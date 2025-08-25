@@ -5,47 +5,42 @@ import os, time, traceback
 from datetime import datetime as dt
 import pandas as pd
 import numpy as np
-
 from alpaca_trade_api.rest import REST, TimeFrame, APIError
 
 # ===== الإعدادات العامة =====
 DEFAULT_SYMBOLS = ["AAPL", "MSFT", "NVDA", "AMD", "TSLA"]
 SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", ",".join(DEFAULT_SYMBOLS)).split(",") if s.strip()]
 
-RISK_PER_TRADE   = float(os.getenv("RISK_PER_TRADE", "0.01"))   # 1% لكل صفقة (تقريبي)
+RISK_PER_TRADE   = float(os.getenv("RISK_PER_TRADE", "0.01"))
 VOL_SPIKE_FACTOR = float(os.getenv("VOL_SPIKE_FACTOR", "2.5"))
 ATR_MULT_TRAIL   = float(os.getenv("ATR_MULT_TRAIL", "2.0"))
 SCORE_THRESHOLD  = float(os.getenv("SCORE_THRESHOLD", "60"))
 PLACE_ORDERS     = os.getenv("PLACE_ORDERS", "false").lower() == "true"
 LOOP_SLEEP       = int(os.getenv("LOOP_SLEEP", "30"))
 
-# ===== مفاتيح وبيئة Alpaca (ندعم ALPACA_* و APCA_*) =====
+# ===== مفاتيح Alpaca =====
 API_KEY = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY")
 BASE_URL = os.getenv("ALPACA_BASE_URL") or os.getenv("APCA_API_BASE_URL") or "https://paper-api.alpaca.markets"
 
 if not API_KEY or not SECRET_KEY:
-    raise RuntimeError("الرجاء ضبط مفاتيح Alpaca في المتغيرات البيئية (APCA_* أو ALPACA_*).")
+    raise RuntimeError("الرجاء ضبط مفاتيح Alpaca في المتغيرات البيئية.")
 
-# نمط البيانات: auto (افتراضي) أو iex أو sip
 DATA_FEED_MODE = os.getenv("ALPACA_DATA_FEED", "auto").lower()
 use_iex_flag = True if DATA_FEED_MODE == "iex" else False
 
-# إنشاء العميل
 api = REST(API_KEY, SECRET_KEY, BASE_URL, api_version="v2", use_iex=use_iex_flag)
 
 def _log(msg):
     print(f"[{dt.utcnow().isoformat()}Z] {msg}", flush=True)
 
 def _switch_to_iex_runtime():
-    """التحويل إلى IEX أثناء التشغيل وإعادة إنشاء العميل."""
     global api
     _log("تم التحويل إلى IEX أثناء التشغيل.")
     api = REST(API_KEY, SECRET_KEY, BASE_URL, api_version="v2", use_iex=True)
 
-# ===== أدوات بيانات =====
+# ===== أدوات البيانات =====
 def get_bars_auto(symbol, timeframe=TimeFrame.Minute, limit=120):
-    """يحاول SIP، ولو رُفض بسبب الاشتراك يتحول لـ IEX تلقائيًا (إلا إذا المستخدم أجبر 'sip')."""
     try:
         return api.get_bars(symbol, timeframe, limit=limit)
     except APIError as e:
@@ -58,7 +53,6 @@ def get_bars_auto(symbol, timeframe=TimeFrame.Minute, limit=120):
         raise
 
 def compute_indicators(df):
-    """ATR مبسّط + سبايك حجم + زخم + درجة إشارة 0..100."""
     tr1 = (df['high'] - df['low']).abs()
     tr2 = (df['high'] - df['close'].shift(1)).abs()
     tr3 = (df['low']  - df['close'].shift(1)).abs()
@@ -82,7 +76,6 @@ def last_price_from_bars(bars_df):
     return float(bars_df['close'].iloc[-1])
 
 def position_size(symbol, last_price):
-    """حجم تقديري بناءً على equity و RISK_PER_TRADE."""
     try:
         acct = api.get_account()
         equity = float(getattr(acct, "equity", "0") or 0)
