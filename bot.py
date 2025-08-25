@@ -26,21 +26,25 @@ BASE_URL = os.getenv("ALPACA_BASE_URL") or os.getenv("APCA_API_BASE_URL") or "ht
 if not API_KEY or not SECRET_KEY:
     raise RuntimeError("الرجاء ضبط مفاتيح Alpaca في المتغيرات البيئية.")
 
+# نمط البيانات: auto (افتراضي) أو iex أو sip
 DATA_FEED_MODE = os.getenv("ALPACA_DATA_FEED", "auto").lower()
 use_iex_flag = True if DATA_FEED_MODE == "iex" else False
 
+# إنشاء العميل مع دعم IEX
 api = REST(API_KEY, SECRET_KEY, BASE_URL, api_version="v2", use_iex=use_iex_flag)
 
 def _log(msg):
     print(f"[{dt.utcnow().isoformat()}Z] {msg}", flush=True)
 
 def _switch_to_iex_runtime():
+    """التحويل إلى IEX أثناء التشغيل وإعادة إنشاء العميل."""
     global api
     _log("تم التحويل إلى IEX أثناء التشغيل.")
     api = REST(API_KEY, SECRET_KEY, BASE_URL, api_version="v2", use_iex=True)
 
 # ===== أدوات البيانات =====
 def get_bars_auto(symbol, timeframe=TimeFrame.Minute, limit=120):
+    """يحاول يجلب من SIP؛ لو اتمنع لعدم الاشتراك يرجع IEX تلقائيًا (إلا إذا أجبرت sip)."""
     try:
         return api.get_bars(symbol, timeframe, limit=limit)
     except APIError as e:
