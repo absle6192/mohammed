@@ -9,50 +9,43 @@ import numpy as np
 from alpaca_trade_api.rest import REST, TimeFrame, APIError
 
 # ===== الإعدادات العامة =====
-# رموز التداول: من env أو افتراضي
 DEFAULT_SYMBOLS = ["AAPL", "MSFT", "NVDA", "AMD", "TSLA"]
 SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", ",".join(DEFAULT_SYMBOLS)).split(",") if s.strip()]
 
-RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))      # 1% من رأس المال لكل صفقة (تقريبي)
-VOL_SPIKE_FACTOR = float(os.getenv("VOL_SPIKE_FACTOR", "2.5"))   # مضاعف حجم التداول لإشارة سبايك
-ATR_MULT_TRAIL = float(os.getenv("ATR_MULT_TRAIL", "2.0"))       # معامل وقف متحرك
-SCORE_THRESHOLD = float(os.getenv("SCORE_THRESHOLD", "60"))      # حد قبول الإشارة
-PLACE_ORDERS = os.getenv("PLACE_ORDERS", "false").lower() == "true"  # افتراضي لا يرسل أوامر
-LOOP_SLEEP = int(os.getenv("LOOP_SLEEP", "30"))                  # ثواني بين كل دورة مسح
+RISK_PER_TRADE   = float(os.getenv("RISK_PER_TRADE", "0.01"))   # 1% لكل صفقة (تقريبي)
+VOL_SPIKE_FACTOR = float(os.getenv("VOL_SPIKE_FACTOR", "2.5"))
+ATR_MULT_TRAIL   = float(os.getenv("ATR_MULT_TRAIL", "2.0"))
+SCORE_THRESHOLD  = float(os.getenv("SCORE_THRESHOLD", "60"))
+PLACE_ORDERS     = os.getenv("PLACE_ORDERS", "false").lower() == "true"
+LOOP_SLEEP       = int(os.getenv("LOOP_SLEEP", "30"))
 
-# ===== الاتصال بـ Alpaca =====
-API_KEY    = os.getenv("ALPACA_API_KEY")
-SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-BASE_URL   = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-DATA_FEED_MODE = os.getenv("ALPACA_DATA_FEED", "auto").lower()   # 'auto' (افتراضي) أو 'iex' أو 'sip'
+# ===== مفاتيح وبيئة Alpaca (ندعم ALPACA_* و APCA_*) =====
+API_KEY = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
+SECRET_KEY = os.getenv("ALPACA_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY")
+BASE_URL = os.getenv("ALPACA_BASE_URL") or os.getenv("APCA_API_BASE_URL") or "https://paper-api.alpaca.markets"
 
 if not API_KEY or not SECRET_KEY:
-    raise RuntimeError("الرجاء ضبط المتغيرات البيئية ALPACA_API_KEY و ALPACA_SECRET_KEY")
+    raise RuntimeError("الرجاء ضبط مفاتيح Alpaca في المتغيرات البيئية (APCA_* أو ALPACA_*).")
 
-api = REST(API_KEY, SECRET_KEY, BASE_URL)
+# نمط البيانات: auto (افتراضي) أو iex أو sip
+DATA_FEED_MODE = os.getenv("ALPACA_DATA_FEED", "auto").lower()
+use_iex_flag = True if DATA_FEED_MODE == "iex" else False
 
-def _force_iex():
-    # إجبار استخدام بيانات IEX المجانية (خاص بالمكتبة القديمة)
-    try:
-        api._use_iex = True
-        _log("تم التحويل إلى IEX (مجاني).")
-    except Exception:
-        pass
-
-# إذا المستخدم أجبر نمط البيانات
-if DATA_FEED_MODE == "iex":
-    _force_iex()
-elif DATA_FEED_MODE == "sip":
-    # لا نفعل شيء: سنعتمد SIP إذا كانت صلاحيات الحساب تسمح
-    pass
+# إنشاء العميل
+api = REST(API_KEY, SECRET_KEY, BASE_URL, api_version="v2", use_iex=use_iex_flag)
 
 def _log(msg):
     print(f"[{dt.utcnow().isoformat()}Z] {msg}", flush=True)
 
+def _switch_to_iex_runtime():
+    """التحويل إلى IEX أثناء التشغيل وإعادة إنشاء العميل."""
+    global api
+    _log("تم التحويل إلى IEX أثناء التشغيل.")
+    api = REST(API_KEY, SECRET_KEY, BASE_URL, api_version="v2", use_iex=True)
+
+# ===== أدوات بيانات =====
 def get_bars_auto(symbol, timeframe=TimeFrame.Minute, limit=120):
-    """
-    يحاول يجلب بيانات تاريخية. إذا رفض SIP لعدم الاشتراك، يعيد المحاولة على IEX.
-    """
+    """يحاول SIP، ولو رُفض بسبب الاشتراك يتحول لـ IEX تلقائيًا (إلا إذا المستخدم أجبر 'sip')."""
     try:
         return api.get_bars(symbol, timeframe, limit=limit)
     except APIError as e:
@@ -60,35 +53,24 @@ def get_bars_auto(symbol, timeframe=TimeFrame.Minute, limit=120):
         sip_denied = ("sip" in msg and "not permitted" in msg) or ("subscription" in msg and "sip" in msg)
         if sip_denied and DATA_FEED_MODE != "sip":
             _log(f"{symbol}: رفض SIP — التحويل إلى IEX وإعادة المحاولة.")
-            _force_iex()
+            _switch_to_iex_runtime()
             return api.get_bars(symbol, timeframe, limit=limit)
         raise
 
 def compute_indicators(df):
-    """
-    df: Bars إلى DataFrame بسيط به الأعمدة o,h,l,c,v مع فهرس زمني
-    يحسب ATR مبسّط + زخم حجمي + درجة إشارة.
-    """
-    # ATR مبسط
+    """ATR مبسّط + سبايك حجم + زخم + درجة إشارة 0..100."""
     tr1 = (df['high'] - df['low']).abs()
     tr2 = (df['high'] - df['close'].shift(1)).abs()
     tr3 = (df['low']  - df['close'].shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    tr  = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     atr = tr.rolling(14, min_periods=1).mean()
 
-    # سبايك حجم
     v_ma = df['volume'].rolling(30, min_periods=1).mean()
     vol_spike = (df['volume'] > VOL_SPIKE_FACTOR * v_ma).astype(int)
 
-    # زخم بسيط: نسبة تغير آخر 5 شموع
     mom = (df['close'] / df['close'].shift(5) - 1) * 100.0
 
-    # درجة إشارة (0-100) تقريبية
-    score = (
-        40 * (mom.clip(lower=-2, upper=2) / 2.0) +  # من -40 إلى +40
-        60 * vol_spike                               # 0 أو 60
-    ).clip(0, 100)
-
+    score = (40 * (mom.clip(-2, 2) / 2.0) + 60 * vol_spike).clip(0, 100)
     out = df.copy()
     out['atr'] = atr
     out['vol_spike'] = vol_spike
@@ -100,32 +82,28 @@ def last_price_from_bars(bars_df):
     return float(bars_df['close'].iloc[-1])
 
 def position_size(symbol, last_price):
-    """
-    تقدير كمية الشراء حسب رصيد الحساب و RISK_PER_TRADE.
-    يستخدم equity من الحساب إن أمكن؛ وإلا يضع حجم بسيط.
-    """
+    """حجم تقديري بناءً على equity و RISK_PER_TRADE."""
     try:
         acct = api.get_account()
         equity = float(getattr(acct, "equity", "0") or 0)
         if equity <= 0:
-            equity = 10000.0  # افتراضي إذا ما توفر
+            equity = 10000.0
     except Exception:
         equity = 10000.0
-
-    budget = max(equity * RISK_PER_TRADE, 50.0)  # حد أدنى 50$
+    budget = max(equity * RISK_PER_TRADE, 50.0)
     qty = int(budget // max(last_price, 0.01))
     return max(qty, 1)
 
 def submit_buy(symbol, qty):
     if not PLACE_ORDERS:
-        _log(f"[DRY-RUN] BUY {symbol} x{qty} (لن يتم إرسال أمر حقيقي).")
+        _log(f"[DRY-RUN] BUY {symbol} x{qty}")
         return
     api.submit_order(symbol=symbol, qty=qty, side="buy", type="market", time_in_force="day")
     _log(f"أُرسل أمر شراء: {symbol} x{qty}")
 
 def submit_sell(symbol, qty):
     if not PLACE_ORDERS:
-        _log(f"[DRY-RUN] SELL {symbol} x{qty} (لن يتم إرسال أمر حقيقي).")
+        _log(f"[DRY-RUN] SELL {symbol} x{qty}")
         return
     api.submit_order(symbol=symbol, qty=qty, side="sell", type="market", time_in_force="day")
     _log(f"أُرسل أمر بيع: {symbol} x{qty}")
@@ -138,11 +116,7 @@ def get_open_position_qty(symbol):
         return 0
 
 def trailing_exit_needed(df, trail_mult=ATR_MULT_TRAIL):
-    """
-    خروج وقف متحرك: إذا الإغلاق الأخير < (أعلى إغلاق - trail_mult * ATR)
-    """
-    closes = df['close']
-    atr = df['atr']
+    closes = df['close']; atr = df['atr']
     hh = closes.cummax()
     trail = hh - trail_mult * atr
     return closes.iloc[-1] < trail.iloc[-1]
@@ -152,29 +126,21 @@ def process_symbol(symbol):
     if len(bars) == 0:
         _log(f"{symbol}: لا توجد بيانات.")
         return
-
-    # تحويل إلى DataFrame
     data = [{
-        "ts": b.t.timestamp() if hasattr(b.t, "timestamp") else pd.Timestamp(b.t).timestamp(),
+        "ts": pd.Timestamp(getattr(b, "t")).timestamp(),
         "open": float(b.o), "high": float(b.h), "low": float(b.l),
         "close": float(b.c), "volume": float(b.v),
     } for b in bars]
-    df = pd.DataFrame(data).set_index(pd.to_datetime(pd.Series([x["ts"] for x in data], index=None), unit="s"))
-    df = df.drop(columns=['ts'])
-    df.columns = ['open','high','low','close','volume']
+    df = pd.DataFrame(data).set_index(pd.to_datetime([d["ts"] for d in data], unit="s"))
+    df = df.drop(columns=['ts']); df.columns = ['open','high','low','close','volume']
 
     ind = compute_indicators(df)
     last = ind.iloc[-1]
     last_price = float(last['close'])
     score = float(last['score'])
-
     qty_open = get_open_position_qty(symbol)
 
-    # منطق إشارة مبسّط:
-    # شراء: سبايك حجم + زخم إيجابي + درجة أعلى من العتبة
-    buy_signal = (last['vol_spike'] == 1) and (last['mom'] > 0) and (score >= SCORE_THRESHOLD)
-
-    # خروج: وقف متحرك مبني على ATR
+    buy_signal  = (last['vol_spike'] == 1) and (last['mom'] > 0) and (score >= SCORE_THRESHOLD)
     sell_signal = qty_open > 0 and trailing_exit_needed(ind)
 
     if buy_signal and qty_open == 0:
@@ -199,8 +165,7 @@ def main_loop():
                     traceback.print_exc()
             time.sleep(LOOP_SLEEP)
         except KeyboardInterrupt:
-            _log("تم إيقاف العامل يدويًا.")
-            break
+            _log("تم إيقاف العامل يدويًا."); break
         except Exception as e:
             _log(f"خطأ عام في الحلقة: {e}")
             traceback.print_exc()
