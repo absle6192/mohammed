@@ -6,7 +6,24 @@ from datetime import datetime as dt
 import pandas as pd
 import numpy as np
 from alpaca_trade_api.rest import REST, TimeFrame, APIError
+from alpaca_trade_api.rest import REST, TimeFrame, APIError
 
+# ===== مفاتيح Alpaca =====
+API_KEY = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
+SECRET_KEY = os.getenv("ALPACA_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY")
+BASE_URL = os.getenv("ALPACA_BASE_URL") or os.getenv("APCA_API_BASE_URL") or "https://paper-api.alpaca.markets"
+
+if not API_KEY or not SECRET_KEY:
+    raise RuntimeError("الرجاء ضبط مفاتيح Alpaca في المتغيرات البيئية.")
+
+# نمط البيانات: auto (افتراضي) أو iex أو sip
+DATA_FEED_MODE = os.getenv("ALPACA_DATA_FEED", "auto").lower()
+use_iex_flag = True if DATA_FEED_MODE == "iex" else False
+
+# إنشاء العميل مع دعم IEX
+api = REST(API_KEY, SECRET_KEY, BASE_URL, api_version="v2", use_iex=use_iex_flag)
+
+# ===== الإعدادات العامة =====
 # ===== الإعدادات العامة =====
 DEFAULT_SYMBOLS = ["AAPL", "MSFT", "NVDA", "AMD", "TSLA"]
 SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", ",".join(DEFAULT_SYMBOLS)).split(",") if s.strip()]
