@@ -21,7 +21,12 @@ DATA_FEED_MODE = os.getenv("ALPACA_DATA_FEED", "auto").lower()
 use_iex_flag = True if DATA_FEED_MODE == "iex" else False
 
 # إنشاء العميل مع دعم IEX
-api = REST(API_KEY, SECRET_KEY, BASE_URL, api_version="v2", use_iex=use_iex_flag)
+api = REST(API_KEY, SECRET_KEY, BASE_URL, api_version="v2")
+if use_iex_flag:
+    try:
+        api._use_iex = True
+    except Exception:
+        pass
 
 # ===== الإعدادات العامة =====
 # ===== الإعدادات العامة =====
@@ -34,14 +39,6 @@ ATR_MULT_TRAIL   = float(os.getenv("ATR_MULT_TRAIL", "2.0"))
 SCORE_THRESHOLD  = float(os.getenv("SCORE_THRESHOLD", "60"))
 PLACE_ORDERS     = os.getenv("PLACE_ORDERS", "false").lower() == "true"
 LOOP_SLEEP       = int(os.getenv("LOOP_SLEEP", "30"))
-
-# ===== مفاتيح Alpaca =====
-API_KEY = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
-SECRET_KEY = os.getenv("ALPACA_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY")
-BASE_URL = os.getenv("ALPACA_BASE_URL") or os.getenv("APCA_API_BASE_URL") or "https://paper-api.alpaca.markets"
-
-if not API_KEY or not SECRET_KEY:
-    raise RuntimeError("الرجاء ضبط مفاتيح Alpaca في المتغيرات البيئية.")
 
 # نمط البيانات: auto (افتراضي) أو iex أو sip
 DATA_FEED_MODE = os.getenv("ALPACA_DATA_FEED", "auto").lower()
