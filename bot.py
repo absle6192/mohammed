@@ -1,4 +1,25 @@
 # bot.py
+# bot.py
+import os
+import time
+import requests
+from datetime import datetime, UTC
+
+# ========== اختبار API ==========
+headers = {
+    "APCA-API-KEY-ID": os.environ["APCA_API_KEY_ID"],
+    "APCA-API-SECRET-KEY": os.environ["APCA_API_SECRET_KEY"],
+}
+try:
+    r = requests.get(
+        "https://data.alpaca.markets/v2/stocks/AAPL/quotes/latest",
+        headers=headers,
+        timeout=10
+    )
+    print("ALPACA_TEST", r.status_code, r.text[:200])
+except Exception as e:
+    print("ALPACA_TEST_ERROR", str(e))
+# ================================
 import os
 import time
 import requests
