@@ -1,4 +1,24 @@
+# bot.py — clean header
+import os
+import time
+import requests
+from datetime import datetime, UTC
 
+# ---- Alpaca env (لا تغيّر الأسماء) ----
+API_KEY    = os.getenv("APCA_API_KEY_ID")
+API_SECRET = os.getenv("APCA_API_SECRET_KEY")
+BASE_URL   = (os.getenv("ALPACA_BASE_URL") or "https://paper-api.alpaca.markets").rstrip("/")
+DATA_URL   = "https://data.alpaca.markets"
+
+# رؤوس الطلبات الموحّدة
+HEADERS = {
+    "APCA-API-KEY-ID": API_KEY,
+    "APCA-API-SECRET-KEY": API_SECRET,
+}
+
+# حماية من نسيان المفاتيح
+if not API_KEY or not API_SECRET:
+    raise RuntimeError("Set APCA_API_KEY_ID and APCA_API_SECRET_KEY in Render → Environment")
 # bot.py
 # bot.py
 import os
