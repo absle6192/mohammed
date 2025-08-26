@@ -1,5 +1,33 @@
+
 # bot.py
 # bot.py
+import os
+import time
+import requests
+from datetime import datetime, UTC
+
+# =========== طباعة كل متغيرات البيئة ===========
+print("ALL ENV VARS:", list(os.environ.keys()))
+# ==============================================
+
+# ===== اختبار اتصال Alpaca (مؤقت) =====
+print("=== بدء اختبار اتصال Alpaca ===")
+
+headers = {
+    "APCA-API-KEY-ID": os.environ.get("APCA_API_KEY_ID", "MISSING"),
+    "APCA-API-SECRET-KEY": os.environ.get("APCA_API_SECRET_KEY", "MISSING"),
+}
+try:
+    r = requests.get(
+        "https://data.alpaca.markets/v2/stocks/AAPL/quotes/latest",
+        headers=headers,
+        timeout=10
+    )
+    print("ALPACA_TEST", r.status_code)
+    print("ALPACA_BODY", r.text[:300])
+except Exception as e:
+    print("ALPACA_TEST_ERROR", str(e))
+# ======================================
 import os
 import time
 import requests
