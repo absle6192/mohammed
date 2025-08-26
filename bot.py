@@ -3,6 +3,24 @@
 import os
 import time
 import requests
+# ===== اختبار اتصال Alpaca (مؤقت) =====
+print("=== بدء اختبار اتصال Alpaca ===")
+
+headers = {
+    "APCA-API-KEY-ID": os.environ["APCA_API_KEY_ID"],
+    "APCA-API-SECRET-KEY": os.environ["APCA_API_SECRET_KEY"],
+}
+try:
+    r = requests.get(
+        "https://data.alpaca.markets/v2/stocks/AAPL/quotes/latest",
+        headers=headers,
+        timeout=10
+    )
+    print("ALPACA_TEST", r.status_code)
+    print("ALPACA_BODY", r.text[:300])
+except Exception as e:
+    print("ALPACA_TEST_ERROR", str(e))
+# ======================================
 from datetime import datetime, UTC
 
 # ========== اختبار API ==========
