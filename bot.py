@@ -1,4 +1,3 @@
-# bot.py – clean header
 import os
 import time
 import requests
