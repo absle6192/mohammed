@@ -1,179 +1,159 @@
 import os
 import time
-import json
 import logging
-from typing import List, Dict
+from typing import Optional, List, Dict
 import requests
 
-# ----------------------------
-# إعدادات اللوج
-# ----------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-log = logging.getLogger("bot")
+# ---------------- Logging ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-# ----------------------------
-# قراءة المتغيرات من البيئة
-# ----------------------------
-ALPACA_API_BASE_URL = os.getenv("ALPACA_API_BASE_URL", "https://paper-api.alpaca.markets")
-DATA_URL_BASE       = os.getenv("DATA_URL_BASE",       "https://data.alpaca.markets")
-API_KEY             = os.getenv("APCA_API_KEY_ID",     "").strip()
-API_SECRET          = os.getenv("APCA_API_SECRET_KEY", "").strip()
+# ---------------- ENV ----------------
+API_KEY = os.getenv("APCA_API_KEY_ID", "").strip()
+API_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
+TRADING_BASE = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets").strip().rstrip("/")
+DATA_BASE = os.getenv("APCA_DATA_BASE_URL", "https://data.alpaca.markets").strip().rstrip("/")
+SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "AAPL,MSFT,AMZN,GOOGL,TSLA").split(",") if s.strip()]
 
-# مهم: الافتراضي iex – لا نستخدم sip
-DATA_FEED           = os.getenv("APCA_API_DATA_FEED", "iex").strip().lower()
-if DATA_FEED not in ("iex", "sip"):
-    DATA_FEED = "iex"
+BUY_THRESHOLD = float(os.getenv("BUY_THRESHOLD", "0.003"))         # 0.3% ↑ vs today's open
+ORDER_NOTIONAL = float(os.getenv("ORDER_NOTIONAL_USD", "1000"))    # $ per trade
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.01"))      # +1%
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.005"))         # -0.5%
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SEC", "5"))
 
-DOLLAR_AMOUNT       = float(os.getenv("DOLLAR_AMOUNT", "200"))
-ENABLE_TRADING      = os.getenv("ENABLE_TRADING", "true").strip().lower() == "true"
-POLL_SECONDS        = int(os.getenv("POLL_SECONDS", "5"))
-SYMBOLS_RAW         = os.getenv("SYMBOLS", "AAPL,MSFT,AMZN,GOOGL,NVDA")
-SYMBOLS             = [s.strip().upper() for s in SYMBOLS_RAW.split(",") if s.strip()]
+HDR = {"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": API_SECRET}
 
-# تحقق مبكر من المفاتيح
-if not API_KEY or not API_SECRET:
-    raise RuntimeError("مفاتيح Alpaca ناقصة: تأكد من ضبط APCA_API_KEY_ID و APCA_API_SECRET_KEY في Render.")
+# -------------- Basic Guards --------------
+def require_env():
+    missing = []
+    if not API_KEY: missing.append("APCA_API_KEY_ID")
+    if not API_SECRET: missing.append("APCA_API_SECRET_KEY")
+    if not TRADING_BASE: missing.append("APCA_API_BASE_URL")
+    if not DATA_BASE: missing.append("APCA_DATA_BASE_URL")
+    if missing:
+        logging.error("MISSING ENV: %s", ", ".join(missing))
+        raise SystemExit(1)
 
-# رؤوس الطلبات
-HEADERS_TRADING = {
-    "APCA-API-KEY-ID": API_KEY,
-    "APCA-API-SECRET-KEY": API_SECRET,
-    "Content-Type": "application/json",
-}
-
-HEADERS_DATA = {
-    "APCA-API-KEY-ID": API_KEY,
-    "APCA-API-SECRET-KEY": API_SECRET,
-}
-
-# ----------------------------
-# دوال مساعدة
-# ----------------------------
-def chunk_symbols(symbols: List[str], size: int = 50) -> List[List[str]]:
-    """نقسم الرموز على دفعات (واجهات ألباكا تسمح بعدة رموز معاً)."""
-    out = []
-    cur = []
-    for s in symbols:
-        cur.append(s)
-        if len(cur) >= size:
-            out.append(cur)
-            cur = []
-    if cur:
-        out.append(cur)
-    return out
-
-def fetch_latest_quotes(symbols: List[str]) -> Dict[str, dict]:
-    """
-    نجلب آخر عرض/طلب (quote) لكل رمز من Data API v2
-    endpoint: /v2/stocks/quotes/latest?symbols=...&feed=iex
-    """
-    results: Dict[str, dict] = {}
-    for batch in chunk_symbols(symbols, 50):
-        url = f"{DATA_URL_BASE}/v2/stocks/quotes/latest"
-        params = {
-            "symbols": ",".join(batch),
-            "feed": DATA_FEED,   # <<<<< هنا يضمن IEX
-        }
+# -------------- HTTP with retry --------------
+def _req(method: str, url: str, **kw) -> requests.Response:
+    # minimal retry for 429/5xx
+    for attempt in range(5):
         try:
-            r = requests.get(url, headers=HEADERS_DATA, params=params, timeout=10)
-            if r.status_code == 403:
-                log.error("403 Forbidden من Data API (feed=%s). تأكد أن APCA_API_DATA_FEED=iex وأن اشتراكك يسمح.", DATA_FEED)
+            r = requests.request(method, url, timeout=10, **kw)
+            if r.status_code in (429, 500, 502, 503, 504):
+                wait = 1 + attempt
+                logging.warning("HTTP %s -> %s (attempt %d) url=%s", r.status_code, r.text[:180], attempt+1, url)
+                time.sleep(wait)
                 continue
             r.raise_for_status()
-            data = r.json().get("quotes", {})
-            # شكل الإرجاع: {"AAPL": {"symbol":"AAPL","quote":{...}}, ...}
-            for sym, item in data.items():
-                results[sym] = item.get("quote") or {}
-        except Exception as e:
-            log.exception("فشل الجلب لدفعة %s: %s", batch, e)
-    return results
+            return r
+        except requests.RequestException as e:
+            wait = 1 + attempt
+            logging.warning("HTTP EXC (%s) attempt %d url=%s", e, attempt+1, url)
+            time.sleep(wait)
+    # last try without catch to raise
+    r = requests.request(method, url, timeout=10, **kw)
+    r.raise_for_status()
+    return r
 
-def fetch_positions() -> Dict[str, float]:
-    """نقرأ المراكز الحالية (عدد الأسهم لكل رمز)."""
-    url = f"{ALPACA_API_BASE_URL}/v2/positions"
-    try:
-        r = requests.get(url, headers=HEADERS_TRADING, timeout=10)
-        if r.status_code == 403:
-            log.error("403 Forbidden من Trading API. تأكد من المفاتيح والبيئة (Paper/Live).")
-            return {}
-        r.raise_for_status()
-        pos = {}
-        for p in r.json():
-            pos[p["symbol"].upper()] = float(p.get("qty", 0))
-        return pos
-    except Exception as e:
-        log.exception("فشل قراءة المراكز: %s", e)
-        return {}
+# -------------- Alpaca helpers --------------
+def get_clock() -> Dict:
+    return _req("GET", f"{TRADING_BASE}/v2/clock", headers=HDR).json()
 
-def place_market_order(symbol: str, notional_usd: float, side: str = "buy"):
-    """أمر Market بالقيمة (notional)."""
-    url = f"{ALPACA_API_BASE_URL}/v2/orders"
+def get_latest_bar(symbol: str) -> Optional[Dict]:
+    # Intraday latest bar
+    r = _req("GET", f"{DATA_BASE}/v2/stocks/{symbol}/bars/latest", headers=HDR)
+    j = r.json()
+    return j.get("bar")
+
+def get_latest_trade_price(symbol: str) -> Optional[float]:
+    r = _req("GET", f"{DATA_BASE}/v2/stocks/{symbol}/trades/latest", headers=HDR)
+    t = r.json().get("trade")
+    return float(t["p"]) if t and "p" in t else None
+
+def has_position(symbol: str) -> bool:
+    r = requests.get(f"{TRADING_BASE}/v2/positions/{symbol}", headers=HDR, timeout=10)
+    if r.status_code == 404:
+        return False
+    r.raise_for_status()
+    return True
+
+def submit_bracket_market_buy(symbol: str, notional: float, tp_price: float, sl_price: float) -> Dict:
     payload = {
         "symbol": symbol,
-        "side": side,
+        "notional": str(notional),
+        "side": "buy",
         "type": "market",
         "time_in_force": "day",
-        "notional": round(notional_usd, 2),
+        "order_class": "bracket",
+        "take_profit": {"limit_price": f"{tp_price:.2f}"},
+        "stop_loss": {"stop_price": f"{sl_price:.2f}"}
     }
-    try:
-        r = requests.post(url, headers=HEADERS_TRADING, data=json.dumps(payload), timeout=10)
-        if r.status_code == 403:
-            log.error("403 Forbidden عند إرسال أمر %s %s: تحقق من الصلاحيات/الحساب.", side, symbol)
-            log.error("Body: %s", r.text)
-            return None
-        r.raise_for_status()
-        order = r.json()
-        log.info("تم إرسال أمر %s %s بقيمة $%.2f | id=%s", side.upper(), symbol, notional_usd, order.get("id"))
-        return order
-    except Exception as e:
-        log.exception("فشل إرسال أمر %s %s: %s", side, symbol, e)
-        return None
+    r = _req("POST", f"{TRADING_BASE}/v2/orders", headers=HDR, json=payload)
+    return r.json()
 
-# ----------------------------
-# استراتيجية بسيطة تجريبية
-# ----------------------------
-def should_buy(quote: dict) -> bool:
-    """
-    مثال بسيط: إذا فيه Quote صالح (ask/bid) ننفّذ شراء تجريبي.
-    عدّل الشرط لاحقاً بما يناسبك.
-    """
-    if not quote:
-        return False
-    # إذا يوجد سعر طلب (ask) موجب
-    ask = quote.get("ap")  # ask price
-    return isinstance(ask, (int, float)) and ask > 0
+# -------------- Math --------------
+def pct_change(a: float, b: float) -> float:
+    if a == 0: return 0.0
+    return (b - a) / a
 
-def main_loop():
-    log.info("بدء البوت ✅ | feed=%s | trading=%s | symbols=%s",
-             DATA_FEED, ENABLE_TRADING, ",".join(SYMBOLS))
+# -------------- Core Loop --------------
+def scan_and_trade(symbols: List[str]):
+    logging.info("BOOT: Worker starting")
+    logging.info("ENV: TRADING_BASE=%s | DATA_BASE=%s", TRADING_BASE, DATA_BASE)
+    logging.info("CONFIG: tickers=%d | threshold=%.4f | notional=%.2f | TP=%.3f | SL=%.3f | interval=%ds",
+                 len(symbols), BUY_THRESHOLD, ORDER_NOTIONAL, TAKE_PROFIT_PCT, STOP_LOSS_PCT, SCAN_INTERVAL)
+
+    require_env()
 
     while True:
         try:
-            quotes = fetch_latest_quotes(SYMBOLS)
+            clock = get_clock()
+            is_open = bool(clock.get("is_open"))
+            logging.info("MARKET: open=%s", is_open)
 
-            if not quotes:
-                log.warning("لا توجد بيانات.")
-            else:
-                for sym in SYMBOLS:
-                    q = quotes.get(sym) or {}
-                    ap = q.get("ap")  # ask price
-                    bp = q.get("bp")  # bid price
-                    ts = q.get("t")
-                    log.info("%s: bid=%s | ask=%s | t=%s", sym, bp, ap, ts)
+            if not is_open:
+                time.sleep(SCAN_INTERVAL)
+                continue
 
-                    if ENABLE_TRADING and should_buy(q):
-                        place_market_order(sym, DOLLAR_AMOUNT, side="buy")
+            for sym in symbols:
+                try:
+                    if has_position(sym):
+                        logging.info("POSITION: %s already held -> skip", sym)
+                        continue
+
+                    bar = get_latest_bar(sym)
+                    if not bar:
+                        logging.info("DATA: no latest bar for %s", sym)
+                        continue
+
+                    today_open = float(bar.get("o", 0.0))
+                    last_price = get_latest_trade_price(sym) or float(bar.get("c", 0.0))
+                    if today_open <= 0 or last_price <= 0:
+                        logging.info("DATA: bad prices for %s (o=%.4f last=%.4f)", sym, today_open, last_price)
+                        continue
+
+                    change = pct_change(today_open, last_price)
+                    logging.info("SCAN: %s open=%.4f last=%.4f change=%.4f", sym, today_open, last_price, change)
+
+                    if change >= BUY_THRESHOLD:
+                        tp = last_price * (1 + TAKE_PROFIT_PCT)
+                        sl = last_price * (1 - STOP_LOSS_PCT)
+                        order = submit_bracket_market_buy(sym, ORDER_NOTIONAL, tp, sl)
+                        logging.info("ORDER: BUY %s notional=%.2f @~%.2f TP=%.2f SL=%.2f id=%s",
+                                     sym, ORDER_NOTIONAL, last_price, tp, sl, order.get("id"))
+                        time.sleep(1)  # small spacing
+                except Exception as e:
+                    logging.exception("SYMBOL ERROR (%s): %s", sym, e)
+
+            time.sleep(SCAN_INTERVAL)
 
         except Exception as e:
-            log.exception("خطأ في الحلقة الرئيسية: %s", e)
+            logging.exception("LOOP ERROR: %s", e)
+            time.sleep(3)
 
-        time.sleep(POLL_SECONDS)
-
-# ----------------------------
-# التشغيل
-# ----------------------------
 if __name__ == "__main__":
-    main_loop()
+    try:
+        scan_and_trade(SYMBOLS)
+    except Exception as e:
+        logging.exception("FATAL: %s", e)
+        raise
