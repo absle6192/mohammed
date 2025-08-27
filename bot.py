@@ -3,7 +3,11 @@ import os
 import time
 import requests
 from datetime import datetime, UTC
+import json, traceback
 
+def debug_print(msg):
+    from datetime import datetime
+    print(f"[{datetime.now().isoformat(timespec='seconds')}] {msg}")
 # ---- Alpaca env (لا تغيّر الأسماء) ----
 API_KEY    = os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY")
@@ -270,14 +274,16 @@ def main():
 
         # نفذ المنطق على القائمة المختارة
         for sym in selected:
-            price = get_last_trade_price(sym)
-            if price is None:
-                log(f"{sym}: لا توجد بيانات.")
-                continue
+    price = get_last_trade_price(sym)
 
-            log(f"{sym}: آخر سعر = {price}")
+    if price is None:
+        debug_print(f"{sym}: ⚠️ API ما رجّع بيانات (None)")
+        debug_print(f"{sym}: لا توجد بيانات.")
+        continue
+    else:
+        debug_print(f"{sym}: ✅ السعر الحالي = {price}")
 
-            if market_open and ENABLE_TRADING and should_enter_long(sym, price):
+    log(f"{sym}: آخر سعر = {price}")
                 qty = dollars_to_qty(DOLLAR_PER_TRADE, price)
                 if qty > 0:
                     res = place_bracket_buy(sym, price, qty)
