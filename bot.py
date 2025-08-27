@@ -22,18 +22,25 @@ SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SEC", "5"))
 
 HDR = {"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": API_SECRET}
 
-# -------------- Basic Guards --------------
-def require_env():
-    missing = []
-    if not API_KEY: missing.append("APCA_API_KEY_ID")
-    if not API_SECRET: missing.append("APCA_API_SECRET_KEY")
-    if not TRADING_BASE: missing.append("APCA_API_BASE_URL")
-    if not DATA_BASE: missing.append("APCA_DATA_BASE_URL")
-    if missing:
-        logging.error("MISSING ENV: %s", ", ".join(missing))
-        raise SystemExit(1)
+# ---------------- Debug Keys ----------------
+def debug_env_keys():
+    def info(name, val):
+        raw = val
+        stripped = val.strip()
+        logging.info(
+            "ENVCHK %s: len=%d stripped_len=%d only_alnum=%s starts=%s... ends=...%s",
+            name, len(raw), len(stripped), stripped.isalnum(),
+            stripped[:3], stripped[-3:]
+        )
+        if raw != stripped:
+            logging.warning("ENVCHK %s: WARNING whitespace detected at ends", name)
 
-# -------------- HTTP with extra logging --------------
+    info("APCA_API_KEY_ID", API_KEY)
+    info("APCA_API_SECRET_KEY", API_SECRET)
+
+debug_env_keys()
+
+# ---------------- HTTP with logging ----------------
 def _req(method: str, url: str, **kw) -> requests.Response:
     for attempt in range(5):
         try:
@@ -58,7 +65,7 @@ def _req(method: str, url: str, **kw) -> requests.Response:
     r.raise_for_status()
     return r
 
-# -------------- Alpaca helpers --------------
+# ---------------- Alpaca helpers ----------------
 def get_clock() -> Dict:
     return _req("GET", f"{TRADING_BASE}/v2/clock", headers=HDR).json()
 
@@ -93,21 +100,19 @@ def submit_bracket_market_buy(symbol: str, notional: float, tp_price: float, sl_
     r = _req("POST", f"{TRADING_BASE}/v2/orders", headers=HDR, json=payload)
     return r.json()
 
-# -------------- Math --------------
+# ---------------- Math ----------------
 def pct_change(a: float, b: float) -> float:
     if a == 0: return 0.0
     return (b - a) / a
 
-# -------------- Core Loop --------------
+# ---------------- Core Loop ----------------
 def scan_and_trade(symbols: List[str]):
     logging.info("BOOT: Worker starting")
     logging.info("ENV: TRADING_BASE=%s | DATA_BASE=%s", TRADING_BASE, DATA_BASE)
     logging.info("CONFIG: tickers=%d | threshold=%.4f | notional=%.2f | TP=%.3f | SL=%.3f | interval=%ds",
                  len(symbols), BUY_THRESHOLD, ORDER_NOTIONAL, TAKE_PROFIT_PCT, STOP_LOSS_PCT, SCAN_INTERVAL)
 
-    require_env()
-
-    # Print account info to confirm authentication
+    # Print account info
     acct = _req("GET", f"{TRADING_BASE}/v2/account", headers=HDR).json()
     logging.info("ACCOUNT: id=%s status=%s buying_power=%s",
                  acct.get("id"), acct.get("status"), acct.get("buying_power"))
