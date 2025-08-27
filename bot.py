@@ -14,10 +14,10 @@ TRADING_BASE = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets"
 DATA_BASE = os.getenv("APCA_DATA_BASE_URL", "https://data.alpaca.markets").strip().rstrip("/")
 SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "AAPL,MSFT,AMZN,GOOGL,TSLA").split(",") if s.strip()]
 
-BUY_THRESHOLD = float(os.getenv("BUY_THRESHOLD", "0.003"))         # 0.3% ↑ vs today's open
-ORDER_NOTIONAL = float(os.getenv("ORDER_NOTIONAL_USD", "1000"))    # $ per trade
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.01"))      # +1%
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.005"))         # -0.5%
+BUY_THRESHOLD = float(os.getenv("BUY_THRESHOLD", "0.003"))
+ORDER_NOTIONAL = float(os.getenv("ORDER_NOTIONAL_USD", "1000"))
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.01"))
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.005"))
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SEC", "5"))
 
 HDR = {"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": API_SECRET}
@@ -33,24 +33,27 @@ def require_env():
         logging.error("MISSING ENV: %s", ", ".join(missing))
         raise SystemExit(1)
 
-# -------------- HTTP with retry --------------
+# -------------- HTTP with extra logging --------------
 def _req(method: str, url: str, **kw) -> requests.Response:
-    # minimal retry for 429/5xx
     for attempt in range(5):
         try:
             r = requests.request(method, url, timeout=10, **kw)
-            if r.status_code in (429, 500, 502, 503, 504):
-                wait = 1 + attempt
-                logging.warning("HTTP %s -> %s (attempt %d) url=%s", r.status_code, r.text[:180], attempt+1, url)
-                time.sleep(wait)
-                continue
+            if r.status_code >= 400:
+                body = ""
+                try:
+                    body = r.text[:500]
+                except Exception:
+                    body = "<no body>"
+                logging.warning("HTTP %s on %s (attempt %d) body=%s",
+                                r.status_code, url, attempt+1, body)
+                if r.status_code in (429, 500, 502, 503, 504):
+                    time.sleep(1 + attempt)
+                    continue
             r.raise_for_status()
             return r
         except requests.RequestException as e:
-            wait = 1 + attempt
-            logging.warning("HTTP EXC (%s) attempt %d url=%s", e, attempt+1, url)
-            time.sleep(wait)
-    # last try without catch to raise
+            logging.warning("HTTP EXC %s (attempt %d) url=%s", e, attempt+1, url)
+            time.sleep(1 + attempt)
     r = requests.request(method, url, timeout=10, **kw)
     r.raise_for_status()
     return r
@@ -60,7 +63,6 @@ def get_clock() -> Dict:
     return _req("GET", f"{TRADING_BASE}/v2/clock", headers=HDR).json()
 
 def get_latest_bar(symbol: str) -> Optional[Dict]:
-    # Intraday latest bar
     r = _req("GET", f"{DATA_BASE}/v2/stocks/{symbol}/bars/latest", headers=HDR)
     j = r.json()
     return j.get("bar")
@@ -105,6 +107,11 @@ def scan_and_trade(symbols: List[str]):
 
     require_env()
 
+    # Print account info to confirm authentication
+    acct = _req("GET", f"{TRADING_BASE}/v2/account", headers=HDR).json()
+    logging.info("ACCOUNT: id=%s status=%s buying_power=%s",
+                 acct.get("id"), acct.get("status"), acct.get("buying_power"))
+
     while True:
         try:
             clock = get_clock()
@@ -141,7 +148,7 @@ def scan_and_trade(symbols: List[str]):
                         order = submit_bracket_market_buy(sym, ORDER_NOTIONAL, tp, sl)
                         logging.info("ORDER: BUY %s notional=%.2f @~%.2f TP=%.2f SL=%.2f id=%s",
                                      sym, ORDER_NOTIONAL, last_price, tp, sl, order.get("id"))
-                        time.sleep(1)  # small spacing
+                        time.sleep(1)
                 except Exception as e:
                     logging.exception("SYMBOL ERROR (%s): %s", sym, e)
 
