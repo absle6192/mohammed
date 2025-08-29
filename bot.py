@@ -23,7 +23,7 @@ API_KEY    = os.getenv("APCA_API_KEY_ID", "")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY", "")
 BASE_URL   = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
 
-# Top 50 US stocks (S&P500 leaders, by market cap / volume)
+# Top 50 US stocks to watch
 SYMBOLS: List[str] = [
     "AAPL","MSFT","AMZN","GOOGL","GOOG","NVDA","META","TSLA","BRK.B","JPM",
     "JNJ","V","UNH","PG","XOM","MA","AVGO","HD","MRK","PEP",
@@ -49,10 +49,11 @@ DAILY_MAX_SPEND         = 5000.0
 LOOP_SLEEP_SECONDS      = 30
 
 # Entry filters
-MOMENTUM_THRESHOLD      = 0.003
-VOLUME_SPIKE_MULT       = 1.2
-SPREAD_CENTS_LIMIT      = 0.05
-SPREAD_PCT_LIMIT        = 0.002
+MOMENTUM_THRESHOLD      = 0.003    # +0.3% last 1-min momentum
+VOLUME_SPIKE_MULT       = 1.2      # last 1-min vol >= 1.2x avg of prev 5
+SPREAD_CENTS_LIMIT      = 0.05     # spread <= $0.05
+SPREAD_PCT_LIMIT        = 0.002    # OR spread <= 0.2% of price
+DAILY_CHANGE_MIN_PCT    = 0.05     # NEW: day change >= +5%
 
 # Exits
 TAKE_PROFIT_PCT         = 0.04     # +4% take-profit
@@ -72,9 +73,11 @@ class Snapshot:
     high_5m: Optional[float]
     vol_1m: Optional[float]
     vol_5m_avg: Optional[float]
+    prev_close: Optional[float]
+    daily_change_pct: Optional[float]
 
 # =========================
-# Market helpers
+# Helpers
 # =========================
 def market_is_open() -> bool:
     try:
@@ -103,9 +106,6 @@ def minutes_to_close() -> Optional[int]:
         logging.warning(f"minutes_to_close failed: {e}")
         return None
 
-# =========================
-# Sizing & filters
-# =========================
 def compute_qty(last_price: float, today_spend: float) -> int:
     try:
         account = api.get_account()
@@ -134,9 +134,6 @@ def spread_ok(bid: float, ask: float, price: float) -> bool:
     spread = ask - bid
     return (spread <= SPREAD_CENTS_LIMIT) or (spread / price <= SPREAD_PCT_LIMIT)
 
-# =========================
-# Snapshot / signals
-# =========================
 def compute_vwap_from_last5(symbol: str) -> Optional[float]:
     try:
         bars = api.get_bars(symbol, TimeFrame.Minute, limit=6)
@@ -167,6 +164,7 @@ def fetch_snapshot(symbol: str) -> Optional[Snapshot]:
         bid = float(getattr(quote, "bid_price", 0) or 0)
         ask = float(getattr(quote, "ask_price", 0) or 0)
 
+        # 1-min momentum
         min1_change_pct = None
         if bars_1m and len(bars_1m) >= 2:
             p_now  = float(bars_1m[-1].c)
@@ -174,10 +172,12 @@ def fetch_snapshot(symbol: str) -> Optional[Snapshot]:
             if p_prev > 0:
                 min1_change_pct = (p_now - p_prev) / p_prev
 
+        # 5-min high
         high_5m = None
         if bars_1m and len(bars_1m) >= 6:
             high_5m = max(float(b.h) for b in bars_1m[-6:-1])
 
+        # volumes
         vol_1m = None
         vol_5m_avg = None
         if bars_1m and len(bars_1m) >= 6:
@@ -185,7 +185,20 @@ def fetch_snapshot(symbol: str) -> Optional[Snapshot]:
             prev5  = [float(b.v) for b in bars_1m[-6:-1]]
             vol_5m_avg = (sum(prev5) / len(prev5)) if prev5 else None
 
+        # VWAP from last 5 minutes
         vwap_value = compute_vwap_from_last5(symbol)
+
+        # NEW: previous daily close & daily change %
+        prev_close = None
+        daily_change_pct = None
+        try:
+            bars_day = api.get_bars(symbol, TimeFrame.Day, limit=2)
+            if bars_day and len(bars_day) >= 2:
+                prev_close = float(bars_day[-2].c)
+                if prev_close > 0:
+                    daily_change_pct = (last_price - prev_close) / prev_close
+        except Exception as e:
+            logging.warning(f"daily change calc failed for {symbol}: {e}")
 
         return Snapshot(
             last_price=last_price,
@@ -196,6 +209,8 @@ def fetch_snapshot(symbol: str) -> Optional[Snapshot]:
             high_5m=high_5m,
             vol_1m=vol_1m,
             vol_5m_avg=vol_5m_avg,
+            prev_close=prev_close,
+            daily_change_pct=daily_change_pct
         )
     except Exception as e:
         logging.warning(f"fetch_snapshot failed for {symbol}: {e}")
@@ -204,14 +219,22 @@ def fetch_snapshot(symbol: str) -> Optional[Snapshot]:
 def should_buy(s: Snapshot) -> bool:
     if s.last_price <= 0:
         return False
+    # NEW: require the stock to be up at least +5% today
+    if s.daily_change_pct is None or s.daily_change_pct < DAILY_CHANGE_MIN_PCT:
+        return False
+    # price above VWAP (if available)
     if s.vwap is not None and s.last_price < s.vwap:
         return False
+    # 1-min momentum
     if s.min1_change_pct is None or s.min1_change_pct < MOMENTUM_THRESHOLD:
         return False
+    # breakout vs. previous 5-min high
     if s.high_5m is None or s.last_price < s.high_5m:
         return False
+    # healthy spread
     if not spread_ok(s.bid, s.ask, s.last_price):
         return False
+    # volume spike
     if s.vol_1m is None or s.vol_5m_avg is None:
         return False
     if s.vol_1m < VOLUME_SPIKE_MULT * s.vol_5m_avg:
@@ -239,7 +262,7 @@ def compute_dynamic_levels(symbol: str, last_price: float) -> Dict[str, float]:
         return {"stop_loss": round(last_price * 0.98, 2), "trailing": 0.015}
 
 # =========================
-# Position state
+# Position state / exits
 # =========================
 positions_state: Dict[str, Dict] = {}
 
@@ -351,7 +374,7 @@ def trade_symbol(symbol: str, today_spend: float) -> float:
 # Main loop
 # =========================
 def run():
-    logging.info("Starting day-trading bot (Dynamic SL + Dynamic Trailing + 50 symbols)...")
+    logging.info("Starting day-trading bot (Daily + Intraminute filters)...")
     today_date = None
     today_spend = 0.0
     while True:
