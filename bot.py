@@ -53,7 +53,7 @@ MOMENTUM_THRESHOLD      = 0.003    # +0.3% last 1-min momentum
 VOLUME_SPIKE_MULT       = 1.2      # last 1-min vol >= 1.2x avg of prev 5
 SPREAD_CENTS_LIMIT      = 0.05     # spread <= $0.05
 SPREAD_PCT_LIMIT        = 0.002    # OR spread <= 0.2% of price
-DAILY_CHANGE_MIN_PCT    = 0.05     # NEW: day change >= +5%
+DAILY_CHANGE_MIN_PCT    = 0.02     # NEW: day change >= +5%
 
 # Exits
 TAKE_PROFIT_PCT         = 0.04     # +4% take-profit
