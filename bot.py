@@ -30,7 +30,7 @@ SYMBOLS = [
 ]
 
 BUY_SIZE    = 5          # shares per trade
-BUY_TRIGGER = 0.0005     # >= +0.05% 1-min momentum to buy
+BUY_TRIGGER = 0.001     # >= +0.05% 1-min momentum to buy
 TRAIL_STOP  = 0.01       # sell if price drops 1% from post-entry highest
 STOP_LOSS   = 0.005      # sell if price drops 0.5% from entry
 
