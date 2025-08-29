@@ -23,7 +23,7 @@ API_KEY    = os.getenv("APCA_API_KEY_ID", "")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY", "")
 BASE_URL   = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
 
-# Top 50 US stocks
+# Top 50 US stocks (large caps / liquid)
 SYMBOLS: List[str] = [
     "AAPL","MSFT","AMZN","GOOGL","GOOG","NVDA","META","TSLA","BRK.B","JPM",
     "JNJ","V","UNH","PG","XOM","MA","AVGO","HD","MRK","PEP",
@@ -41,24 +41,29 @@ api = REST(API_KEY, API_SECRET, base_url=BASE_URL)
 # =========================
 # Risk / Sizing Parameters
 # =========================
-FIXED_DOLLARS_PER_TRADE = 1000.0
-RISK_PCT_OF_BP          = 0.01
-MAX_SHARES_PER_TRADE    = 10
-MAX_PRICE_PER_SHARE     = 600.0
-DAILY_MAX_SPEND         = 5000.0
-LOOP_SLEEP_SECONDS      = 30
+FIXED_DOLLARS_PER_TRADE = 1000.0   # fixed budget per trade
+RISK_PCT_OF_BP          = 0.01     # cap = min(fixed, 1% of buying power)
+MAX_SHARES_PER_TRADE    = 10       # never buy more than this many shares
+MAX_PRICE_PER_SHARE     = 600.0    # skip very expensive tickers
+DAILY_MAX_SPEND         = 5000.0   # daily gross spend cap
+LOOP_SLEEP_SECONDS      = 30       # loop frequency (seconds)
 
+# =========================
 # Entry filters
-MOMENTUM_THRESHOLD      = 0.003    # +0.3% last 1-min momentum (reduce to 0.001 for +0.1%)
+# =========================
+MOMENTUM_THRESHOLD      = 0.003    # +0.3% last 1-min momentum (lower to 0.001 for +0.1%)
 VOLUME_SPIKE_MULT       = 1.2      # last 1-min vol >= 1.2x avg of prev 5
-SPREAD_CENTS_LIMIT      = 0.05     # spread <= $0.05
+SPREAD_CENTS_LIMIT      = 0.05     # pass if spread <= $0.05
 SPREAD_PCT_LIMIT        = 0.002    # OR spread <= 0.2% of price
-DAILY_CHANGE_MIN_PCT    = 0.02     # day change >= +2%  (you lowered this from 5%)
+DAILY_CHANGE_MIN_PCT    = 0.02     # day change >= +2%
+# NOTE: if daily_change is None, we do NOT reject (see should_buy)
 
+# =========================
 # Exits
-TAKE_PROFIT_PCT         = 0.04
-MAX_HOLD_MINUTES        = 25
-FLATTEN_BEFORE_CLOSE_MIN= 5
+# =========================
+TAKE_PROFIT_PCT         = 0.04     # +4% take-profit (bracket)
+MAX_HOLD_MINUTES        = 25       # time-based exit
+FLATTEN_BEFORE_CLOSE_MIN= 5        # flatten positions before close
 
 # =========================
 # Data Container
@@ -86,6 +91,7 @@ def market_is_open() -> bool:
         return bool(getattr(clock, "is_open", False))
     except Exception as e:
         logging.warning(f"clock check failed: {e}")
+        # Be permissive on paper
         return True
 
 def minutes_to_close() -> Optional[int]:
@@ -134,7 +140,8 @@ def compute_vwap_from_last5(symbol: str) -> Optional[float]:
         vol_sum = 0.0
         tpv_sum = 0.0
         for b in prev5:
-            tpv_sum += ((float(b.h) + float(b.l) + float(b.c)) / 3.0) * float(b.v)
+            tp = (float(b.h) + float(b.l) + float(b.c)) / 3.0
+            tpv_sum += tp * float(b.v)
             vol_sum += float(b.v)
         if vol_sum <= 0:
             return None
@@ -153,6 +160,7 @@ def fetch_snapshot(symbol: str) -> Optional[Snapshot]:
         bid = float(getattr(quote, "bid_price", 0) or 0)
         ask = float(getattr(quote, "ask_price", 0) or 0)
 
+        # 1-min momentum, 5-min high, volumes
         min1_change_pct = None
         high_5m = None
         vol_1m = None
@@ -170,6 +178,7 @@ def fetch_snapshot(symbol: str) -> Optional[Snapshot]:
 
         vwap_value = compute_vwap_from_last5(symbol)
 
+        # Previous daily close & daily change %
         prev_close = None
         daily_change_pct = None
         try:
@@ -199,18 +208,28 @@ def fetch_snapshot(symbol: str) -> Optional[Snapshot]:
         return None
 
 # =========================
-# Diagnostic entry check
+# Diagnostics helpers
+# =========================
+def fmt_pct(x: Optional[float]) -> str:
+    return f"{x*100:.2f}%" if x is not None else "None"
+
+def fmt_price(x: Optional[float]) -> str:
+    return f"{x:.2f}" if x is not None else "None"
+
+def fmt_ratio(x: Optional[float]) -> str:
+    return f"{x:.2f}x" if x is not None else "None"
+
+# =========================
+# Entry decision (with detailed diagnostics)
 # =========================
 def should_buy(s: Snapshot) -> Tuple[bool, str]:
-    """Return (ok, reason). If not ok, reason explains the first failing filter."""
-    # Pre-computed diagnostics
+    """Return (ok, reason). If not ok, 'reason' explains the first failing filter."""
     vwap_ok = (s.vwap is None) or (s.last_price >= s.vwap)
     vol_ratio = None
     if s.vol_1m is not None and s.vol_5m_avg not in (None, 0):
         vol_ratio = s.vol_1m / s.vol_5m_avg
     spread_ok_flag = spread_ok(s.bid, s.ask, s.last_price)
 
-    # Print a one-line diagnostic snapshot
     logging.info(
         f"CHK {s.symbol} | day={fmt_pct(s.daily_change_pct)} "
         f"| 1m={fmt_pct(s.min1_change_pct)} "
@@ -222,8 +241,12 @@ def should_buy(s: Snapshot) -> Tuple[bool, str]:
 
     if s.last_price <= 0:
         return False, "bad_price"
-    if s.daily_change_pct is None or s.daily_change_pct < DAILY_CHANGE_MIN_PCT:
+
+    # KEY CHANGE: Do NOT reject when daily_change_pct is None.
+    # Only reject if it's present AND below threshold.
+    if (s.daily_change_pct is not None) and (s.daily_change_pct < DAILY_CHANGE_MIN_PCT):
         return False, "daily_change_below_threshold"
+
     if not vwap_ok:
         return False, "below_VWAP"
     if s.min1_change_pct is None or s.min1_change_pct < MOMENTUM_THRESHOLD:
@@ -238,19 +261,15 @@ def should_buy(s: Snapshot) -> Tuple[bool, str]:
         return False, "weak_volume_spike"
     return True, "ok"
 
-def fmt_pct(x: Optional[float]) -> str:
-    return f"{x*100:.2f}%" if x is not None else "None"
-
-def fmt_price(x: Optional[float]) -> str:
-    return f"{x:.2f}" if x is not None else "None"
-
-def fmt_ratio(x: Optional[float]) -> str:
-    return f"{x:.2f}x" if x is not None else "None"
-
 # =========================
 # Dynamic SL & Trailing
 # =========================
 def compute_dynamic_levels(symbol: str, last_price: float) -> Dict[str, float]:
+    """
+    Dynamic Stop-Loss (price) and dynamic Trailing % based on intraday volatility
+    (avg (high-low) over the last 10 one-minute bars).
+    Fallback: 2% SL and 1.5% trailing when volatility data is missing.
+    """
     try:
         bars = api.get_bars(symbol, TimeFrame.Minute, limit=11)
         if not bars or len(bars) < 2:
@@ -260,7 +279,7 @@ def compute_dynamic_levels(symbol: str, last_price: float) -> Dict[str, float]:
         avg_range = mean(ranges) if ranges else last_price * 0.01
 
         stop_loss_price = round(last_price - (avg_range * 1.5), 2)
-        trailing_pct    = max(min(avg_range / last_price, 0.05), 0.005)
+        trailing_pct    = max(min(avg_range / last_price, 0.05), 0.005)  # 0.5%–5%
         return {"stop_loss": stop_loss_price, "trailing": trailing_pct}
     except Exception as e:
         logging.warning(f"dynamic levels failed for {symbol}: {e}")
@@ -269,7 +288,7 @@ def compute_dynamic_levels(symbol: str, last_price: float) -> Dict[str, float]:
 # =========================
 # Position state / exits
 # =========================
-positions_state: Dict[str, Dict] = {}
+positions_state: Dict[str, Dict] = {}  # symbol -> {entry_price, entry_time, high_water}
 
 def update_position_state(symbol: str, entry_price: float):
     positions_state[symbol] = {
@@ -282,12 +301,15 @@ def handle_trailing_and_time_exit(symbol: str, last_price: float):
     st = positions_state.get(symbol)
     if not st:
         return
+    # Update high water
     if last_price > st["high_water"]:
         st["high_water"] = last_price
+    # Time stop
     age_min = (datetime.now(timezone.utc) - st["entry_time"]).total_seconds() / 60.0
     if age_min >= MAX_HOLD_MINUTES:
         close_position(symbol, reason=f"time_stop {age_min:.1f}m")
         return
+    # Dynamic trailing
     dyn = compute_dynamic_levels(symbol, last_price)
     dyn_trail = dyn["trailing"]
     if st["high_water"] > 0:
@@ -297,9 +319,11 @@ def handle_trailing_and_time_exit(symbol: str, last_price: float):
 
 def close_position(symbol: str, reason: str = ""):
     try:
+        # Cancel open orders (e.g., remaining bracket legs)
         for o in api.list_orders(status="open"):
             if o.symbol == symbol:
                 api.cancel_order(o.id)
+        # Market-close the position
         api.close_position(symbol)
         logging.info(f"CLOSE {symbol} (reason={reason})")
         positions_state.pop(symbol, None)
@@ -331,13 +355,16 @@ def place_bracket_buy(symbol: str, qty: int, last_price: float):
         stop_loss={"stop_price": stop_price},
         take_profit={"limit_price": tp_price},
     )
-    logging.info(f"BUY {symbol} qty={qty} @~{last_price:.2f} TP={tp_price:.2f} SL={stop_price:.2f}")
+    logging.info(
+        f"BUY {symbol} qty={qty} @~{last_price:.2f} TP={tp_price:.2f} SL={stop_price:.2f}"
+    )
     return order
 
 # =========================
-# Trade logic
+# Trade routine
 # =========================
 def trade_symbol(symbol: str, today_spend: float) -> float:
+    # Safety: flatten close to market close
     mtc = minutes_to_close()
     if mtc is not None and mtc <= FLATTEN_BEFORE_CLOSE_MIN:
         try:
@@ -352,10 +379,12 @@ def trade_symbol(symbol: str, today_spend: float) -> float:
         logging.info(f"NO_DATA {symbol}")
         return 0.0
 
+    # Manage open position (dynamic trailing/time)
     if already_in_position(symbol):
         handle_trailing_and_time_exit(symbol, snap.last_price)
         return 0.0
 
+    # Entry
     ok, reason = should_buy(snap)
     if ok:
         qty = compute_qty(snap.last_price, today_spend)
@@ -388,9 +417,10 @@ def trade_symbol(symbol: str, today_spend: float) -> float:
 # Main loop
 # =========================
 def run():
-    logging.info("Starting day-trading bot (with detailed diagnostics)...")
+    logging.info("Starting day-trading bot (diagnostics + dynamic SL/trailing + bracket TP/SL)...")
     today_date = None
     today_spend = 0.0
+
     while True:
         try:
             now_date = time.strftime("%Y-%m-%d")
@@ -407,6 +437,7 @@ def run():
                 logging.info("Market closed. Waiting...")
         except Exception as e:
             logging.exception(f"Run loop error: {e}")
+
         time.sleep(LOOP_SLEEP_SECONDS)
 
 if __name__ == "__main__":
