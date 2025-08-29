@@ -2,7 +2,7 @@ import os
 import time
 import logging
 from dataclasses import dataclass
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone
 from statistics import mean
 
@@ -23,7 +23,7 @@ API_KEY    = os.getenv("APCA_API_KEY_ID", "")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY", "")
 BASE_URL   = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
 
-# Top 50 US stocks to watch
+# Top 50 US stocks
 SYMBOLS: List[str] = [
     "AAPL","MSFT","AMZN","GOOGL","GOOG","NVDA","META","TSLA","BRK.B","JPM",
     "JNJ","V","UNH","PG","XOM","MA","AVGO","HD","MRK","PEP",
@@ -49,14 +49,14 @@ DAILY_MAX_SPEND         = 5000.0
 LOOP_SLEEP_SECONDS      = 30
 
 # Entry filters
-MOMENTUM_THRESHOLD      = 0.003    # +0.3% last 1-min momentum
+MOMENTUM_THRESHOLD      = 0.003    # +0.3% last 1-min momentum (reduce to 0.001 for +0.1%)
 VOLUME_SPIKE_MULT       = 1.2      # last 1-min vol >= 1.2x avg of prev 5
 SPREAD_CENTS_LIMIT      = 0.05     # spread <= $0.05
 SPREAD_PCT_LIMIT        = 0.002    # OR spread <= 0.2% of price
-DAILY_CHANGE_MIN_PCT    = 0.02     # NEW: day change >= +5%
+DAILY_CHANGE_MIN_PCT    = 0.02     # day change >= +2%  (you lowered this from 5%)
 
 # Exits
-TAKE_PROFIT_PCT         = 0.04     # +4% take-profit
+TAKE_PROFIT_PCT         = 0.04
 MAX_HOLD_MINUTES        = 25
 FLATTEN_BEFORE_CLOSE_MIN= 5
 
@@ -65,6 +65,7 @@ FLATTEN_BEFORE_CLOSE_MIN= 5
 # =========================
 @dataclass
 class Snapshot:
+    symbol: str
     last_price: float
     bid: float
     ask: float
@@ -96,12 +97,8 @@ def minutes_to_close() -> Optional[int]:
         close_ts = getattr(clock, "next_close", None)
         if not close_ts:
             return None
-        if isinstance(close_ts, str):
-            close_dt = datetime.fromisoformat(close_ts.replace("Z", "+00:00"))
-        else:
-            close_dt = close_ts
-        delta = (close_dt - now).total_seconds() / 60.0
-        return int(delta)
+        close_dt = datetime.fromisoformat(close_ts.replace("Z", "+00:00")) if isinstance(close_ts, str) else close_ts
+        return int((close_dt - now).total_seconds() / 60.0)
     except Exception as e:
         logging.warning(f"minutes_to_close failed: {e}")
         return None
@@ -117,16 +114,10 @@ def compute_qty(last_price: float, today_spend: float) -> int:
     if last_price <= 0 or last_price > MAX_PRICE_PER_SHARE:
         return 0
 
-    cap_by_fixed = FIXED_DOLLARS_PER_TRADE
-    cap_by_pct   = buying_power * RISK_PCT_OF_BP
-    dollars_cap  = min(cap_by_fixed, cap_by_pct)
-
-    remaining_daily = max(DAILY_MAX_SPEND - today_spend, 0.0)
-    dollars_cap = min(dollars_cap, remaining_daily)
-
+    dollars_cap  = min(FIXED_DOLLARS_PER_TRADE, buying_power * RISK_PCT_OF_BP)
+    dollars_cap  = min(dollars_cap, max(DAILY_MAX_SPEND - today_spend, 0.0))
     qty = int(dollars_cap // last_price)
-    qty = max(min(qty, MAX_SHARES_PER_TRADE), 0)
-    return qty
+    return max(min(qty, MAX_SHARES_PER_TRADE), 0)
 
 def spread_ok(bid: float, ask: float, price: float) -> bool:
     if bid <= 0 or ask <= 0 or ask < bid or price <= 0:
@@ -143,10 +134,8 @@ def compute_vwap_from_last5(symbol: str) -> Optional[float]:
         vol_sum = 0.0
         tpv_sum = 0.0
         for b in prev5:
-            h = float(b.h); l = float(b.l); c = float(b.c); v = float(b.v)
-            tp = (h + l + c) / 3.0
-            tpv_sum += tp * v
-            vol_sum += v
+            tpv_sum += ((float(b.h) + float(b.l) + float(b.c)) / 3.0) * float(b.v)
+            vol_sum += float(b.v)
         if vol_sum <= 0:
             return None
         return tpv_sum / vol_sum
@@ -164,31 +153,23 @@ def fetch_snapshot(symbol: str) -> Optional[Snapshot]:
         bid = float(getattr(quote, "bid_price", 0) or 0)
         ask = float(getattr(quote, "ask_price", 0) or 0)
 
-        # 1-min momentum
         min1_change_pct = None
+        high_5m = None
+        vol_1m = None
+        vol_5m_avg = None
         if bars_1m and len(bars_1m) >= 2:
             p_now  = float(bars_1m[-1].c)
             p_prev = float(bars_1m[-2].c)
             if p_prev > 0:
                 min1_change_pct = (p_now - p_prev) / p_prev
-
-        # 5-min high
-        high_5m = None
         if bars_1m and len(bars_1m) >= 6:
             high_5m = max(float(b.h) for b in bars_1m[-6:-1])
-
-        # volumes
-        vol_1m = None
-        vol_5m_avg = None
-        if bars_1m and len(bars_1m) >= 6:
             vol_1m = float(bars_1m[-1].v)
             prev5  = [float(b.v) for b in bars_1m[-6:-1]]
             vol_5m_avg = (sum(prev5) / len(prev5)) if prev5 else None
 
-        # VWAP from last 5 minutes
         vwap_value = compute_vwap_from_last5(symbol)
 
-        # NEW: previous daily close & daily change %
         prev_close = None
         daily_change_pct = None
         try:
@@ -201,6 +182,7 @@ def fetch_snapshot(symbol: str) -> Optional[Snapshot]:
             logging.warning(f"daily change calc failed for {symbol}: {e}")
 
         return Snapshot(
+            symbol=symbol,
             last_price=last_price,
             bid=bid,
             ask=ask,
@@ -216,30 +198,54 @@ def fetch_snapshot(symbol: str) -> Optional[Snapshot]:
         logging.warning(f"fetch_snapshot failed for {symbol}: {e}")
         return None
 
-def should_buy(s: Snapshot) -> bool:
+# =========================
+# Diagnostic entry check
+# =========================
+def should_buy(s: Snapshot) -> Tuple[bool, str]:
+    """Return (ok, reason). If not ok, reason explains the first failing filter."""
+    # Pre-computed diagnostics
+    vwap_ok = (s.vwap is None) or (s.last_price >= s.vwap)
+    vol_ratio = None
+    if s.vol_1m is not None and s.vol_5m_avg not in (None, 0):
+        vol_ratio = s.vol_1m / s.vol_5m_avg
+    spread_ok_flag = spread_ok(s.bid, s.ask, s.last_price)
+
+    # Print a one-line diagnostic snapshot
+    logging.info(
+        f"CHK {s.symbol} | day={fmt_pct(s.daily_change_pct)} "
+        f"| 1m={fmt_pct(s.min1_change_pct)} "
+        f"| vwap_ok={vwap_ok} "
+        f"| 5m_high={fmt_price(s.high_5m)}<=curr={fmt_price(s.last_price)} "
+        f"| vol_ratio={fmt_ratio(vol_ratio)} "
+        f"| spread_ok={spread_ok_flag}"
+    )
+
     if s.last_price <= 0:
-        return False
-    # NEW: require the stock to be up at least +5% today
+        return False, "bad_price"
     if s.daily_change_pct is None or s.daily_change_pct < DAILY_CHANGE_MIN_PCT:
-        return False
-    # price above VWAP (if available)
-    if s.vwap is not None and s.last_price < s.vwap:
-        return False
-    # 1-min momentum
+        return False, "daily_change_below_threshold"
+    if not vwap_ok:
+        return False, "below_VWAP"
     if s.min1_change_pct is None or s.min1_change_pct < MOMENTUM_THRESHOLD:
-        return False
-    # breakout vs. previous 5-min high
+        return False, "weak_1min_momentum"
     if s.high_5m is None or s.last_price < s.high_5m:
-        return False
-    # healthy spread
-    if not spread_ok(s.bid, s.ask, s.last_price):
-        return False
-    # volume spike
-    if s.vol_1m is None or s.vol_5m_avg is None:
-        return False
-    if s.vol_1m < VOLUME_SPIKE_MULT * s.vol_5m_avg:
-        return False
-    return True
+        return False, "not_breaking_5min_high"
+    if not spread_ok_flag:
+        return False, "bad_spread"
+    if s.vol_1m is None or s.vol_5m_avg in (None, 0):
+        return False, "volume_data_missing"
+    if vol_ratio is None or vol_ratio < VOLUME_SPIKE_MULT:
+        return False, "weak_volume_spike"
+    return True, "ok"
+
+def fmt_pct(x: Optional[float]) -> str:
+    return f"{x*100:.2f}%" if x is not None else "None"
+
+def fmt_price(x: Optional[float]) -> str:
+    return f"{x:.2f}" if x is not None else "None"
+
+def fmt_ratio(x: Optional[float]) -> str:
+    return f"{x:.2f}x" if x is not None else "None"
 
 # =========================
 # Dynamic SL & Trailing
@@ -254,8 +260,7 @@ def compute_dynamic_levels(symbol: str, last_price: float) -> Dict[str, float]:
         avg_range = mean(ranges) if ranges else last_price * 0.01
 
         stop_loss_price = round(last_price - (avg_range * 1.5), 2)
-        trailing_pct = max(min(avg_range / last_price, 0.05), 0.005)
-
+        trailing_pct    = max(min(avg_range / last_price, 0.05), 0.005)
         return {"stop_loss": stop_loss_price, "trailing": trailing_pct}
     except Exception as e:
         logging.warning(f"dynamic levels failed for {symbol}: {e}")
@@ -289,7 +294,6 @@ def handle_trailing_and_time_exit(symbol: str, last_price: float):
         drawdown = (st["high_water"] - last_price) / st["high_water"]
         if drawdown >= dyn_trail:
             close_position(symbol, reason=f"trailing_stop {drawdown:.3f}")
-            return
 
 def close_position(symbol: str, reason: str = ""):
     try:
@@ -352,7 +356,8 @@ def trade_symbol(symbol: str, today_spend: float) -> float:
         handle_trailing_and_time_exit(symbol, snap.last_price)
         return 0.0
 
-    if should_buy(snap):
+    ok, reason = should_buy(snap)
+    if ok:
         qty = compute_qty(snap.last_price, today_spend)
         if qty >= 1:
             try:
@@ -367,14 +372,23 @@ def trade_symbol(symbol: str, today_spend: float) -> float:
             logging.info(f"SKIP {symbol}: qty<1 (price={snap.last_price:.2f})")
             return 0.0
     else:
-        logging.info(f"NO_ENTRY {symbol}: filters not satisfied")
+        logging.info(
+            f"NO_ENTRY {symbol}: {reason} "
+            f"| day={fmt_pct(snap.daily_change_pct)} "
+            f"| 1m={fmt_pct(snap.min1_change_pct)} "
+            f"| vwap={fmt_price(snap.vwap)} "
+            f"| 5m_high={fmt_price(snap.high_5m)} "
+            f"| vol1m={snap.vol_1m if snap.vol_1m is not None else 'None'} "
+            f"| vol5mAvg={snap.vol_5m_avg if snap.vol_5m_avg is not None else 'None'} "
+            f"| spread_ok={spread_ok(snap.bid, snap.ask, snap.last_price)}"
+        )
         return 0.0
 
 # =========================
 # Main loop
 # =========================
 def run():
-    logging.info("Starting day-trading bot (Daily + Intraminute filters)...")
+    logging.info("Starting day-trading bot (with detailed diagnostics)...")
     today_date = None
     today_spend = 0.0
     while True:
