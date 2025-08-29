@@ -1,6 +1,7 @@
 import os
 import time
 import logging
+from time import monotonic
 from alpaca_trade_api.rest import REST, TimeFrame
 
 # =========================
@@ -21,17 +22,22 @@ BASE_URL   = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets").
 api = REST(API_KEY, API_SECRET, BASE_URL)
 
 # =========================
-# Config
+# Config (tuning)
 # =========================
+# Static fallback list (used if DYNAMIC_SYMBOLS=False or picker fails)
 SYMBOLS = [
-    "AAPL","MSFT","NVDA","TSLA","AMZN","META","GOOGL","AMD","NFLX",
-    "AVGO","ORCL","CRM","COIN","SHOP","UBER"
-]  # add/remove symbols as you like
+    "AAPL","MSFT","NVDA","TSLA","AMZN","META","GOOGL","AMD","NFLX","AVGO"
+]
 
-BUY_SIZE    = 5        # shares per trade (change as you want)
-BUY_TRIGGER = 0.0005   # >= +0.05% 1-min momentum to buy
-TRAIL_STOP  = 0.01     # sell if price drops 1% from post-entry highest
-STOP_LOSS   = 0.005    # sell if price drops 0.5% from entry (fixed SL)
+BUY_SIZE    = 5          # shares per trade
+BUY_TRIGGER = 0.0005     # >= +0.05% 1-min momentum to buy
+TRAIL_STOP  = 0.01       # sell if price drops 1% from post-entry highest
+STOP_LOSS   = 0.005      # sell if price drops 0.5% from entry
+
+# Dynamic universe selection
+DYNAMIC_SYMBOLS = True   # turn on/off dynamic picking
+SYMBOL_COUNT    = 10     # how many symbols to track dynamically
+REFRESH_MINUTES = 15     # re-pick universe every N minutes
 
 # Track highest price since entry per symbol
 highest_price = {}  # symbol -> float
@@ -58,6 +64,57 @@ def has_open_order(symbol: str) -> bool:
         return False
 
 # =========================
+# Dynamic symbol picking
+# =========================
+def list_tradable_us_symbols(limit_universe: int = 200):
+    """Return a coarse universe of liquid, tradable US symbols."""
+    syms = []
+    try:
+        assets = api.list_assets(status="active")
+        for a in assets:
+            if (
+                a.tradable
+                and a.exchange in ("NASDAQ", "NYSE", "ARCA")
+                and a.symbol.isalpha()
+                and len(a.symbol) <= 5
+            ):
+                syms.append(a.symbol)
+            if len(syms) >= limit_universe:
+                break
+    except Exception as e:
+        logging.error(f"list_tradable_us_symbols error: {e}")
+    return syms
+
+def pick_dynamic_symbols(n: int = 10):
+    """
+    Pick top 'n' movers by current 1-min % change, boosted by last bar volume.
+    Only positive movers are considered.
+    """
+    base = list_tradable_us_symbols(limit_universe=200)
+    scored = []
+    for sym in base:
+        try:
+            bars = api.get_bars(sym, TimeFrame.Minute, limit=2)
+            if len(bars) != 2:
+                continue
+            prev_c = float(bars[0].c)
+            last_c = float(bars[1].c)
+            last_v = float(bars[1].v)
+            if prev_c <= 0:
+                continue
+            change = (last_c - prev_c) / prev_c  # 1-min % change
+            if change <= 0:
+                continue  # focus on upward movers
+            # score: momentum × (1 + volume factor capped at 2x)
+            score = change * (1.0 + min(last_v / 1_000_000.0, 2.0))
+            scored.append((score, sym))
+        except Exception:
+            continue
+    scored.sort(reverse=True)
+    picked = [sym for _, sym in scored[:n]]
+    return picked if picked else SYMBOLS[:n]
+
+# =========================
 # Trading actions
 # =========================
 def place_buy(symbol: str, qty: int = None):
@@ -71,8 +128,7 @@ def place_buy(symbol: str, qty: int = None):
         type="market",
         time_in_force="gtc"
     )
-    # reset high tracking for new position
-    highest_price[symbol] = None
+    highest_price[symbol] = None  # reset high tracking
 
 def place_sell(symbol: str, qty: int):
     logging.info(f"Placing SELL for {qty} of {symbol}")
@@ -83,8 +139,7 @@ def place_sell(symbol: str, qty: int):
         type="market",
         time_in_force="gtc"
     )
-    # allow immediate re-entry later
-    highest_price.pop(symbol, None)
+    highest_price.pop(symbol, None)  # allow re-entry later
 
 # =========================
 # Position management (Trailing + Fixed Stop)
@@ -129,8 +184,26 @@ def manage_positions():
 # Main loop
 # =========================
 if __name__ == "__main__":
+    # Initial dynamic pick
+    if DYNAMIC_SYMBOLS:
+        try:
+            SYMBOLS = pick_dynamic_symbols(SYMBOL_COUNT)
+            logging.info(f"Dynamic SYMBOLS = {SYMBOLS}")
+        except Exception as e:
+            logging.error(f"Initial dynamic pick failed: {e}")
+
+    last_refresh_t = monotonic()
+
     while True:
         try:
+            # Periodic refresh of dynamic universe
+            if DYNAMIC_SYMBOLS and (monotonic() - last_refresh_t) >= REFRESH_MINUTES * 60:
+                new_syms = pick_dynamic_symbols(SYMBOL_COUNT)
+                if new_syms:
+                    SYMBOLS = new_syms
+                    logging.info(f"Refreshed SYMBOLS = {SYMBOLS}")
+                last_refresh_t = monotonic()
+
             open_positions = {p.symbol for p in api.list_positions()}
 
             for symbol in SYMBOLS:
@@ -148,10 +221,10 @@ if __name__ == "__main__":
                     if change >= BUY_TRIGGER:
                         place_buy(symbol, BUY_SIZE)
 
-            # manage trailing/fixed stops for open positions
+            # manage stops for open positions
             manage_positions()
 
-            time.sleep(60)  # run every minute (keep it 60s for now)
+            time.sleep(60)  # 1-minute cadence (because we're using minute bars)
         except Exception as e:
             logging.error(f"Loop error: {e}")
             time.sleep(60)
