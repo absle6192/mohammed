@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone
 from statistics import mean
-from alpaca_trade_api.rest import REST, TimeFrame
+from alpaca_trade_api.rest import REST, TimeFrame, APIError
 
 # =========================
 # Logging
@@ -46,30 +46,31 @@ DAILY_MAX_SPEND         = float(os.getenv("DAILY_MAX_SPEND", "5000"))
 LOOP_SLEEP_SECONDS      = int(os.getenv("LOOP_SLEEP_SECONDS", "30"))
 
 # =========================
-# Lite filters (ON)
+# Lite entry filters
 # =========================
 DAILY_CHANGE_MIN_PCT    = float(os.getenv("DAILY_CHANGE_MIN_PCT", "0.02"))  # +2%
 SPREAD_CENTS_LIMIT      = float(os.getenv("SPREAD_CENTS_LIMIT", "0.05"))
 SPREAD_PCT_LIMIT        = float(os.getenv("SPREAD_PCT_LIMIT", "0.002"))
 
-# Optional filters (OFF by default)
+# Optional (off by default)
 ENABLE_VWAP         = os.getenv("ENABLE_VWAP", "false").lower() == "true"
 ENABLE_MOMENTUM     = os.getenv("ENABLE_MOMENTUM", "false").lower() == "true"
 ENABLE_VOLUME_SPIKE = os.getenv("ENABLE_VOLUME_SPIKE", "false").lower() == "true"
 ENABLE_5M_BREAK     = os.getenv("ENABLE_5M_BREAK", "false").lower() == "true"
 
-MOMENTUM_THRESHOLD  = float(os.getenv("MOMENTUM_THRESHOLD", "0.001"))
-VOLUME_SPIKE_MULT   = float(os.getenv("VOLUME_SPIKE_MULT", "1.0"))
+MOMENTUM_THRESHOLD  = float(os.getenv("MOMENTUM_THRESHOLD", "0.001"))  # +0.1% if enabled
+VOLUME_SPIKE_MULT   = float(os.getenv("VOLUME_SPIKE_MULT", "1.0"))     # 1.0x if enabled
 
 # =========================
-# Exits
+# Exits (Trailing + safety)
 # =========================
-TAKE_PROFIT_PCT          = float(os.getenv("TAKE_PROFIT_PCT", "0.04"))  # +4%
+TRAILING_STOP_PCT        = float(os.getenv("TRAILING_STOP_PCT", "0.02"))  # 2% trailing from high-water
+INITIAL_STOP_PCT         = float(os.getenv("INITIAL_STOP_PCT", "0.02"))   # initial protective stop vs entry
 MAX_HOLD_MINUTES         = int(os.getenv("MAX_HOLD_MINUTES", "25"))
 FLATTEN_BEFORE_CLOSE_MIN = int(os.getenv("FLATTEN_BEFORE_CLOSE_MIN", "5"))
 
 # =========================
-# Data
+# Data types
 # =========================
 @dataclass
 class Snapshot:
@@ -211,7 +212,7 @@ def should_buy(s: Snapshot) -> Tuple[bool, str]:
     if s.last_price <= 0:
         return False, "bad_price"
 
-    # Lite: only reject daily change when it exists AND is below the threshold
+    # Do NOT reject if daily is None; only reject when present and below threshold
     if (s.daily_change_pct is not None) and (s.daily_change_pct < DAILY_CHANGE_MIN_PCT):
         return False, "daily_change_below_threshold"
 
@@ -234,104 +235,120 @@ def should_buy(s: Snapshot) -> Tuple[bool, str]:
     return True, "ok"
 
 # =========================
-# Dynamic SL + trailing helpers
+# Trailing stop management
 # =========================
-def dynamic_levels(symbol: str, last_price: float) -> Dict[str, float]:
-    try:
-        bars = api.get_bars(symbol, TimeFrame.Minute, limit=11)
-        if not bars or len(bars) < 2:
-            return {"stop_loss": round(last_price * 0.98, 2), "trailing": 0.015}
-        rng = [float(b.h) - float(b.l) for b in bars[-10:]]
-        avg_r = mean(rng) if rng else last_price * 0.01
-        sl = round(last_price - avg_r * 1.5, 2)
-        tr = max(min(avg_r / last_price, 0.05), 0.005)
-        return {"stop_loss": sl, "trailing": tr}
-    except Exception:
-        return {"stop_loss": round(last_price * 0.98, 2), "trailing": 0.015}
+positions_state: Dict[str, Dict] = {}  # symbol -> {entry_price, entry_time, high_water, stop_order_id}
 
-# =========================
-# Positions state / exits
-# =========================
-positions_state: Dict[str, Dict] = {}
+def create_or_update_stop(symbol: str, qty: int, desired_stop: float, last_price: float):
+    """
+    Place or update a server-side SELL stop order at desired_stop.
+    Will only move stop UP (never down).
+    """
+    # Alpaca rule: stop for a long must be below current price
+    desired_stop = round(min(desired_stop, last_price - 0.01), 2)
 
-def update_position_state(symbol: str, entry_price: float):
-    positions_state[symbol] = {
-        "entry_price": entry_price,
-        "entry_time": datetime.now(timezone.utc),
-        "high_water": entry_price
-    }
+    st = positions_state.get(symbol, {})
+    existing_id = st.get("stop_order_id")
+    current_stop = st.get("current_stop")
 
-def handle_trailing_and_time_exit(symbol: str, last_price: float):
+    # Only raise the stop (or create if none)
+    if current_stop is None or desired_stop > current_stop:
+        # Cancel old stop if any
+        if existing_id:
+            try:
+                api.cancel_order(existing_id)
+                logging.info(f"{symbol}: canceled old stop {existing_id} @ {current_stop}")
+            except Exception as e:
+                logging.warning(f"{symbol}: cancel old stop failed: {e}")
+
+        # Submit new stop
+        try:
+            o = api.submit_order(
+                symbol=symbol,
+                qty=qty,
+                side="sell",
+                type="stop",
+                time_in_force="day",
+                stop_price=desired_stop
+            )
+            st["stop_order_id"] = o.id
+            st["current_stop"]  = desired_stop
+            positions_state[symbol] = st
+            logging.info(f"{symbol}: placed/raised stop to {desired_stop:.2f}")
+        except APIError as e:
+            logging.exception(f"{symbol}: submit stop failed: {e}")
+        except Exception as e:
+            logging.exception(f"{symbol}: submit stop failed: {e}")
+
+def handle_trailing_and_time_exit(symbol: str, last_price: float, qty: int):
     st = positions_state.get(symbol)
     if not st:
         return
+
+    # Update high-water
     if last_price > st["high_water"]:
         st["high_water"] = last_price
-    age = (datetime.now(timezone.utc) - st["entry_time"]).total_seconds() / 60.0
-    if age >= MAX_HOLD_MINUTES:
-        close_position(symbol, f"time_stop {age:.1f}m"); return
-    dyn = dynamic_levels(symbol, last_price)
-    drawdown = (st["high_water"] - last_price) / st["high_water"] if st["high_water"] > 0 else 0
-    if drawdown >= dyn["trailing"]:
-        close_position(symbol, f"trailing_stop {drawdown:.3f}")
+
+    # Time exit
+    age_min = (datetime.now(timezone.utc) - st["entry_time"]).total_seconds() / 60.0
+    if age_min >= MAX_HOLD_MINUTES:
+        close_position(symbol, f"time_stop {age_min:.1f}m")
+        return
+
+    # Trailing: stop follows high_water down by TRAILING_STOP_PCT
+    desired_stop = round(st["high_water"] * (1 - TRAILING_STOP_PCT), 2)
+    create_or_update_stop(symbol, qty, desired_stop, last_price)
 
 def close_position(symbol: str, reason: str = ""):
     try:
+        # Cancel open orders first (stop orders etc.)
         for o in api.list_orders(status="open"):
             if o.symbol == symbol:
                 api.cancel_order(o.id)
+        # Close market
         api.close_position(symbol)
-        positions_state.pop(symbol, None)
         logging.info(f"CLOSE {symbol} (reason={reason})")
+        positions_state.pop(symbol, None)
     except Exception as e:
         logging.exception(f"close_position failed for {symbol}: {e}")
 
-def already_in_position(symbol: str) -> bool:
+def already_in_position(symbol: str) -> Tuple[bool, int]:
     try:
         pos = api.get_position(symbol)
-        in_pos = float(pos.qty) != 0.0
+        qty = int(float(pos.qty))
+        in_pos = qty != 0
         if not in_pos:
             positions_state.pop(symbol, None)
-        return in_pos
+        return in_pos, qty
     except Exception:
         positions_state.pop(symbol, None)
-        return False
+        return False, 0
 
 # =========================
-# Order placement (FIXED stop-loss rule)
+# Order placement (market buy + server-side stop)
 # =========================
-def place_bracket_buy(symbol: str, qty: int, base_price: float):
-    dyn = dynamic_levels(symbol, base_price)
-    # Start with dynamic suggested stop
-    stop_price = dyn["stop_loss"]
-
-    # Enforce Alpaca rule: stop must be <= base - 0.01
-    hard_cap = round(base_price - 0.01, 2)
-    if stop_price >= hard_cap:
-        stop_price = hard_cap
-
-    # Also ensure a minimum distance (safety)
-    min_gap = 0.03  # $0.03 below base
-    if stop_price > base_price - min_gap:
-        stop_price = round(base_price - min_gap, 2)
-
-    tp_price = round(base_price * (1 + TAKE_PROFIT_PCT), 2)
-
+def place_market_buy_with_initial_stop(symbol: str, qty: int, base_price: float):
+    # Market buy
     order = api.submit_order(
         symbol=symbol,
         qty=qty,
         side="buy",
         type="market",
-        time_in_force="day",
-        order_class="bracket",
-        stop_loss={"stop_price": stop_price},
-        take_profit={"limit_price": tp_price},
+        time_in_force="day"
     )
-    logging.info(f"BUY {symbol} qty={qty} @~{base_price:.2f} TP={tp_price:.2f} SL={stop_price:.2f}")
+    logging.info(f"BUY {symbol} qty={qty} @~{base_price:.2f}")
+
+    # Initial protective stop (relative to entry)
+    initial_stop = round(base_price * (1 - INITIAL_STOP_PCT), 2)
+    # Alpaca rule: must be below current price by at least $0.01
+    initial_stop = round(min(initial_stop, base_price - 0.01), 2)
+
+    # Create the initial stop server-side
+    create_or_update_stop(symbol, qty, initial_stop, base_price)
     return order
 
 # =========================
-# Trading loop
+# Trade routine
 # =========================
 def trade_symbol(symbol: str, today_spend: float) -> float:
     mtc = minutes_to_close()
@@ -348,8 +365,10 @@ def trade_symbol(symbol: str, today_spend: float) -> float:
         logging.info(f"NO_DATA {symbol}")
         return 0.0
 
-    if already_in_position(symbol):
-        handle_trailing_and_time_exit(symbol, snap.last_price)
+    in_pos, qty = already_in_position(symbol)
+    if in_pos:
+        # Manage trailing/time using last price
+        handle_trailing_and_time_exit(symbol, snap.last_price, qty)
         return 0.0
 
     ok, reason = should_buy(snap)
@@ -361,22 +380,28 @@ def trade_symbol(symbol: str, today_spend: float) -> float:
         )
         return 0.0
 
-    qty = compute_qty(snap.last_price, today_spend)
-    if qty < 1:
+    qty_new = compute_qty(snap.last_price, today_spend)
+    if qty_new < 1:
         logging.info(f"SKIP {symbol}: qty<1 (price={snap.last_price:.2f})")
         return 0.0
 
     try:
-        place_bracket_buy(symbol, qty, snap.last_price)
-        est_val = qty * snap.last_price
-        update_position_state(symbol, snap.last_price)
+        place_market_buy_with_initial_stop(symbol, qty_new, snap.last_price)
+        positions_state[symbol] = {
+            "entry_price": snap.last_price,
+            "entry_time": datetime.now(timezone.utc),
+            "high_water": snap.last_price,
+            "stop_order_id": positions_state.get(symbol, {}).get("stop_order_id"),
+            "current_stop": positions_state.get(symbol, {}).get("current_stop"),
+        }
+        est_val = qty_new * snap.last_price
         return est_val
     except Exception as e:
         logging.exception(f"submit_order failed for {symbol}: {e}")
         return 0.0
 
 def run():
-    logging.info("Starting LITE bot (daily% + spread; optional filters OFF)...")
+    logging.info("Starting LITE bot (Trailing Stop, no fixed TP)...")
     today_date = None
     today_spend = 0.0
     while True:
