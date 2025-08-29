@@ -1,236 +1,335 @@
-# bot.py  — LITE + Dynamic Trailing
-# Requires: alpaca-trade-api
-# Behavior:
-# - Scans a watchlist and buys when simple entry filters pass
-# - Immediately attaches a TRAILING STOP (dynamic) that moves up with price
-# - Optional hard take-profit (sell limit) if price hits a fixed % gain
-# - If either TP or trailing stop fills, the other order gets cancelled
+# bot.py  — LITE intraday bot with dynamic trailing stop
+# -----------------------------------------------
+# What it does:
+# - Scans a watchlist
+# - Basic entry filter (daily % change, spread sanity, simple momentum/volume hints)
+# - Places a bracket-like buy (with TP optional) + initial stop
+# - Keeps a dynamic trailing-stop that moves up as price makes new highs
+# -----------------------------------------------
 
-import os, time, math, logging
-from datetime import datetime, timezone
-from typing import Optional, Dict, List
-import alpaca_trade_api as tradeapi
+import os
+import time
+import math
+import datetime as dt
+from typing import Dict, Optional
 
-# =========================
-# CONFIG
-# =========================
-API_KEY        = os.getenv("APCA_API_KEY_ID")
-API_SECRET     = os.getenv("APCA_API_SECRET_KEY")
-BASE_URL       = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
+from alpaca_trade_api import REST
+from alpaca_trade_api.common import URL
 
-SYMBOLS: List[str] = [
-    "AAPL","MSFT","AMZN","GOOGL","NVDA","META","TSLA","KO","PEP","COST","V","UNH",
-    "PG","JPM","HD","NFLX","CRM","MRK","TXN","IBM","INTC","CAT","GE","LLY","XOM","ORCL","BAC","WMT","TMO"
+# ========= USER SETTINGS =========
+API_KEY = os.getenv("APCA_API_KEY_ID")
+API_SECRET = os.getenv("APCA_API_SECRET_KEY")
+PAPER = os.getenv("APCA_PAPER", "true").lower() in ("1", "true", "yes")
+BASE_URL = URL("https://paper-api.alpaca.markets" if PAPER else "https://api.alpaca.markets")
+
+# Symbols to scan (edit to your list)
+WATCHLIST = [
+    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","UNH","V","KO","PEP","PG","HD",
+    "LLY","MRK","COST","TMO","ORCL","BAC","QCOM","IBM","INTC","CAT","GE"
 ]
 
-# --- Entry filters (lightweight) ---
-DAILY_CHANGE_MIN = 0.02     # 2% day gain required (None means ignore day % filter)
-ALLOW_BELOW_VWAP = True     # if False, require last >= vwap (needs minute bars)
-MOMENTUM_1M_MIN  = 0.00     # +% change last ~1m; set negative to disable
-MAX_SPREAD_PCT   = 0.40/100 # skip if spread too wide (e.g., >0.40%)
+# Position sizing
+DOLLARS_PER_TRADE = 850.0     # approx per position
+MAX_OPEN_POS = 6              # cap concurrent positions
 
-# --- Risk & exits ---
-ALLOC_PER_TRADE_USD = 900.0  # position size cap per trade
-TRAIL_PCT            = 0.8/100  # trailing stop distance (e.g., 0.8%)
-HARD_TP_PCT          = 4.0/100  # optional take-profit (e.g., 4%); set None to disable
-MIN_QTY              = 1        # avoid fractional qty<1
+# Entry filters
+MIN_DAILY_PCT = 0.02          # 2% daily change threshold (if daily % is available)
+MIN_1M_MOMENTUM = -0.20/100   # allow >= -0.20% over the last 1m (very light gate)
+MAX_SPREAD_PCT = 0.40/100     # max spread 0.40%
 
-# --- Runtime ---
-LOOP_SLEEP_SEC = 10      # scan cadence
-CANCEL_CHECK_SEC = 2     # poll child orders after entry
+# Risk/Reward
+TP_PCT = 0.04                 # +4% take-profit target (set None to disable TP)
+INIT_SL_PCT = 0.01            # initial stop  -1% from fill
+TRAIL_FROM_PEAK_PCT = 0.01    # trailing stop distance 1% from highest seen since entry
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-log = logging.getLogger("bot")
+# Engine
+POLL_SEC = 3
 
-api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version="v2")
+# ========= API =========
+api = REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
 
-# =========================
-# Helpers
-# =========================
-def now_et_str() -> str:
-    return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+# ========= STATE (in-memory) =========
+# Keeps entry info for dynamic trailing: { symbol: { 'qty':int, 'entry':float, 'highest':float, 'stop_id':str|None } }
+BOOK: Dict[str, Dict] = {}
 
-def get_last_price(symbol: str) -> Optional[float]:
-    q = api.get_last_quote(symbol)
-    # Fallback: use ask if good; else bid; else mid
-    pxs = [q.askprice, q.bidprice, (q.askprice + q.bidprice)/2 if q.askprice and q.bidprice else None]
-    for p in pxs:
-        if p and p > 0:
-            return p
+def log(msg: str):
+    now = dt.datetime.now().strftime("%b %d %H:%M:%S")
+    print(f"{now} | INFO | {msg}", flush=True)
+
+# ------------------------------ Utilities ------------------------------
+
+def get_latest_quote(symbol: str):
+    """
+    FIX: use get_latest_quote (correct modern call).
+    Returns object with .ask_price, .bid_price, etc.
+    """
+    return api.get_latest_quote(symbol)
+
+def get_last_trade(symbol: str):
+    """
+    Recent last trade (price) – used as 'current' for simpler math.
+    """
+    return api.get_latest_trade(symbol)
+
+def mid_price(q) -> Optional[float]:
+    if q and q.ask_price and q.bid_price and q.ask_price > 0 and q.bid_price > 0:
+        return (q.ask_price + q.bid_price) / 2.0
     return None
 
-def get_spread_pct(symbol: str) -> float:
-    q = api.get_last_quote(symbol)
-    if q.askprice and q.bidprice and q.askprice > 0:
-        return (q.askprice - q.bidprice) / q.askprice
-    return 9.99  # huge to force-skip if no data
-
-def daily_change(symbol: str) -> Optional[float]:
-    # Use previous close vs last trade
-    t = api.get_last_trade(symbol)
-    bars = api.get_bars(symbol, "1D", limit=2)
-    if not bars or len(bars) == 0:
+def get_spread_pct(symbol: str) -> Optional[float]:
+    """
+    Spread sanity check in % of mid.
+    """
+    q = get_latest_quote(symbol)       # <-- FIXED here
+    if not q: 
         return None
-    prev_close = bars[-1].c if len(bars) == 1 else bars[-2].c
-    if prev_close and prev_close > 0:
-        return (t.price - prev_close) / prev_close
-    return None
-
-def momentum_1m(symbol: str) -> Optional[float]:
-    bars = api.get_bars(symbol, "1Min", limit=2)
-    if not bars or len(bars) < 2:
+    m = mid_price(q)
+    if not m or m <= 0:
         return None
-    old = bars[-2].c
-    new = bars[-1].c
-    if old and old > 0:
-        return (new - old) / old
-    return None
+    spread = (q.ask_price - q.bid_price) / m
+    return spread
 
-def vwap_ok(symbol: str) -> bool:
-    # Simple intraday VWAP check using last minute bar
-    bars = api.get_bars(symbol, "1Min", limit=1)
-    if not bars:
-        return True  # don’t block on missing data
-    b = bars[-1]
-    last = b.c
-    vwap = b.vw if hasattr(b, "vw") and b.vw else None
-    return True if (ALLOW_BELOW_VWAP or vwap is None or last >= vwap) else False
+def get_daily_change_pct(symbol: str) -> Optional[float]:
+    """
+    Tries to estimate daily % change using bars (today open vs last trade).
+    If data missing, returns None (and we do NOT reject on None).
+    """
+    try:
+        today = dt.date.today()
+        start = dt.datetime(today.year, today.month, today.day, 9, 30)
+        bars = api.get_bars(symbol, "1Min", start.isoformat(), limit=1).df
+        last_trade = get_last_trade(symbol)
+        if bars is None or bars.empty or last_trade is None:
+            return None
+        open_price = float(bars['open'].iloc[0])
+        curr = float(last_trade.price)
+        if open_price <= 0:
+            return None
+        return (curr - open_price) / open_price
+    except Exception:
+        return None
+
+def last_1m_momentum_pct(symbol: str) -> Optional[float]:
+    """
+    Simple 1-minute momentum: (last - prev_close_of_1m) / prev_close_of_1m
+    If unavailable, return None.
+    """
+    try:
+        now = dt.datetime.utcnow()
+        start = (now - dt.timedelta(minutes=2)).isoformat()
+        bars = api.get_bars(symbol, "1Min", start, limit=2).df
+        if bars is None or len(bars) < 2:
+            return None
+        prev_close = float(bars['close'].iloc[-2])
+        last_close = float(bars['close'].iloc[-1])
+        if prev_close <= 0:
+            return None
+        return (last_close - prev_close) / prev_close
+    except Exception:
+        return None
+
+# ------------------------------ Entry Logic ------------------------------
 
 def can_enter(symbol: str) -> (bool, str):
+    # Spread
     sp = get_spread_pct(symbol)
-    if sp > MAX_SPREAD_PCT:
-        return False, f"wide_spread {sp:.2%}"
+    if sp is not None and sp > MAX_SPREAD_PCT:
+        return False, f"wide_spread({sp:.3%})"
 
-    day = daily_change(symbol)  # may be None
-    if DAILY_CHANGE_MIN is not None and day is not None and day < DAILY_CHANGE_MIN:
-        return False, f"day% {day:.2%} < {DAILY_CHANGE_MIN:.2%}"
+    # Daily %
+    day = get_daily_change_pct(symbol)
+    if day is not None and day < MIN_DAILY_PCT:
+        return False, f"daily_change_below({day:.2%}<{MIN_DAILY_PCT:.2%})"
 
-    if not vwap_ok(symbol):
-        return False, "below_VWAP"
-
-    mom = momentum_1m(symbol)  # may be None
-    if mom is not None and mom < MOMENTUM_1M_MIN:
-        return False, f"1m_mom {mom:.2%} < {MOMENTUM_1M_MIN:.2%}"
+    # 1m momentum
+    m1 = last_1m_momentum_pct(symbol)
+    if m1 is not None and m1 < MIN_1M_MOMENTUM:
+        return False, f"weak_1m_momentum({m1:.2%})"
 
     return True, "ok"
 
-def position_exists(symbol: str) -> bool:
-    try:
-        api.get_position(symbol)
-        return True
-    except Exception:
-        return False
-
-def open_qty(symbol: str) -> int:
-    try:
-        p = api.get_position(symbol)
-        return int(float(p.qty))
-    except Exception:
+def calc_qty(symbol: str, price: float) -> int:
+    if price <= 0:
         return 0
+    qty = int(DOLLARS_PER_TRADE // price)
+    return max(qty, 0)
 
-def round_qty(dollars: float, price: float) -> int:
-    if not price or price <= 0:
-        return 0
-    q = int(dollars // price)
-    return max(q, 0)
+# ------------------------------ Orders ------------------------------
 
-# =========================
-# Order placement
-# =========================
-def place_trailing_stop(symbol: str, qty: int, trail_pct: float):
-    """
-    Places a trailing stop SELL for full qty. It trails by a % of price.
-    """
-    api.submit_order(
+def place_buy_with_initial_stop(symbol: str, price_hint: float):
+    qty = calc_qty(symbol, price_hint)
+    if qty < 1:
+        log(f"SKIP {symbol}: qty<1 (price={price_hint})")
+        return
+
+    # market buy (simpler/faster); optionally could use limit at ask
+    o = api.submit_order(
+        symbol=symbol,
+        qty=qty,
+        side="buy",
+        type="market",
+        time_in_force="day"
+    )
+    log(f"BUY {symbol} qty={qty}")
+
+    # fetch fill price
+    time.sleep(1.0)
+    pos = api.get_position(symbol)
+    entry = float(pos.avg_entry_price)
+
+    # initial stop
+    stop_price = round(entry * (1.0 - INIT_SL_PCT), 2 if entry < 1000 else 3)
+    stop_order = api.submit_order(
         symbol=symbol,
         qty=qty,
         side="sell",
-        type="trailing_stop",
+        type="stop",
         time_in_force="day",
-        trail_percent=round(trail_pct*100, 4)  # Alpaca expects percent number, e.g., 0.8 -> 0.8
+        stop_price=stop_price
     )
+    stop_id = stop_order.id
 
-def place_take_profit(symbol: str, qty: int, entry_price: float, tp_pct: float):
-    limit_price = round(entry_price * (1.0 + tp_pct), 2)
-    api.submit_order(
-        symbol=symbol,
-        qty=qty,
-        side="sell",
-        type="limit",
-        time_in_force="day",
-        limit_price=limit_price
-    )
-    return limit_price
+    # optional TP
+    if TP_PCT is not None:
+        tp_price = round(entry * (1.0 + TP_PCT), 2 if entry < 1000 else 3)
+        api.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side="sell",
+            type="limit",
+            time_in_force="day",
+            limit_price=tp_price
+        )
+        log(f"TP set at {tp_price}")
 
-def cancel_open_sells(symbol: str):
-    for o in api.list_orders(status="open", side="sell"):
-        if o.symbol == symbol:
-            api.cancel_order(o.id)
+    BOOK[symbol] = {
+        "qty": qty,
+        "entry": entry,
+        "highest": entry,        # start tracking the high since entry
+        "stop_id": stop_id
+    }
+    log(f"INIT SL for {symbol} at {stop_price}; tracking started (entry {entry})")
 
-def buy_with_dynamic_exits(symbol: str):
-    if position_exists(symbol):
+def update_trailing_stop(symbol: str):
+    """
+    Tracks the highest price seen since entry; if price makes a new high,
+    lift the stop to (highest * (1 - TRAIL_FROM_PEAK_PCT)).
+    """
+    if symbol not in BOOK:
         return
 
-    price = get_last_price(symbol)
-    if not price:
+    info = BOOK[symbol]
+    qty = info["qty"]
+    stop_id = info["stop_id"]
+    highest = info["highest"]
+
+    last = get_last_trade(symbol)
+    if not last:
         return
 
-    qty = round_qty(ALLOC_PER_TRADE_USD, price)
-    if qty < MIN_QTY:
-        log.info(f"SKIP {symbol}: qty<{MIN_QTY} (price={price:.2f})")
+    curr = float(last.price)
+
+    # update the highest
+    if curr > highest:
+        info["highest"] = curr
+        highest = curr
+
+    # new trailing stop level
+    desired_stop = highest * (1.0 - TRAIL_FROM_PEAK_PCT)
+
+    # Make sure stop is below current price by the exchange minimum tick
+    min_tick = 0.01 if curr < 1000 else 0.001
+    desired_stop = round(min(desired_stop, curr - min_tick), 2 if curr < 1000 else 3)
+
+    # Fetch current stop and modify only if we need to move it UP
+    try:
+        existing = api.get_order(stop_id) if stop_id else None
+    except Exception:
+        existing = None
+
+    need_replace = True
+    if existing and existing.stop_price:
+        if float(existing.stop_price) >= desired_stop:
+            need_replace = False
+
+    if need_replace:
+        # cancel the old stop (if any) and place a new tighter one
+        try:
+            if stop_id:
+                api.cancel_order(stop_id)
+        except Exception:
+            pass
+
+        new_stop = api.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side="sell",
+            type="stop",
+            time_in_force="day",
+            stop_price=desired_stop
+        )
+        info["stop_id"] = new_stop.id
+        log(f"TRAIL {symbol}: new_stop={desired_stop:.2f} (highest={highest:.2f})")
+
+# ------------------------------ Main Loop ------------------------------
+
+def open_positions() -> Dict[str, float]:
+    live = {}
+    for p in api.list_positions():
+        live[p.symbol] = float(p.qty)
+    return live
+
+def prune_book():
+    """
+    Remove symbols from BOOK that no longer exist in positions (flat or fully sold).
+    """
+    live = set(open_positions().keys())
+    gone = [s for s in BOOK.keys() if s not in live]
+    for s in gone:
+        BOOK.pop(s, None)
+
+def step():
+    # update trailing stops for open positions
+    for sym in list(BOOK.keys()):
+        update_trailing_stop(sym)
+
+    # entries, respect max slots
+    live = open_positions()
+    if len(live) >= MAX_OPEN_POS:
         return
 
-    # Market buy
-    api.submit_order(symbol=symbol, qty=qty, side="buy", type="market", time_in_force="day")
-    log.info(f"BUY {symbol} qty={qty} @~{price:.2f}")
+    slots = MAX_OPEN_POS - len(live)
 
-    # Wait until position appears
-    for _ in range(30):
-        time.sleep(CANCEL_CHECK_SEC)
-        if open_qty(symbol) >= qty:
+    for sym in WATCHLIST:
+        if sym in live:
+            continue
+        ok, why = can_enter(sym)
+        if not ok:
+            log(f"NO_ENTRY {sym}: {why}")
+            continue
+
+        # price hint
+        lt = get_last_trade(sym)
+        if not lt:
+            continue
+        price = float(lt.price)
+        place_buy_with_initial_stop(sym, price)
+
+        slots -= 1
+        if slots <= 0:
             break
 
-    # Attach trailing stop + (optional) take profit
-    cancel_open_sells(symbol)  # safety
-    place_trailing_stop(symbol, qty=open_qty(symbol), trail_pct=TRAIL_PCT)
-    tp_price = None
-    if HARD_TP_PCT is not None:
-        tp_price = place_take_profit(symbol, qty=open_qty(symbol), entry_price=price, tp_pct=HARD_TP_PCT)
-
-    log.info(f"ATTACH {symbol}: trailing={TRAIL_PCT:.2%}" +
-             (f", hard_TP≈{tp_price}" if tp_price else ""))
-
-    # Watch: if one exit fills, cancel the other (simple polling)
-    for _ in range(600):  # ~20 minutes
-        time.sleep(CANCEL_CHECK_SEC)
-        # If position closed -> cancel any residual sells and stop watching
-        if open_qty(symbol) == 0:
-            cancel_open_sells(symbol)
-            log.info(f"EXITED {symbol}: position closed; cleaned remaining orders.")
-            return
-
-# =========================
-# MAIN LOOP
-# =========================
 def main():
-    log.info("Starting LITE bot with dynamic trailing...")
+    log("Starting LITE day-trading bot (daily% + spread + light momentum; dynamic trailing stop ON)...")
+    # reset per “day”
+    log("New trading day: Reset state.")
     while True:
         try:
-            for sym in SYMBOLS:
-                if position_exists(sym):
-                    continue
-                ok, why = can_enter(sym)
-                if ok:
-                    buy_with_dynamic_exits(sym)
-                else:
-                    log.info(f"NO_ENTRY {sym}: {why}")
-            time.sleep(LOOP_SLEEP_SEC)
+            prune_book()
+            step()
         except Exception as e:
-            log.exception(f"Loop error: {e}")
-            time.sleep(5)
+            log(f"ERROR loop: {e}")
+        time.sleep(POLL_SEC)
 
 if __name__ == "__main__":
     main()
