@@ -23,7 +23,7 @@ API_KEY    = os.getenv("APCA_API_KEY_ID", "")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY", "")
 BASE_URL   = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
 
-# Top 50 US stocks (large caps / liquid)
+# Universe: large/liquid names
 SYMBOLS: List[str] = [
     "AAPL","MSFT","AMZN","GOOGL","GOOG","NVDA","META","TSLA","BRK.B","JPM",
     "JNJ","V","UNH","PG","XOM","MA","AVGO","HD","MRK","PEP",
@@ -39,34 +39,41 @@ if not API_KEY or not API_SECRET:
 api = REST(API_KEY, API_SECRET, base_url=BASE_URL)
 
 # =========================
-# Risk / Sizing Parameters
+# RISK / SIZING
 # =========================
-FIXED_DOLLARS_PER_TRADE = 1000.0   # fixed budget per trade
-RISK_PCT_OF_BP          = 0.01     # cap = min(fixed, 1% of buying power)
-MAX_SHARES_PER_TRADE    = 10       # never buy more than this many shares
-MAX_PRICE_PER_SHARE     = 600.0    # skip very expensive tickers
-DAILY_MAX_SPEND         = 5000.0   # daily gross spend cap
-LOOP_SLEEP_SECONDS      = 30       # loop frequency (seconds)
+FIXED_DOLLARS_PER_TRADE = float(os.getenv("FIXED_DOLLARS_PER_TRADE", "1000"))
+RISK_PCT_OF_BP          = float(os.getenv("RISK_PCT_OF_BP", "0.01"))
+MAX_SHARES_PER_TRADE    = int(os.getenv("MAX_SHARES_PER_TRADE", "10"))
+MAX_PRICE_PER_SHARE     = float(os.getenv("MAX_PRICE_PER_SHARE", "600"))
+DAILY_MAX_SPEND         = float(os.getenv("DAILY_MAX_SPEND", "5000"))
+LOOP_SLEEP_SECONDS      = int(os.getenv("LOOP_SLEEP_SECONDS", "30"))
 
 # =========================
-# Entry filters
+# LITE FILTERS (flags)
 # =========================
-MOMENTUM_THRESHOLD      = 0.003    # +0.3% last 1-min momentum (lower to 0.001 for +0.1%)
-VOLUME_SPIKE_MULT       = 1.2      # last 1-min vol >= 1.2x avg of prev 5
-SPREAD_CENTS_LIMIT      = 0.05     # pass if spread <= $0.05
-SPREAD_PCT_LIMIT        = 0.002    # OR spread <= 0.2% of price
-DAILY_CHANGE_MIN_PCT    = 0.02     # day change >= +2%
-# NOTE: if daily_change is None, we do NOT reject (see should_buy)
+# Core lite filters (always on):
+DAILY_CHANGE_MIN_PCT    = float(os.getenv("DAILY_CHANGE_MIN_PCT", "0.02"))  # +2%
+SPREAD_CENTS_LIMIT      = float(os.getenv("SPREAD_CENTS_LIMIT", "0.05"))
+SPREAD_PCT_LIMIT        = float(os.getenv("SPREAD_PCT_LIMIT", "0.002"))
+
+# Optional filters (OFF by default for lite mode)
+ENABLE_VWAP             = os.getenv("ENABLE_VWAP", "false").lower() == "true"
+ENABLE_MOMENTUM         = os.getenv("ENABLE_MOMENTUM", "false").lower() == "true"
+ENABLE_VOLUME_SPIKE     = os.getenv("ENABLE_VOLUME_SPIKE", "false").lower() == "true"
+ENABLE_5M_BREAK         = os.getenv("ENABLE_5M_BREAK", "false").lower() == "true"
+
+MOMENTUM_THRESHOLD      = float(os.getenv("MOMENTUM_THRESHOLD", "0.001"))  # +0.1% if enabled
+VOLUME_SPIKE_MULT       = float(os.getenv("VOLUME_SPIKE_MULT", "1.0"))     # 1.0x if enabled
 
 # =========================
-# Exits
+# EXITS
 # =========================
-TAKE_PROFIT_PCT         = 0.04     # +4% take-profit (bracket)
-MAX_HOLD_MINUTES        = 25       # time-based exit
-FLATTEN_BEFORE_CLOSE_MIN= 5        # flatten positions before close
+TAKE_PROFIT_PCT         = float(os.getenv("TAKE_PROFIT_PCT", "0.04"))  # +4% TP
+MAX_HOLD_MINUTES        = int(os.getenv("MAX_HOLD_MINUTES", "25"))
+FLATTEN_BEFORE_CLOSE_MIN= int(os.getenv("FLATTEN_BEFORE_CLOSE_MIN", "5"))
 
 # =========================
-# Data Container
+# Data container
 # =========================
 @dataclass
 class Snapshot:
@@ -91,7 +98,6 @@ def market_is_open() -> bool:
         return bool(getattr(clock, "is_open", False))
     except Exception as e:
         logging.warning(f"clock check failed: {e}")
-        # Be permissive on paper
         return True
 
 def minutes_to_close() -> Optional[int]:
@@ -116,10 +122,8 @@ def compute_qty(last_price: float, today_spend: float) -> int:
     except Exception as e:
         logging.error(f"Failed to get account: {e}")
         return 0
-
     if last_price <= 0 or last_price > MAX_PRICE_PER_SHARE:
         return 0
-
     dollars_cap  = min(FIXED_DOLLARS_PER_TRADE, buying_power * RISK_PCT_OF_BP)
     dollars_cap  = min(dollars_cap, max(DAILY_MAX_SPEND - today_spend, 0.0))
     qty = int(dollars_cap // last_price)
@@ -160,7 +164,6 @@ def fetch_snapshot(symbol: str) -> Optional[Snapshot]:
         bid = float(getattr(quote, "bid_price", 0) or 0)
         ask = float(getattr(quote, "ask_price", 0) or 0)
 
-        # 1-min momentum, 5-min high, volumes
         min1_change_pct = None
         high_5m = None
         vol_1m = None
@@ -178,7 +181,6 @@ def fetch_snapshot(symbol: str) -> Optional[Snapshot]:
 
         vwap_value = compute_vwap_from_last5(symbol)
 
-        # Previous daily close & daily change %
         prev_close = None
         daily_change_pct = None
         try:
@@ -220,10 +222,9 @@ def fmt_ratio(x: Optional[float]) -> str:
     return f"{x:.2f}x" if x is not None else "None"
 
 # =========================
-# Entry decision (with detailed diagnostics)
+# Entry decision (LITE)
 # =========================
 def should_buy(s: Snapshot) -> Tuple[bool, str]:
-    """Return (ok, reason). If not ok, 'reason' explains the first failing filter."""
     vwap_ok = (s.vwap is None) or (s.last_price >= s.vwap)
     vol_ratio = None
     if s.vol_1m is not None and s.vol_5m_avg not in (None, 0):
@@ -242,44 +243,41 @@ def should_buy(s: Snapshot) -> Tuple[bool, str]:
     if s.last_price <= 0:
         return False, "bad_price"
 
-    # KEY CHANGE: Do NOT reject when daily_change_pct is None.
-    # Only reject if it's present AND below threshold.
+    # LITE: do NOT reject if daily is None; only reject when present and below threshold
     if (s.daily_change_pct is not None) and (s.daily_change_pct < DAILY_CHANGE_MIN_PCT):
         return False, "daily_change_below_threshold"
 
-    if not vwap_ok:
-        return False, "below_VWAP"
-    if s.min1_change_pct is None or s.min1_change_pct < MOMENTUM_THRESHOLD:
-        return False, "weak_1min_momentum"
-    if s.high_5m is None or s.last_price < s.high_5m:
-        return False, "not_breaking_5min_high"
+    # LITE: spread must be reasonable to avoid bad fills
     if not spread_ok_flag:
         return False, "bad_spread"
-    if s.vol_1m is None or s.vol_5m_avg in (None, 0):
-        return False, "volume_data_missing"
-    if vol_ratio is None or vol_ratio < VOLUME_SPIKE_MULT:
-        return False, "weak_volume_spike"
+
+    # OPTIONAL filters (off by default)
+    if ENABLE_VWAP and not vwap_ok:
+        return False, "below_VWAP"
+    if ENABLE_5M_BREAK and (s.high_5m is not None) and (s.last_price < s.high_5m):
+        return False, "not_breaking_5min_high"
+    if ENABLE_MOMENTUM and (s.min1_change_pct is None or s.min1_change_pct < MOMENTUM_THRESHOLD):
+        return False, "weak_1min_momentum"
+    if ENABLE_VOLUME_SPIKE:
+        if s.vol_1m is None or s.vol_5m_avg in (None, 0):
+            return False, "volume_data_missing"
+        if vol_ratio is None or vol_ratio < VOLUME_SPIKE_MULT:
+            return False, "weak_volume_spike"
+
     return True, "ok"
 
 # =========================
 # Dynamic SL & Trailing
 # =========================
 def compute_dynamic_levels(symbol: str, last_price: float) -> Dict[str, float]:
-    """
-    Dynamic Stop-Loss (price) and dynamic Trailing % based on intraday volatility
-    (avg (high-low) over the last 10 one-minute bars).
-    Fallback: 2% SL and 1.5% trailing when volatility data is missing.
-    """
     try:
         bars = api.get_bars(symbol, TimeFrame.Minute, limit=11)
         if not bars or len(bars) < 2:
             return {"stop_loss": round(last_price * 0.98, 2), "trailing": 0.015}
-
         ranges = [float(b.h) - float(b.l) for b in bars[-10:]]
         avg_range = mean(ranges) if ranges else last_price * 0.01
-
         stop_loss_price = round(last_price - (avg_range * 1.5), 2)
-        trailing_pct    = max(min(avg_range / last_price, 0.05), 0.005)  # 0.5%–5%
+        trailing_pct    = max(min(avg_range / last_price, 0.05), 0.005)
         return {"stop_loss": stop_loss_price, "trailing": trailing_pct}
     except Exception as e:
         logging.warning(f"dynamic levels failed for {symbol}: {e}")
@@ -288,7 +286,7 @@ def compute_dynamic_levels(symbol: str, last_price: float) -> Dict[str, float]:
 # =========================
 # Position state / exits
 # =========================
-positions_state: Dict[str, Dict] = {}  # symbol -> {entry_price, entry_time, high_water}
+positions_state: Dict[str, Dict] = {}
 
 def update_position_state(symbol: str, entry_price: float):
     positions_state[symbol] = {
@@ -301,29 +299,23 @@ def handle_trailing_and_time_exit(symbol: str, last_price: float):
     st = positions_state.get(symbol)
     if not st:
         return
-    # Update high water
     if last_price > st["high_water"]:
         st["high_water"] = last_price
-    # Time stop
     age_min = (datetime.now(timezone.utc) - st["entry_time"]).total_seconds() / 60.0
     if age_min >= MAX_HOLD_MINUTES:
         close_position(symbol, reason=f"time_stop {age_min:.1f}m")
         return
-    # Dynamic trailing
     dyn = compute_dynamic_levels(symbol, last_price)
-    dyn_trail = dyn["trailing"]
     if st["high_water"] > 0:
         drawdown = (st["high_water"] - last_price) / st["high_water"]
-        if drawdown >= dyn_trail:
+        if drawdown >= dyn["trailing"]:
             close_position(symbol, reason=f"trailing_stop {drawdown:.3f}")
 
 def close_position(symbol: str, reason: str = ""):
     try:
-        # Cancel open orders (e.g., remaining bracket legs)
         for o in api.list_orders(status="open"):
             if o.symbol == symbol:
                 api.cancel_order(o.id)
-        # Market-close the position
         api.close_position(symbol)
         logging.info(f"CLOSE {symbol} (reason={reason})")
         positions_state.pop(symbol, None)
@@ -355,16 +347,13 @@ def place_bracket_buy(symbol: str, qty: int, last_price: float):
         stop_loss={"stop_price": stop_price},
         take_profit={"limit_price": tp_price},
     )
-    logging.info(
-        f"BUY {symbol} qty={qty} @~{last_price:.2f} TP={tp_price:.2f} SL={stop_price:.2f}"
-    )
+    logging.info(f"BUY {symbol} qty={qty} @~{last_price:.2f} TP={tp_price:.2f} SL={stop_price:.2f}")
     return order
 
 # =========================
-# Trade routine
+# Trading routines
 # =========================
 def trade_symbol(symbol: str, today_spend: float) -> float:
-    # Safety: flatten close to market close
     mtc = minutes_to_close()
     if mtc is not None and mtc <= FLATTEN_BEFORE_CLOSE_MIN:
         try:
@@ -379,12 +368,10 @@ def trade_symbol(symbol: str, today_spend: float) -> float:
         logging.info(f"NO_DATA {symbol}")
         return 0.0
 
-    # Manage open position (dynamic trailing/time)
     if already_in_position(symbol):
         handle_trailing_and_time_exit(symbol, snap.last_price)
         return 0.0
 
-    # Entry
     ok, reason = should_buy(snap)
     if ok:
         qty = compute_qty(snap.last_price, today_spend)
@@ -417,7 +404,7 @@ def trade_symbol(symbol: str, today_spend: float) -> float:
 # Main loop
 # =========================
 def run():
-    logging.info("Starting day-trading bot (diagnostics + dynamic SL/trailing + bracket TP/SL)...")
+    logging.info("Starting LITE day-trading bot (daily% + spread; optional filters off by default)...")
     today_date = None
     today_spend = 0.0
 
@@ -437,7 +424,6 @@ def run():
                 logging.info("Market closed. Waiting...")
         except Exception as e:
             logging.exception(f"Run loop error: {e}")
-
         time.sleep(LOOP_SLEEP_SECONDS)
 
 if __name__ == "__main__":
