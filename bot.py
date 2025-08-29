@@ -25,7 +25,7 @@ api = REST(API_KEY, API_SECRET, BASE_URL)
 # =========================
 SYMBOLS     = ["AAPL", "MSFT", "NVDA"]  # change as you like
 BUY_SIZE    = 1                         # shares per trade
-BUY_TRIGGER = 0.001                     # +0.3% 1-min momentum to buy
+BUY_TRIGGER = 0.0005                     # +0.3% 1-min momentum to buy
 TRAIL_STOP  = 0.01                      # sell if -1% from post-entry highest price
 
 # Tracking highest price per open position
