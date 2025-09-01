@@ -13,9 +13,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 # =========================
 # Hardcoded API Credentials (Paper)
 # =========================
-API_KEY    = "PKVX14E7A6KDI4XTUBYC"
-API_SECRET = "iUn6BLgR2gZVg8HhY19O9aCmHuPJoUOr"
-BASE_URL   = "https://paper-api.alpaca.markets"  # <- correct, no /v2
+API_KEY    = os.getenv("APCA_API_KEY_ID")
+API_SECRET = os.getenv("APCA_API_SECRET_KEY")
+BASE_URL   = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
 
 # Quick sanity print
 print("BASE_URL =", BASE_URL)
