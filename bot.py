@@ -1,181 +1,185 @@
-# bot.py  — Alpaca paper trading bot (SnapshotV2 safe)
+# bot.py
+# -----------------------------------------
+# Simple Alpaca paper-trading bot (VWAP check + fractional orders)
+# Works with: alpaca-trade-api >= 3.x
+# -----------------------------------------
 
 import os
 import time
 import logging
-from dataclasses import dataclass
-from typing import Optional, Dict, List
-from datetime import datetime, timezone
+from typing import Optional, List
 
-from alpaca_trade_api.rest import REST, TimeFrame
+from alpaca_trade_api.rest import REST, TimeFrame, APIError
 
-# ============================
-# Logging
-# ============================
+
+# ========= Logging =========
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-# ============================
-# Env & constants
-# ============================
-API_KEY     = os.getenv("APCA_API_KEY_ID", "").strip()
-API_SECRET  = os.getenv("APCA_API_SECRET_KEY", "").strip()
-BASE_URL    = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets").strip()
 
-# Symbols list (edit if you like)
+# ========= Env & Client =========
+API_KEY    = os.getenv("APCA_API_KEY_ID")
+API_SECRET = os.getenv("APCA_API_SECRET_KEY")
+BASE_URL   = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
+
+if not API_KEY or not API_SECRET:
+    raise RuntimeError("Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY environment variables.")
+
+api = REST(API_KEY, API_SECRET, base_url=BASE_URL)
+
+
+# ========= Universe =========
 SYMBOLS: List[str] = [
     "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "NFLX", "BA", "MU", "JPM", "PEP",
+    "KO", "COST", "PG", "MRK", "HD",
 ]
 
-# Sizing & risk (simple demo values)
-RISK_PCT_PER_TRADE = 0.01  # 1% of buying power per trade
-MAX_POSITIONS = 5
-POLL_SECONDS = 15
 
-# ============================
-# Helpers
-# ============================
-
-def make_client() -> REST:
-    if not API_KEY or not API_SECRET:
-        raise RuntimeError("Missing API keys. Ensure APCA_API_KEY_ID and APCA_API_SECRET_KEY are set.")
-    return REST(API_KEY, API_SECRET, BASE_URL)
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-def get_snapshot_vwap(client: REST, symbol: str) -> Optional[float]:
+# ========= Helpers =========
+def get_daily_vwap(symbol: str) -> Optional[float]:
     """
-    SnapshotV2 has no 'daily_vwap' attribute.
-    We read 'daily_bar' and use its 'vwap' if available.
-    If 'vwap' is None, approximate via (H+L+C)/3.
+    Get today's VWAP from daily bars (v2). Returns None if not available.
     """
-    snap = client.get_snapshot(symbol)
-
-    daily_bar = getattr(snap, "daily_bar", None)
-    if daily_bar is None:
-        logging.error("No daily_bar in snapshot for %s; skipping", symbol)
+    try:
+        bars = api.get_bars(symbol, TimeFrame.Day, limit=1)
+        df = bars.df
+        if df is None or df.empty:
+            return None
+        # Alpaca v2 includes 'vwap' on daily bars
+        return float(df["vwap"].iloc[-1])
+    except Exception as e:
+        logging.error(f"VWAP fetch error {symbol}: {e}")
         return None
 
-    vwap = getattr(daily_bar, "vwap", None)
-    if vwap is None:
-        # Fallback approximation
-        try:
-            vwap = (daily_bar.h + daily_bar.l + daily_bar.c) / 3.0
-        except Exception:
-            logging.exception("Failed to approximate VWAP for %s", symbol)
-            return None
 
-    return float(vwap)
-
-def get_last_price_from_snapshot(client: REST, symbol: str) -> Optional[float]:
-    snap = client.get_snapshot(symbol)
-    trade = getattr(snap, "latest_trade", None)
-    if trade and getattr(trade, "p", None) is not None:
-        return float(trade.p)
-    # Fallback to minute bar close if latest trade is missing
-    minute_bar = getattr(snap, "minute_bar", None)
-    if minute_bar and getattr(minute_bar, "c", None) is not None:
-        return float(minute_bar.c)
-    logging.error("No price info in snapshot for %s", symbol)
-    return None
-
-def get_buying_power(client: REST) -> float:
-    acct = client.get_account()
-    return float(acct.buying_power)
-
-def get_position_qty(client: REST, symbol: str) -> int:
+def get_last_price(symbol: str) -> Optional[float]:
+    """
+    Get latest trade price from snapshot. Returns None if not available.
+    """
     try:
-        pos = client.get_position(symbol)
-        return int(float(pos.qty))
-    except Exception:
-        return 0
+        snap = api.get_snapshot(symbol)
+        # latest trade price property name is 'p' on the trade object
+        price = getattr(snap.latest_trade, "p", None)
+        return float(price) if price is not None else None
+    except Exception as e:
+        logging.error(f"Last price fetch error {symbol}: {e}")
+        return None
 
-def open_positions_count(client: REST) -> int:
+
+def buy_fractional(symbol: str, pct_of_bp: float = 0.05, min_notional: float = 5.0):
+    """
+    Buy using notional (fractional). Default 5% of current Buying Power,
+    with a floor of $5 to avoid tiny orders.
+    """
     try:
-        positions = client.list_positions()
-        return len(positions)
-    except Exception:
-        return 0
+        acct = api.get_account()
+        bp = float(acct.buying_power)
+        notional = round(max(bp * pct_of_bp, min_notional), 2)
 
-def submit_market_buy(client: REST, symbol: str, usd_amount: float) -> None:
-    if usd_amount <= 0:
-        return
-    # Use notional to size by USD
-    client.submit_order(
-        symbol=symbol,
-        notional=round(usd_amount, 2),
-        side="buy",
-        type="market",
-        time_in_force="day",
-    )
-    logging.info("BUY %s notional=%.2f", symbol, usd_amount)
-
-def submit_market_sell_all(client: REST, symbol: str) -> None:
-    qty = get_position_qty(client, symbol)
-    if qty > 0:
-        client.submit_order(
+        order = api.submit_order(
             symbol=symbol,
-            qty=qty,
-            side="sell",
+            side="buy",
             type="market",
             time_in_force="day",
+            notional=notional,  # <-- fractional (no qty)
         )
-        logging.info("SELL %s qty=%d", symbol, qty)
+        logging.info(f"BUY {symbol} notional=${notional} id={order.id}")
+        return order
 
-# ============================
-# Simple strategy:
-#   - If last_price > VWAP: buy a slice (if capacity allows)
-#   - If last_price < VWAP: close any open position
-# ============================
-
-def trade_once(client: REST) -> None:
-    try:
-        bp = get_buying_power(client)
-    except Exception as e:
-        logging.error("Failed to fetch account/buying power: %s", e)
-        return
-
-    max_new_positions = max(0, MAX_POSITIONS - open_positions_count(client))
-    usd_per_trade = max(0.0, bp * RISK_PCT_PER_TRADE)
-
-    for symbol in SYMBOLS:
+    except APIError as e:
+        logging.error(f"Order error on {symbol}: {e}")
+        # graceful retry with smaller notional
         try:
-            vwap = get_snapshot_vwap(client, symbol)
-            last = get_last_price_from_snapshot(client, symbol)
-            if vwap is None or last is None:
-                continue
-
-            if last > vwap * 1.001:  # tiny buffer
-                if get_position_qty(client, symbol) == 0 and max_new_positions > 0 and usd_per_trade > 0:
-                    submit_market_buy(client, symbol, usd_per_trade)
-                    max_new_positions -= 1
-            elif last < vwap * 0.999:
-                # below VWAP -> flat
-                submit_market_sell_all(client, symbol)
-        except Exception as e:
-            logging.error("Error on %s: %s", symbol, e)
-
-def main() -> None:
-    logging.info("Starting bot | base_url=%s | symbols=%s", BASE_URL, ",".join(SYMBOLS))
-    client = make_client()
-
-    # Optional: quick connectivity sanity
-    try:
-        acct = client.get_account()
-        logging.info("Account ok: buying_power=%.2f, status=%s", float(acct.buying_power), acct.status)
+            fallback = round(max(min_notional, notional * 0.5), 2)
+            order2 = api.submit_order(
+                symbol=symbol,
+                side="buy",
+                type="market",
+                time_in_force="day",
+                notional=fallback,
+            )
+            logging.info(f"BUY-RETRY {symbol} notional=${fallback} id={order2.id}")
+            return order2
+        except Exception as e2:
+            logging.error(f"Retry failed on {symbol}: {e2}")
+            return None
     except Exception as e:
-        logging.error("Account check failed: %s", e)
-        return
+        logging.error(f"Unexpected order error on {symbol}: {e}")
+        return None
+
+
+def sell_all_positions():
+    """
+    Market-sell everything (useful if you want a flat-close routine).
+    """
+    try:
+        positions = api.list_positions()
+        for p in positions:
+            qty = abs(int(float(p.qty)))
+            if qty == 0:
+                continue
+            side = "sell" if p.side == "long" else "buy"
+            api.submit_order(
+                symbol=p.symbol,
+                side=side,
+                type="market",
+                time_in_force="day",
+                qty=qty,
+            )
+            logging.info(f"FLAT {p.symbol} qty={qty}")
+    except Exception as e:
+        logging.error(f"Flat error: {e}")
+
+
+# ========= Strategy (example) =========
+def should_buy(symbol: str) -> bool:
+    """
+    Example rule: buy if last price > daily VWAP (simple momentum filter).
+    """
+    vwap = get_daily_vwap(symbol)
+    last = get_last_price(symbol)
+
+    if vwap is None or last is None:
+        logging.warning(f"Skip {symbol}: missing data (vwap={vwap}, last={last})")
+        return False
+
+    logging.info(f"{symbol}: last={last:.2f} | vwap={vwap:.2f}")
+    return last > vwap
+
+
+# ========= Main Loop =========
+def main_loop(sleep_seconds: int = 60):
+    # sanity: print account
+    acct = api.get_account()
+    logging.info(
+        f"Account ok: buying_power={acct.buying_power}, "
+        f"status={acct.status}"
+    )
 
     while True:
-        loop_start = time.time()
-        trade_once(client)
-        elapsed = time.time() - loop_start
-        sleep_for = max(1.0, POLL_SECONDS - elapsed)
-        time.sleep(sleep_for)
+        try:
+            for sym in SYMBOLS:
+                try:
+                    if should_buy(sym):
+                        buy_fractional(sym, pct_of_bp=0.03, min_notional=10.0)
+                except Exception as sym_err:
+                    logging.error(f"Symbol loop error {sym}: {sym_err}")
+
+            time.sleep(sleep_seconds)
+
+        except KeyboardInterrupt:
+            logging.info("Interrupted by user, exiting.")
+            break
+        except Exception as e:
+            logging.error(f"Run loop error: {e}")
+            time.sleep(5)
+
 
 if __name__ == "__main__":
-    main()
+    logging.info(
+        f"Starting bot | base_url={BASE_URL} | symbols="
+        + ",".join(SYMBOLS)
+    )
+    main_loop(sleep_seconds=60)
