@@ -1,263 +1,170 @@
-# bot.py — Alpaca Paper bot: live SIP, daily 500 SAR target with full liquidation, auto buy/sell, $27 stop-loss
+# bot.py
 import os
 import time
 import logging
-from typing import Optional, List
-from datetime import date
+from datetime import datetime, timezone, timedelta
+from alpaca_trade_api.rest import REST, TimeFrame
 
-from alpaca_trade_api.rest import REST, TimeFrame, APIError
-
-# ==============================
+# =========================
 # Logging
-# ==============================
+# =========================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-# ==============================
-# ENV (Render -> Environment Variables)
-# ==============================
-API_KEY    = os.getenv("APCA_API_KEY_ID", "").strip()
-API_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
-BASE_URL   = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets").strip()
-DATA_FEED  = os.getenv("APCA_API_DATA_FEED", "sip").strip()  # make sure you set 'sip' in Render
+# =========================
+# API & ENV
+# =========================
+API_KEY    = os.getenv("APCA_API_KEY_ID", "")
+API_SECRET = os.getenv("APCA_API_SECRET_KEY", "")
+BASE_URL   = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
+
+SYMBOLS = [s.strip().upper() for s in os.getenv(
+    "SYMBOLS", "AAPL,MSFT,AMZN,NVDA,META,TSLA,GOOGL,AMD"
+).split(",") if s.strip()]
 
 if not API_KEY or not API_SECRET:
-    raise RuntimeError("Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY.")
+    logging.error("Missing API keys in environment.")
+    raise SystemExit(1)
 
-api = REST(API_KEY, API_SECRET, base_url=BASE_URL, api_version="v2")
+api = REST(API_KEY, API_SECRET, BASE_URL)
 
-# ==============================
-# Symbols universe
-# ==============================
-SYMBOLS: List[str] = [
-    "AAPL", "MSFT", "NVDA", "TSLA", "AMZN",
-    "NFLX", "BA", "MU", "JPM", "PEP",
-]
+# =========================
+# Trading Parameters (ENV)
+# =========================
+# Regular session (RTH) entry threshold based on 1-min candle move
+ENTRY_PCT        = float(os.getenv("ENTRY_PCT", "0.003"))        # 0.3%
+FIXED_DPT        = float(os.getenv("FIXED_DOLLARS_PER_TRADE", "500"))   # dollars per trade
+STOP_LOSS_DOLLAR = float(os.getenv("STOP_LOSS_DOLLARS", "27"))          # dollar stop per position
+TAKE_PROFIT_PCT  = float(os.getenv("TAKE_PROFIT_PCT", "0.006"))         # 0.6% take profit
+DAILY_TARGET     = float(os.getenv("DAILY_TARGET", "133.33"))           # printed only
 
-# ==============================
-# Trading config
-# ==============================
-# Sizing via fractional notional:
-RISK_PCT_OF_BP   = 0.03   # buy up to 3% of current buying power per entry
-MIN_NOTIONAL_USD = 10.0   # minimum notional to avoid tiny orders
+# Optional heartbeat (0 disables)
+HEARTBEAT_SECS   = int(os.getenv("HEARTBEAT_SECS", "0"))
 
-# Entry/Exit:
-# - Buy if last >= VWAP
-# - Exit if last < VWAP
-CHECK_INTERVAL_SEC = 30
-
-# Daily profit target (≈ 500 SAR)
-SAR_PER_USD           = 3.75
-DAILY_TARGET_SAR      = 500.0
-DAILY_TARGET_USD      = DAILY_TARGET_SAR / SAR_PER_USD
-LIQUIDATE_ON_TARGET   = True   # <— as you requested (liquidate all positions on target)
-
-# Fixed per-position stop-loss (unrealized P&L <= -$27 closes the position)
-STOP_LOSS_USD = 27.0
-
-# ==============================
-# Session state
-# ==============================
-_session_day: Optional[date] = None
-_session_open_equity: Optional[float] = None
-_halt_buys_today: bool = False
-
-# ==============================
+# =========================
 # Helpers
-# ==============================
-def reset_daily_session():
-    """Call at the first run of the calendar day."""
-    global _session_day, _session_open_equity, _halt_buys_today
-    _session_day = date.today()
-    acct = api.get_account()
-    _session_open_equity = float(acct.equity)
-    _halt_buys_today = False
-    logging.info(
-        "New day: %s | open_equity=%.2f | data_feed=%s",
-        _session_day.isoformat(), _session_open_equity, DATA_FEED
-    )
+# =========================
+def compute_qty(last_price: float) -> int:
+    """Position size as fixed dollars per trade."""
+    if last_price <= 0:
+        return 0
+    return int(max(1, FIXED_DPT // last_price))
 
-def ensure_daily_session():
-    """Resets daily state if calendar day changed."""
-    global _session_day
-    today = date.today()
-    if _session_day != today:
-        reset_daily_session()
-
-def pnl_today_usd() -> float:
-    """Account-level realized+unrealized PnL vs session open equity."""
-    acct = api.get_account()
-    return float(acct.equity) - (_session_open_equity or float(acct.equity))
-
-def enforce_daily_target():
-    """If daily PnL >= target: halt new buys and (optionally) liquidate all."""
-    global _halt_buys_today
-    pnl = pnl_today_usd()
-    if pnl >= DAILY_TARGET_USD and not _halt_buys_today:
-        _halt_buys_today = True
-        logging.info("[TARGET HIT] pnl=%.2f >= %.2f (~500 SAR). Halting buys.", pnl, DAILY_TARGET_USD)
-        if LIQUIDATE_ON_TARGET:
-            try:
-                api.close_all_positions(cancel_orders=True)
-                logging.info("All positions liquidated due to target.")
-            except Exception as e:
-                logging.warning("Liquidation on target failed: %s", e)
-
-def get_daily_vwap(symbol: str) -> Optional[float]:
-    """Get today's daily VWAP from bars; fallback to typical price if missing."""
-    try:
-        bars = api.get_bars(symbol, TimeFrame.Day, limit=1)
-        df = bars.df
-        if df is None or df.empty:
-            return None
-        if "vwap" in df.columns:
-            return float(df["vwap"].iloc[-1])
-        # Fallback: typical price
-        h = float(df["high"].iloc[-1]); l = float(df["low"].iloc[-1]); c = float(df["close"].iloc[-1])
-        return (h + l + c) / 3.0
-    except Exception as e:
-        logging.warning("VWAP fetch error %s: %s", symbol, e)
-        return None
-
-def get_last_price(symbol: str) -> Optional[float]:
-    """Latest trade price from snapshot; fallback to minute bar close."""
-    try:
-        snap = api.get_snapshot(symbol)
-        last = None
-        if getattr(snap, "latest_trade", None) is not None:
-            last = getattr(snap.latest_trade, "p", None)
-        if last is None and getattr(snap, "minute_bar", None) is not None:
-            last = getattr(snap.minute_bar, "c", None)
-        return float(last) if last is not None else None
-    except Exception as e:
-        logging.warning("Last price fetch error %s: %s", symbol, e)
-        return None
-
-def position_qty(symbol: str) -> float:
+def safe_sell(symbol: str, *, limit_price: float | None = None, stop_price: float | None = None):
+    """
+    Sell only if a position with qty > 0 exists. Works for market, limit, or stop.
+    Returns the order object or None.
+    """
     try:
         pos = api.get_position(symbol)
-        return float(pos.qty)
+        qty = int(float(pos.qty))
     except Exception:
-        return 0.0
-
-def position_unrealized_pl(symbol: str) -> Optional[float]:
-    try:
-        pos = api.get_position(symbol)
-        # unrealized_pl can be None if no position
-        upl = getattr(pos, "unrealized_pl", None)
-        return float(upl) if upl is not None else None
-    except Exception:
+        logging.info(f"[SELL] No open position for {symbol}")
         return None
 
-def buy_fractional(symbol: str, bp: float) -> bool:
-    """Buy using notional (fractional)."""
-    notional = round(max(bp * RISK_PCT_OF_BP, MIN_NOTIONAL_USD), 2)
-    try:
-        o = api.submit_order(
-            symbol=symbol, side="buy", type="market", time_in_force="day",
-            notional=notional
-        )
-        logging.info("BUY %s notional=$%.2f id=%s", symbol, notional, o.id)
-        return True
-    except APIError as e:
-        logging.warning("BUY error %s: %s", symbol, e)
-        # try half notional once
-        try:
-            fallback = round(max(MIN_NOTIONAL_USD, notional * 0.5), 2)
-            o2 = api.submit_order(
-                symbol=symbol, side="buy", type="market", time_in_force="day",
-                notional=fallback
-            )
-            logging.info("BUY-RETRY %s notional=$%.2f id=%s", symbol, fallback, o2.id)
-            return True
-        except Exception as e2:
-            logging.error("BUY-RETRY failed %s: %s", symbol, e2)
-            return False
-    except Exception as e:
-        logging.error("BUY unexpected %s: %s", symbol, e)
-        return False
+    if qty <= 0:
+        logging.info(f"[SELL] Qty <= 0 for {symbol}, skip")
+        return None
 
-def sell_all(symbol: str) -> bool:
-    """Close full position for a symbol at market."""
-    qty = position_qty(symbol)
-    if qty == 0:
-        return True
-    try:
-        side = "sell" if qty > 0 else "buy"
-        api.submit_order(symbol=symbol, side=side, type="market", time_in_force="day", qty=abs(int(qty)))
-        logging.info("SELL %s qty=%s", symbol, int(abs(qty)))
-        return True
-    except Exception as e:
-        logging.error("SELL error %s: %s", symbol, e)
-        return False
-
-# ==============================
-# Strategy: buy if last >= vwap; exit if last < vwap; per-position $27 stop-loss
-# ==============================
-def trade_cycle():
-    ensure_daily_session()
-    enforce_daily_target()
-
-    # If buys halted and (optionally) already liquidated, we still enforce stop-losses below.
-    acct = api.get_account()
-    bp = float(acct.buying_power)
-
-    for sym in SYMBOLS:
-        try:
-            vwap = get_daily_vwap(sym)
-            last = get_last_price(sym)
-            if last is None:
-                logging.warning("Skip %s: missing last price", sym)
-                continue
-
-            # Per-position $27 stop-loss (based on unrealized PnL)
-            upl = position_unrealized_pl(sym)
-            if upl is not None and upl <= -abs(STOP_LOSS_USD):
-                logging.info("STOP-LOSS %s triggered (UPL=%.2f <= -%.2f).", sym, upl, STOP_LOSS_USD)
-                sell_all(sym)
-                continue  # proceed to next symbol
-
-            # VWAP-based exit
-            if vwap is not None and last < vwap and position_qty(sym) > 0:
-                sell_all(sym)
-                continue
-
-            # Entry (only if target not hit)
-            if not _halt_buys_today and vwap is not None and last >= vwap and position_qty(sym) == 0:
-                buy_fractional(sym, bp)
-
-        except Exception as e:
-            logging.error("Symbol %s error: %s", sym, e)
-
-# ==============================
-# Main loop
-# ==============================
-def main():
-    logging.info(
-        "Starting bot | base_url=%s | feed=%s | daily_target≈$%.2f (≈%.0f SAR) | stop_loss=$%.2f",
-        BASE_URL, DATA_FEED, DAILY_TARGET_USD, DAILY_TARGET_SAR, STOP_LOSS_USD
+    order_args = dict(
+        symbol=symbol,
+        qty=qty,
+        side="sell",
+        time_in_force="day",
     )
-    reset_daily_session()
+    if limit_price is not None:
+        order_args.update(type="limit", limit_price=round(float(limit_price), 4))
+    elif stop_price is not None:
+        order_args.update(type="stop", stop_price=round(float(stop_price), 4))
+    else:
+        order_args.update(type="market")
 
-    # Connectivity / account print
+    logging.info(f"[SELL] {symbol} qty={qty} type={order_args['type']} "
+                 f"limit={order_args.get('limit_price')} stop={order_args.get('stop_price')}")
     try:
-        acct = api.get_account()
-        logging.info(
-            "Account: equity=%.2f cash=%.2f buying_power=%.2f status=%s",
-            float(acct.equity), float(acct.cash), float(acct.buying_power), acct.status
-        )
+        return api.submit_order(**order_args)
     except Exception as e:
-        logging.error("Account check failed: %s", e)
+        logging.error(f"[SELL] Submit error for {symbol}: {e}")
+        return None
 
-    while True:
-        try:
-            ensure_daily_session()
-            trade_cycle()
-        except Exception as e:
-            logging.error("Loop error: %s", e)
-        time.sleep(CHECK_INTERVAL_SEC)
+def place_exit_orders(symbol: str, avg_fill_price: float):
+    """
+    Place separate TP (limit) and SL (stop) orders. Not a true OCO, but simple and robust.
+    """
+    tp_price = round(avg_fill_price * (1 + TAKE_PROFIT_PCT), 4)
+    sl_price = round(max(0.01, avg_fill_price - STOP_LOSS_DOLLAR), 4)
+    safe_sell(symbol, limit_price=tp_price)
+    safe_sell(symbol, stop_price=sl_price)
+    logging.info(f"[EXIT] TP={tp_price} SL={sl_price} for {symbol}")
 
-if __name__ == "__main__":
-    main()
+# =========================
+# Main
+# =========================
+logging.info(
+    "Starting bot | feed=sip | daily_target=$%.2f | stop_loss=$%.2f | entry_pct=%.4f"
+    % (DAILY_TARGET, STOP_LOSS_DOLLAR, ENTRY_PCT)
+)
+
+last_heartbeat = time.time()
+
+while True:
+    try:
+        clock = api.get_clock()
+        if clock.is_open:
+            # ===== Regular Market Logic (RTH) =====
+            for sym in SYMBOLS:
+                try:
+                    bars = api.get_bars(sym, TimeFrame.Minute, limit=1, feed="sip")
+                    if not bars:
+                        continue
+                    bar = bars[0]
+                    if not getattr(bar, "o", None) or not getattr(bar, "c", None):
+                        continue
+
+                    move_pct = (bar.c - bar.o) / bar.o if bar.o else 0.0
+
+                    if move_pct >= ENTRY_PCT:
+                        qty = compute_qty(bar.c)
+                        if qty <= 0:
+                            continue
+                        logging.info(f"[BUY] {sym} qty={qty} @ {bar.c:.4f} (move={move_pct:.4%})")
+                        try:
+                            api.submit_order(
+                                symbol=sym,
+                                qty=qty,
+                                side="buy",
+                                type="market",
+                                time_in_force="day",
+                            )
+                            # small pause then fetch avg entry and place exits
+                            time.sleep(1)
+                            try:
+                                pos = api.get_position(sym)
+                                avg = float(pos.avg_entry_price)
+                                place_exit_orders(sym, avg)
+                            except Exception as e:
+                                logging.error(f"[EXIT] Could not place exits for {sym}: {e}")
+                        except Exception as e:
+                            logging.error(f"[BUY] Submit error for {sym}: {e}")
+                except Exception as e:
+                    logging.error(f"[RTH] Scan error for {sym}: {e}")
+
+            time.sleep(5)
+
+        else:
+            # Market closed
+            if HEARTBEAT_SECS > 0 and (time.time() - last_heartbeat) >= HEARTBEAT_SECS:
+                # Print a lightweight "alive" message while waiting
+                try:
+                    next_open = api.get_clock().next_open
+                except Exception:
+                    next_open = None
+                logging.info(f"[HB] Market closed. Next open: {next_open}. Bot alive.")
+                last_heartbeat = time.time()
+            time.sleep(5)
+
+    except Exception as e:
+        logging.error(f"[MAIN] Loop error: {e}")
+        time.sleep(10)
