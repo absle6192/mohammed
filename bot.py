@@ -43,11 +43,7 @@ HEARTBEAT_SECS   = int(os.getenv("HEARTBEAT_SECS", "60"))             # 0 disabl
 # Helpers
 # =========================
 def tick_round(price: float) -> float:
-    """
-    Force valid ticks:
-      - price >= $1.00 -> 0.01
-      - price <  $1.00 -> 0.0001
-    """
+    """Ensure valid tick sizes."""
     if price <= 0:
         return 0.01
     tick = 0.01 if price >= 1.0 else 0.0001
@@ -104,7 +100,6 @@ while True:
         if clock.is_open:
             for sym in SYMBOLS:
                 try:
-                    # لا تكرر على نفس السهم
                     if has_open_position(sym) or has_open_orders(sym):
                         logging.info(f"[SKIP] {sym} has open position/order.")
                         continue
@@ -129,32 +124,50 @@ while True:
 
                     logging.info(f"[BUY] {sym} qty={qty} @ {c:.4f} (move={move_pct:.4%})")
 
-                    # --- احسب TP/SL مع حد أدنى للإزاحة لتجاوز قيود Alpaca ---
-                    # نضيف هامش 0.02 فوق/تحت سعر الدخول المرجعي لسلامة الإرسال حتى مع التقريب أو الانزلاق
-                    min_tp = c + 0.02
-                    min_sl = c - 0.02
+                    # --- Send Market Buy ---
+                    api.submit_order(
+                        symbol=sym,
+                        qty=qty,
+                        side="buy",
+                        type="market",
+                        time_in_force="day"
+                    )
+                    time.sleep(1)
 
-                    tp_price = tick_round(max(min_tp, c * (1.0 + TAKE_PROFIT_PCT)))
-                    sl_candidate = c - STOP_LOSS_DOLLAR
-                    sl_price = tick_round(min(min_sl, sl_candidate))
-                    if sl_price <= 0:
-                        sl_price = tick_round(0.01)
-
+                    # --- Fetch position avg entry ---
                     try:
+                        pos = api.get_position(sym)
+                        avg = float(pos.avg_entry_price)
+
+                        # Ensure TP >= avg + 0.02
+                        tp_price = tick_round(max(avg + 0.02, avg * (1.0 + TAKE_PROFIT_PCT)))
+                        # Ensure SL <= avg - 0.02
+                        sl_price = tick_round(max(0.01, avg - STOP_LOSS_DOLLAR))
+
+                        # Take Profit (limit)
                         api.submit_order(
                             symbol=sym,
                             qty=qty,
-                            side="buy",
-                            type="market",
-                            time_in_force="day",
-                            order_class="bracket",
-                            take_profit={"limit_price": tp_price},
-                            stop_loss={"stop_price": sl_price}
+                            side="sell",
+                            type="limit",
+                            limit_price=tp_price,
+                            time_in_force="day"
                         )
-                        logging.info(f"[BRACKET] {sym} TP={tp_price} SL={sl_price}")
+                        logging.info(f"[EXIT] TP {sym} @ {tp_price}")
+
+                        # Stop Loss (stop)
+                        api.submit_order(
+                            symbol=sym,
+                            qty=qty,
+                            side="sell",
+                            type="stop",
+                            stop_price=sl_price,
+                            time_in_force="day"
+                        )
+                        logging.info(f"[EXIT] SL {sym} @ {sl_price}")
+
                     except Exception as e:
-                        # في بيئة Paper قد يرفض الـ bracket؛ اطبع الخطأ واترك السهم (بدون تكرار)
-                        logging.error(f"[BUY/BRACKET] Submit error for {sym}: {e}")
+                        logging.error(f"[EXIT] Could not place TP/SL for {sym}: {e}")
 
                 except Exception as e:
                     logging.error(f"[RTH] Scan error for {sym}: {e}")
