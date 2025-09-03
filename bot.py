@@ -32,16 +32,17 @@ api = REST(API_KEY, API_SECRET, BASE_URL)
 # =========================
 # Trading Parameters (ENV)
 # =========================
-ENTRY_PCT        = float(os.getenv("ENTRY_PCT", "0.001"))             # 0.3% 1-min candle move
-FIXED_DPT        = float(os.getenv("FIXED_DOLLARS_PER_TRADE", "500")) # $ per trade
-STOP_LOSS_DOLLAR = float(os.getenv("STOP_LOSS_DOLLARS", "27"))        # $ below entry
-TAKE_PROFIT_PCT  = float(os.getenv("TAKE_PROFIT_PCT", "0.006"))       # 0.6% above entry
-DAILY_TARGET     = float(os.getenv("DAILY_TARGET", "133.33"))         # printed only
-HEARTBEAT_SECS   = int(os.getenv("HEARTBEAT_SECS", "60"))             # 0 disables
+ENTRY_PCT        = float(os.getenv("ENTRY_PCT", "0.001"))            # 0.1% 1-min candle move
+FIXED_DPT        = float(os.getenv("FIXED_DOLLARS_PER_TRADE", "500"))# $ per trade
 
-# Retry settings after buy (to wait for position to appear)
+# Trailing stop config (dynamic take-profit)
+TRAIL_PCT        = float(os.getenv("TRAIL_PCT", "0.004"))            # 0.4% of entry
+TRAIL_DOLLARS_MIN= float(os.getenv("TRAIL_DOLLARS_MIN", "0.20"))     # >= $0.20
+# Retry settings after buy (to wait for fill)
 FILL_RETRIES     = int(os.getenv("FILL_RETRIES", "5"))
 FILL_RETRY_SECS  = float(os.getenv("FILL_RETRY_SECS", "2.0"))
+
+HEARTBEAT_SECS   = int(os.getenv("HEARTBEAT_SECS", "60"))            # 0 disables
 
 # =========================
 # Helpers
@@ -91,7 +92,7 @@ def get_last_minute_bar(symbol: str):
 def wait_for_position(symbol: str, retries: int, sleep_secs: float):
     """Poll for a filled position after sending a market buy."""
     pos = None
-    for i in range(retries):
+    for _ in range(retries):
         time.sleep(sleep_secs)
         try:
             pos = api.get_position(symbol)
@@ -105,11 +106,13 @@ def wait_for_position(symbol: str, retries: int, sleep_secs: float):
 # Main
 # =========================
 logging.info(
-    "Starting bot | feed=sip | daily_target=$%.2f | stop_loss=$%.2f | entry_pct=%.4f"
-    % (DAILY_TARGET, STOP_LOSS_DOLLAR, ENTRY_PCT)
+    "Starting bot | feed=sip | entry_pct=%.4f | trail_pct=%.4f | trail_min=$%.2f"
+    % (ENTRY_PCT, TRAIL_PCT, TRAIL_DOLLARS_MIN)
 )
 
 last_heartbeat = time.time()
+last_skip_print = {}
+SKIP_COOLDOWN = 30  # seconds to throttle SKIP prints
 
 while True:
     try:
@@ -118,9 +121,12 @@ while True:
         if clock.is_open:
             for sym in SYMBOLS:
                 try:
-                    # Avoid duplicates on the same symbol
+                    # avoid duplicates on the same symbol
+                    now = time.time()
                     if has_open_position(sym) or has_open_orders(sym):
-                        logging.info(f"[SKIP] {sym} has open position/order.")
+                        if now - last_skip_print.get(sym, 0) >= SKIP_COOLDOWN:
+                            logging.info(f"[SKIP] {sym} has open position/order.")
+                            last_skip_print[sym] = now
                         continue
 
                     bar = get_last_minute_bar(sym)
@@ -143,7 +149,7 @@ while True:
 
                     logging.info(f"[BUY] {sym} qty={qty} @ {c:.4f} (move={move_pct:.4%})")
 
-                    # --- Send Market Buy ---
+                    # --- Market Buy ---
                     api.submit_order(
                         symbol=sym,
                         qty=qty,
@@ -153,40 +159,28 @@ while True:
                     )
                     logging.info(f"[BUY] Market order sent for {sym}, qty={qty}")
 
-                    # --- Wait for the position to appear (retry) ---
+                    # --- Wait for fill (position to appear) ---
                     pos = wait_for_position(sym, FILL_RETRIES, FILL_RETRY_SECS)
                     if not pos or float(pos.qty) <= 0:
-                        logging.error(f"[EXIT] No filled position for {sym}; skip TP/SL.")
+                        logging.error(f"[TRAIL] No filled position for {sym}; skip trailing stop.")
                         continue
 
                     avg = float(pos.avg_entry_price)
 
-                    # --- Compute TP/SL with safe minimum offsets and valid ticks ---
-                    # Ensure TP >= avg + 0.02 (avoid paper constraints) OR by percentage
-                    tp_price = tick_round(max(avg + 0.02, avg * (1.0 + TAKE_PROFIT_PCT)))
-                    # Ensure SL <= avg - 0.02 and by dollar stop
-                    sl_price = tick_round(max(0.01, min(avg - 0.02, avg - STOP_LOSS_DOLLAR)))
+                    # --- Compute trailing amount in dollars ---
+                    trail_dollars = max(0.02, max(avg * TRAIL_PCT, TRAIL_DOLLARS_MIN))
+                    trail_dollars = tick_round(trail_dollars)
 
-                    # --- Place separate exit orders (limit TP and stop SL) ---
+                    # --- Place Trailing Stop (dynamic take profit) ---
                     api.submit_order(
                         symbol=sym,
                         qty=qty,
                         side="sell",
-                        type="limit",
-                        limit_price=tp_price,
+                        type="trailing_stop",
+                        trail_price=trail_dollars,   # dollar offset from highest price
                         time_in_force="day"
                     )
-                    logging.info(f"[EXIT] TP {sym} @ {tp_price}")
-
-                    api.submit_order(
-                        symbol=sym,
-                        qty=qty,
-                        side="sell",
-                        type="stop",
-                        stop_price=sl_price,
-                        time_in_force="day"
-                    )
-                    logging.info(f"[EXIT] SL {sym} @ {sl_price}")
+                    logging.info(f"[TRAIL] {sym} trailing_stop trail=${trail_dollars} (avg={avg:.4f})")
 
                 except Exception as e:
                     logging.error(f"[RTH] Scan error for {sym}: {e}")
