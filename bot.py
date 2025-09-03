@@ -203,7 +203,6 @@ def get_today_open(symbol: str):
         dbar = api.get_bars(symbol, TimeFrame.Day, limit=1, feed="sip")
         if not dbar:
             return None
-        # same iterator/list guard
         try:
             obar = dbar[0]
         except Exception:
@@ -271,11 +270,11 @@ _tick_history = {sym: deque(maxlen=120) for sym in SYMBOLS}  # ~ up to 10 minute
 
 def update_tick_and_get_change(symbol: str):
     """
-    Push last trade price into history and compute tick_move vs price >= lookback seconds ago.
+    Push latest trade price into history and compute tick_move vs price >= lookback seconds ago.
     Returns (tick_move, last_price, has_baseline)
     """
     try:
-        trade = api.get_last_trade(symbol)
+        trade = api.get_latest_trade(symbol)  # <-- updated method
         price = float(getattr(trade, "price", None))
         if price <= 0:
             return (0.0, None, False)
@@ -376,7 +375,7 @@ while True:
                     today_open = get_today_open(sym) if ENABLE_DAY_TREND else None
                     last_price_for_day = None
 
-                    # realtime price
+                    # realtime price (tick)
                     tick_move_val, last_price, has_baseline = update_tick_and_get_change(sym) if ENABLE_TICK else (None, None, False)
                     if ENABLE_TICK:
                         tick_move = tick_move_val
@@ -414,8 +413,7 @@ while True:
                             now_ts = time.time()
                             key = f"SCAN-{sym}"
                             if now_ts - last_skip_log.get(key, 0) >= SKIP_LOG_COOLDOWN:
-                                logging.info(f"[SCAN] {sym} -> SKIP | " +
-                                             ("; ".join(reasons)))
+                                logging.info(f"[SCAN] {sym} -> SKIP | " + ("; ".join(reasons)))
                                 last_skip_log[key] = now_ts
                         continue
 
