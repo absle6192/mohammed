@@ -32,18 +32,22 @@ api = REST(API_KEY, API_SECRET, BASE_URL)
 # =========================
 # Trading Parameters (ENV)
 # =========================
-ENTRY_PCT        = float(os.getenv("ENTRY_PCT", "0.003"))             # 0.3% (1-min candle move)
+ENTRY_PCT        = float(os.getenv("ENTRY_PCT", "0.003"))             # 0.3% 1-min candle move
 FIXED_DPT        = float(os.getenv("FIXED_DOLLARS_PER_TRADE", "500")) # $ per trade
 STOP_LOSS_DOLLAR = float(os.getenv("STOP_LOSS_DOLLARS", "27"))        # $ below entry
 TAKE_PROFIT_PCT  = float(os.getenv("TAKE_PROFIT_PCT", "0.006"))       # 0.6% above entry
 DAILY_TARGET     = float(os.getenv("DAILY_TARGET", "133.33"))         # printed only
 HEARTBEAT_SECS   = int(os.getenv("HEARTBEAT_SECS", "60"))             # 0 disables
 
+# Retry settings after buy (to wait for position to appear)
+FILL_RETRIES     = int(os.getenv("FILL_RETRIES", "5"))
+FILL_RETRY_SECS  = float(os.getenv("FILL_RETRY_SECS", "2.0"))
+
 # =========================
 # Helpers
 # =========================
 def tick_round(price: float) -> float:
-    """Ensure valid tick sizes."""
+    """Round price to a valid tick (>=$1 => 0.01, else 0.0001)."""
     if price <= 0:
         return 0.01
     tick = 0.01 if price >= 1.0 else 0.0001
@@ -70,6 +74,7 @@ def has_open_orders(symbol: str) -> bool:
         return False
 
 def get_last_minute_bar(symbol: str):
+    """Return latest 1-min bar (handles iterator/list differences)."""
     try:
         bars = api.get_bars(symbol, TimeFrame.Minute, limit=1, feed="sip")
         if not bars:
@@ -82,6 +87,19 @@ def get_last_minute_bar(symbol: str):
     except Exception as e:
         logging.error(f"[BARS] Fetch error for {symbol}: {e}")
         return None
+
+def wait_for_position(symbol: str, retries: int, sleep_secs: float):
+    """Poll for a filled position after sending a market buy."""
+    pos = None
+    for i in range(retries):
+        time.sleep(sleep_secs)
+        try:
+            pos = api.get_position(symbol)
+            if float(pos.qty) > 0:
+                return pos
+        except Exception:
+            pass
+    return None
 
 # =========================
 # Main
@@ -100,6 +118,7 @@ while True:
         if clock.is_open:
             for sym in SYMBOLS:
                 try:
+                    # Avoid duplicates on the same symbol
                     if has_open_position(sym) or has_open_orders(sym):
                         logging.info(f"[SKIP] {sym} has open position/order.")
                         continue
@@ -132,42 +151,42 @@ while True:
                         type="market",
                         time_in_force="day"
                     )
-                    time.sleep(1)
+                    logging.info(f"[BUY] Market order sent for {sym}, qty={qty}")
 
-                    # --- Fetch position avg entry ---
-                    try:
-                        pos = api.get_position(sym)
-                        avg = float(pos.avg_entry_price)
+                    # --- Wait for the position to appear (retry) ---
+                    pos = wait_for_position(sym, FILL_RETRIES, FILL_RETRY_SECS)
+                    if not pos or float(pos.qty) <= 0:
+                        logging.error(f"[EXIT] No filled position for {sym}; skip TP/SL.")
+                        continue
 
-                        # Ensure TP >= avg + 0.02
-                        tp_price = tick_round(max(avg + 0.02, avg * (1.0 + TAKE_PROFIT_PCT)))
-                        # Ensure SL <= avg - 0.02
-                        sl_price = tick_round(max(0.01, avg - STOP_LOSS_DOLLAR))
+                    avg = float(pos.avg_entry_price)
 
-                        # Take Profit (limit)
-                        api.submit_order(
-                            symbol=sym,
-                            qty=qty,
-                            side="sell",
-                            type="limit",
-                            limit_price=tp_price,
-                            time_in_force="day"
-                        )
-                        logging.info(f"[EXIT] TP {sym} @ {tp_price}")
+                    # --- Compute TP/SL with safe minimum offsets and valid ticks ---
+                    # Ensure TP >= avg + 0.02 (avoid paper constraints) OR by percentage
+                    tp_price = tick_round(max(avg + 0.02, avg * (1.0 + TAKE_PROFIT_PCT)))
+                    # Ensure SL <= avg - 0.02 and by dollar stop
+                    sl_price = tick_round(max(0.01, min(avg - 0.02, avg - STOP_LOSS_DOLLAR)))
 
-                        # Stop Loss (stop)
-                        api.submit_order(
-                            symbol=sym,
-                            qty=qty,
-                            side="sell",
-                            type="stop",
-                            stop_price=sl_price,
-                            time_in_force="day"
-                        )
-                        logging.info(f"[EXIT] SL {sym} @ {sl_price}")
+                    # --- Place separate exit orders (limit TP and stop SL) ---
+                    api.submit_order(
+                        symbol=sym,
+                        qty=qty,
+                        side="sell",
+                        type="limit",
+                        limit_price=tp_price,
+                        time_in_force="day"
+                    )
+                    logging.info(f"[EXIT] TP {sym} @ {tp_price}")
 
-                    except Exception as e:
-                        logging.error(f"[EXIT] Could not place TP/SL for {sym}: {e}")
+                    api.submit_order(
+                        symbol=sym,
+                        qty=qty,
+                        side="sell",
+                        type="stop",
+                        stop_price=sl_price,
+                        time_in_force="day"
+                    )
+                    logging.info(f"[EXIT] SL {sym} @ {sl_price}")
 
                 except Exception as e:
                     logging.error(f"[RTH] Scan error for {sym}: {e}")
