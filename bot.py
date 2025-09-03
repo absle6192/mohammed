@@ -2,7 +2,9 @@
 import os
 import json
 import time
+import random
 import logging
+from collections import deque
 from datetime import datetime, timezone, timedelta
 from alpaca_trade_api.rest import REST, TimeFrame
 
@@ -24,24 +26,42 @@ if not API_KEY or not API_SECRET:
 
 api = REST(API_KEY, API_SECRET, BASE_URL)
 
-# ============== Parameters ==============
-ENTRY_PCT          = float(os.getenv("ENTRY_PCT", "0.001"))         # 0.1% 1-min move
+# ============== Entry Filters (ENV) ==============
+# 1) Daily trend (price vs today's open)
+ENABLE_DAY_TREND = os.getenv("ENABLE_DAY_TREND", "1") == "1"
+DAY_TREND_PCT    = float(os.getenv("DAY_TREND_PCT", "0.003"))   # 0.30%
+
+# 2) 1-minute bar momentum
+ENABLE_1M        = os.getenv("ENABLE_1M", "1") == "1"
+ENTRY_PCT        = float(os.getenv("ENTRY_PCT", "0.001"))       # 0.10%
+MIN_VOL_1M       = int(os.getenv("MIN_VOL_1M", "0"))            # 0 disables
+
+# 3) Realtime tick (last trade vs price X seconds ago)
+ENABLE_TICK      = os.getenv("ENABLE_TICK", "1") == "1"
+TICK_PCT         = float(os.getenv("TICK_PCT", "0.0005"))       # 0.05%
+TICK_LOOKBACK_S  = float(os.getenv("TICK_LOOKBACK_SECS", "3"))
+
+# ============== Risk/Exit ==============
 TRAIL_PCT          = float(os.getenv("TRAIL_PCT", "0.004"))         # 0.4% of avg entry
-TRAIL_DOLLARS_MIN  = float(os.getenv("TRAIL_DOLLARS_MIN", "0.20"))  # min $ for trailing
-STOP_LOSS_DOLLARS  = float(os.getenv("STOP_LOSS_DOLLARS", "0.60"))  # fixed $ stop from avg
+TRAIL_DOLLARS_MIN  = float(os.getenv("TRAIL_DOLLARS_MIN", "0.20"))  # >= $0.20
+STOP_LOSS_DOLLARS  = float(os.getenv("STOP_LOSS_DOLLARS", "0.60"))  # fixed $ stop
 FILL_RETRIES       = int(os.getenv("FILL_RETRIES", "8"))
 FILL_RETRY_SECS    = float(os.getenv("FILL_RETRY_SECS", "1.5"))
 HEARTBEAT_SECS     = int(os.getenv("HEARTBEAT_SECS", "60"))
 
-# Cash split
-MAX_SLOTS          = int(os.getenv("MAX_SLOTS", "4"))
+# ============== Capital & Scheduling ==============
+MAX_SLOTS          = int(os.getenv("MAX_SLOTS", "4"))               # max concurrent positions
 CASH_BUFFER        = float(os.getenv("CASH_BUFFER", "5.0"))
 
 # One-entry-per-symbol-per-day lock
 ONE_ENTRY_PER_SYMBOL_PER_DAY = os.getenv("ONE_ENTRY_PER_SYMBOL_PER_DAY", "1") == "1"
 STATE_PATH         = os.getenv("ONE_ENTRY_STATE_PATH", "/tmp/trade_state.json")
 
+# Diagnostics
 VERBOSE            = os.getenv("VERBOSE", "1") == "1"
+LOCK_LOG_COOLDOWN  = int(os.getenv("LOCK_LOG_COOLDOWN", "300"))     # sec
+SKIP_LOG_COOLDOWN  = int(os.getenv("SKIP_LOG_COOLDOWN", "30"))      # sec
+SCAN_SLEEP_SECS    = float(os.getenv("SCAN_SLEEP_SECS", "5"))       # loop sleep
 
 # ============== Market TZ helpers ==============
 try:
@@ -177,6 +197,23 @@ def get_last_minute_bar(symbol: str):
         logging.error(f"[BARS] Fetch error for {symbol}: {e}")
         return None
 
+def get_today_open(symbol: str):
+    """Return today's daily open using Day timeframe."""
+    try:
+        dbar = api.get_bars(symbol, TimeFrame.Day, limit=1, feed="sip")
+        if not dbar:
+            return None
+        # same iterator/list guard
+        try:
+            obar = dbar[0]
+        except Exception:
+            from itertools import islice
+            obar = next(islice(dbar, 0, 1), None)
+        return getattr(obar, "o", None)
+    except Exception as e:
+        logging.error(f"[DAYBAR] Fetch error for {symbol}: {e}")
+        return None
+
 def wait_for_stable_position(symbol: str, retries: int, sleep_secs: float):
     """Wait until position exists and qty is stable across two consecutive reads."""
     last_qty = None
@@ -192,14 +229,12 @@ def wait_for_stable_position(symbol: str, retries: int, sleep_secs: float):
                 last_qty = qty
         except Exception:
             pass
-    return pos  # return whatever we have (may be None)
+    return pos
 
 def place_exits(symbol: str, avg: float, qty: int):
     """Place both Trailing Stop and fixed Stop orders for the same qty."""
-    # trailing amount in $
     trail_dollars = max(0.02, max(avg * TRAIL_PCT, TRAIL_DOLLARS_MIN))
     trail_dollars = tick_round(trail_dollars)
-    # fixed stop price in $
     stop_price = tick_round(max(0.01, avg - STOP_LOSS_DOLLARS))
 
     # Trailing Stop
@@ -230,15 +265,54 @@ def place_exits(symbol: str, avg: float, qty: int):
     except Exception as e:
         logging.error(f"[EXIT] Fixed stop error for {symbol}: {e}")
 
+# ============== Realtime tick store ==============
+# For each symbol keep a small deque of (ts, price) to lookup price >= lookback seconds ago
+_tick_history = {sym: deque(maxlen=120) for sym in SYMBOLS}  # ~ up to 10 minutes at 5s cadence
+
+def update_tick_and_get_change(symbol: str):
+    """
+    Push last trade price into history and compute tick_move vs price >= lookback seconds ago.
+    Returns (tick_move, last_price, has_baseline)
+    """
+    try:
+        trade = api.get_last_trade(symbol)
+        price = float(getattr(trade, "price", None))
+        if price <= 0:
+            return (0.0, None, False)
+    except Exception as e:
+        logging.error(f"[TICK] Fetch error for {symbol}: {e}")
+        return (0.0, None, False)
+
+    now_ts = time.time()
+    dq = _tick_history[symbol]
+    dq.append((now_ts, price))
+
+    # find baseline at least TICK_LOOKBACK_S ago
+    baseline_price = None
+    for ts, p in reversed(dq):
+        if now_ts - ts >= TICK_LOOKBACK_S:
+            baseline_price = p
+            break
+
+    if baseline_price is None:
+        # not enough history yet
+        return (0.0, price, False)
+
+    tick_move = (price - baseline_price) / baseline_price if baseline_price else 0.0
+    return (tick_move, price, True)
+
 # ============== Main Loop ==============
 logging.info(
-    "Starting bot | entry_pct=%.4f | trail_pct=%.4f | trail_min=$%.2f | stop_loss=$%.2f | slots=%d | cash_buffer=$%.2f | one_entry_per_symbol_per_day=%s"
-    % (ENTRY_PCT, TRAIL_PCT, TRAIL_DOLLARS_MIN, STOP_LOSS_DOLLARS, MAX_SLOTS, CASH_BUFFER, str(ONE_ENTRY_PER_SYMBOL_PER_DAY))
+    "Starting bot | day_trend=%s(%.4f) | one_min=%s(%.4f, min_vol=%d) | tick=%s(%.4f/%ss) | slots=%d | cash_buffer=$%.2f | exits: trail=%.4f(min $%.2f) stop=$%.2f | one_entry=%s",
+    ENABLE_DAY_TREND, DAY_TREND_PCT, ENABLE_1M, ENTRY_PCT, MIN_VOL_1M,
+    ENABLE_TICK, TICK_PCT, TICK_LOOKBACK_S,
+    MAX_SLOTS, CASH_BUFFER, TRAIL_PCT, TRAIL_DOLLARS_MIN, STOP_LOSS_DOLLARS, ONE_ENTRY_PER_SYMBOL_PER_DAY
 )
+logging.info("Symbols universe: %s", ",".join(SYMBOLS))
 
 last_heartbeat = time.time()
-last_skip_print = {}
-SKIP_COOLDOWN = 30
+last_locked_log = {}
+last_skip_log = {}
 
 while True:
     try:
@@ -250,50 +324,119 @@ while True:
             sync_locks_from_orders(market_day)
 
         if clock.is_open:
+            # Respect global slots
             if count_open_positions() >= MAX_SLOTS:
-                if time.time() - last_skip_print.get("MAXSLOTS", 0) >= SKIP_COOLDOWN:
+                if time.time() - last_skip_log.get("MAXSLOTS", 0) >= SKIP_LOG_COOLDOWN:
                     logging.info(f"[SLOTS] Reached MAX_SLOTS={MAX_SLOTS}. No new entries.")
-                    last_skip_print["MAXSLOTS"] = time.time()
-                time.sleep(5)
+                    last_skip_log["MAXSLOTS"] = time.time()
+                time.sleep(SCAN_SLEEP_SECS)
                 continue
 
-            for sym in SYMBOLS:
+            symbols_order = SYMBOLS[:]
+            random.shuffle(symbols_order)
+
+            for sym in symbols_order:
                 try:
+                    # Daily lock
                     if ONE_ENTRY_PER_SYMBOL_PER_DAY and is_locked_today(sym, market_day):
-                        if VERBOSE:
+                        now_ts = time.time()
+                        if now_ts - last_locked_log.get(sym, 0) >= LOCK_LOG_COOLDOWN:
                             logging.info(f"[ONE] {sym} locked for {market_day}.")
+                            last_locked_log[sym] = now_ts
                         continue
 
-                    nowp = time.time()
+                    # Skip if position/order exists
+                    now_ts = time.time()
                     if has_open_position(sym) or has_open_orders(sym):
-                        if nowp - last_skip_print.get(sym, 0) >= SKIP_COOLDOWN:
+                        if now_ts - last_skip_log.get(sym, 0) >= SKIP_LOG_COOLDOWN:
                             logging.info(f"[SKIP] {sym} has open position/order.")
-                            last_skip_print[sym] = nowp
+                            last_skip_log[sym] = now_ts
                         continue
 
                     if count_open_positions() >= MAX_SLOTS:
                         break
 
+                    # ===== Gather signals =====
+                    one_min_move = None
+                    one_min_vol  = None
+                    day_move     = None
+                    tick_move    = None
+
+                    # 1m bar
                     bar = get_last_minute_bar(sym)
-                    if bar is None:
-                        continue
-                    o = getattr(bar, "o", None)
-                    c = getattr(bar, "c", None)
-                    if not o or not c:
+                    if bar:
+                        o = getattr(bar, "o", None)
+                        c = getattr(bar, "c", None)
+                        v = getattr(bar, "v", None)
+                        if o and c:
+                            one_min_move = (c - o) / o
+                            one_min_vol  = int(v) if v is not None else None
+
+                    # daily open move (vs last price or 1m close)
+                    today_open = get_today_open(sym) if ENABLE_DAY_TREND else None
+                    last_price_for_day = None
+
+                    # realtime price
+                    tick_move_val, last_price, has_baseline = update_tick_and_get_change(sym) if ENABLE_TICK else (None, None, False)
+                    if ENABLE_TICK:
+                        tick_move = tick_move_val
+
+                    if ENABLE_DAY_TREND and today_open:
+                        last_price_for_day = last_price if last_price is not None else (getattr(bar, "c", None) if bar else None)
+                        if last_price_for_day:
+                            day_move = (last_price_for_day - today_open) / today_open
+
+                    # ===== Evaluate filters =====
+                    reasons = []
+                    ok = True
+
+                    if ENABLE_DAY_TREND:
+                        if day_move is None or day_move < DAY_TREND_PCT:
+                            ok = False
+                            reasons.append(f"day { (day_move or 0)*100:.2f}% < {DAY_TREND_PCT*100:.2f}%")
+
+                    if ENABLE_1M:
+                        if one_min_move is None or one_min_move < ENTRY_PCT:
+                            ok = False
+                            reasons.append(f"1m { (one_min_move or 0)*100:.2f}% < {ENTRY_PCT*100:.2f}%")
+                        if MIN_VOL_1M > 0:
+                            if one_min_vol is None or one_min_vol < MIN_VOL_1M:
+                                ok = False
+                                reasons.append(f"vol {one_min_vol or 0} < {MIN_VOL_1M}")
+
+                    if ENABLE_TICK:
+                        if not has_baseline or tick_move is None or tick_move < TICK_PCT:
+                            ok = False
+                            reasons.append(f"tick { (tick_move or 0)*100:.2f}% < {TICK_PCT*100:.2f}% (lookback {TICK_LOOKBACK_S:.0f}s)")
+
+                    if not ok:
+                        if VERBOSE:
+                            now_ts = time.time()
+                            key = f"SCAN-{sym}"
+                            if now_ts - last_skip_log.get(key, 0) >= SKIP_LOG_COOLDOWN:
+                                logging.info(f"[SCAN] {sym} -> SKIP | " +
+                                             ("; ".join(reasons)))
+                                last_skip_log[key] = now_ts
                         continue
 
-                    move_pct = (c - o) / o if o else 0.0
-                    if move_pct < ENTRY_PCT:
+                    # ===== Passed filters -> compute qty and buy =====
+                    price_for_qty = last_price if last_price is not None else (getattr(bar, "c", None) if bar else None)
+                    if not price_for_qty or price_for_qty <= 0:
                         continue
 
-                    qty = compute_slot_qty(c)
+                    qty = compute_slot_qty(price_for_qty)
                     if qty <= 0:
-                        if nowp - last_skip_print.get(f"CASH-{sym}", 0) >= SKIP_COOLDOWN:
-                            logging.info(f"[SKIP] {sym} qty<=0 @ {c:.4f} | cash=${available_cash():.2f}")
-                            last_skip_print[f"CASH-{sym}"] = nowp
+                        now_ts = time.time()
+                        key = f"CASH-{sym}"
+                        if now_ts - last_skip_log.get(key, 0) >= SKIP_LOG_COOLDOWN:
+                            logging.info(f"[SKIP] {sym} qty<=0 @ {price_for_qty:.4f} | cash=${available_cash():.2f}")
+                            last_skip_log[key] = now_ts
                         continue
 
-                    logging.info(f"[BUY] {sym} qty={qty} @ {c:.4f} (move={move_pct:.4%}) | slots={count_open_positions()}/{MAX_SLOTS}")
+                    logging.info(f"[BUY] {sym} qty={qty} @ ~{price_for_qty:.4f} "
+                                 f"(day={ (day_move or 0)*100:.2f}% ; 1m={ (one_min_move or 0)*100:.2f}% ; tick={ (tick_move or 0)*100:.2f}% ) "
+                                 f"| slots={count_open_positions()}/{MAX_SLOTS}")
+
                     api.submit_order(symbol=sym, qty=qty, side="buy", type="market", time_in_force="day")
                     logging.info(f"[BUY] Market order sent for {sym}, qty={qty}")
 
@@ -301,7 +444,7 @@ while True:
                         lock_symbol_today(sym, market_day)
                         logging.info(f"[ONE] {sym}: locked for {market_day} (one trade per symbol per day).")
 
-                    # Wait for stable qty then place exits
+                    # Wait stable fill, then exits
                     pos = wait_for_stable_position(sym, FILL_RETRIES, FILL_RETRY_SECS)
                     if not pos or float(pos.qty) <= 0:
                         logging.error(f"[EXIT] No filled position for {sym}; skip exits.")
@@ -317,7 +460,7 @@ while True:
                 except Exception as e:
                     logging.error(f"[RTH] Scan error for {sym}: {e}")
 
-            time.sleep(5)
+            time.sleep(SCAN_SLEEP_SECS)
 
         else:
             if HEARTBEAT_SECS > 0 and (time.time() - last_heartbeat) >= HEARTBEAT_SECS:
@@ -327,7 +470,7 @@ while True:
                     next_open = None
                 logging.info(f"[HB] Market closed. Next open: {next_open}. Bot alive.")
                 last_heartbeat = time.time()
-            time.sleep(5)
+            time.sleep(SCAN_SLEEP_SECS)
 
     except Exception as e:
         logging.error(f"[MAIN] Loop error: {e}")
