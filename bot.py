@@ -32,7 +32,7 @@ api = REST(API_KEY, API_SECRET, BASE_URL)
 # =========================
 # Trading Parameters (ENV)
 # =========================
-ENTRY_PCT        = float(os.getenv("ENTRY_PCT", "0.003"))             # 0.3% 1-min candle move
+ENTRY_PCT        = float(os.getenv("ENTRY_PCT", "0.001"))             # 0.3% 1-min candle move
 FIXED_DPT        = float(os.getenv("FIXED_DOLLARS_PER_TRADE", "500")) # $ per trade
 STOP_LOSS_DOLLAR = float(os.getenv("STOP_LOSS_DOLLARS", "27"))        # $ below entry
 TAKE_PROFIT_PCT  = float(os.getenv("TAKE_PROFIT_PCT", "0.006"))       # 0.6% above entry
