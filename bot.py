@@ -29,7 +29,7 @@ api = REST(API_KEY, API_SECRET, BASE_URL)
 # ============== Entry Filters (ENV) ==============
 # 1) Daily trend (price vs today's open)
 ENABLE_DAY_TREND = os.getenv("ENABLE_DAY_TREND", "1") == "1"
-DAY_TREND_PCT    = float(os.getenv("DAY_TREND_PCT", "0.003"))   # 0.30%
+DAY_TREND_PCT    = float(os.getenv("DAY_TREND_PCT", "0.001"))   # 0.30%
 
 # 2) 1-minute bar momentum
 ENABLE_1M        = os.getenv("ENABLE_1M", "1") == "1"
