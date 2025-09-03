@@ -1,5 +1,6 @@
 # bot.py
 import os
+import json
 import time
 import logging
 from alpaca_trade_api.rest import REST, TimeFrame
@@ -32,17 +33,71 @@ api = REST(API_KEY, API_SECRET, BASE_URL)
 # =========================
 # Trading Parameters (ENV)
 # =========================
-ENTRY_PCT        = float(os.getenv("ENTRY_PCT", "0.001"))            # 0.1% 1-min candle move
-FIXED_DPT        = float(os.getenv("FIXED_DOLLARS_PER_TRADE", "500"))# $ per trade
+ENTRY_PCT        = float(os.getenv("ENTRY_PCT", "0.001"))             # 0.1% 1-min candle move
+FIXED_DPT        = float(os.getenv("FIXED_DOLLARS_PER_TRADE", "500")) # $ per trade
 
-# Trailing stop config (dynamic take-profit)
-TRAIL_PCT        = float(os.getenv("TRAIL_PCT", "0.004"))            # 0.4% of entry
-TRAIL_DOLLARS_MIN= float(os.getenv("TRAIL_DOLLARS_MIN", "0.20"))     # >= $0.20
-# Retry settings after buy (to wait for fill)
+# Trailing stop (dynamic take-profit)
+TRAIL_PCT         = float(os.getenv("TRAIL_PCT", "0.004"))            # 0.4% of entry
+TRAIL_DOLLARS_MIN = float(os.getenv("TRAIL_DOLLARS_MIN", "0.20"))     # >= $0.20
+
+# Fill waiting after market buy
 FILL_RETRIES     = int(os.getenv("FILL_RETRIES", "5"))
 FILL_RETRY_SECS  = float(os.getenv("FILL_RETRY_SECS", "2.0"))
 
-HEARTBEAT_SECS   = int(os.getenv("HEARTBEAT_SECS", "60"))            # 0 disables
+HEARTBEAT_SECS   = int(os.getenv("HEARTBEAT_SECS", "60"))             # 0 disables
+
+# One-entry-per-symbol-per-day lock
+ONE_ENTRY_PER_SYMBOL_PER_DAY = os.getenv("ONE_ENTRY_PER_SYMBOL_PER_DAY", "1") == "1"
+STATE_PATH = os.getenv("ONE_ENTRY_STATE_PATH", "/tmp/trade_state.json")
+
+# =========================
+# One-day lock state helpers
+# =========================
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+    _ny_tz = ZoneInfo("America/New_York")
+except Exception:
+    _ny_tz = None  # fallback handled below
+
+def _state_load():
+    try:
+        with open(STATE_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _state_save(d):
+    try:
+        with open(STATE_PATH, "w") as f:
+            json.dump(d, f)
+    except Exception as e:
+        logging.warning(f"[ONE] Could not persist state: {e}")
+
+def _market_day(clock_obj):
+    """
+    Return market-local date string (YYYY-MM-DD) using Alpaca clock timestamp
+    in America/New_York time.
+    """
+    try:
+        ts = clock_obj.timestamp  # datetime
+        if _ny_tz:
+            d = ts.astimezone(_ny_tz).date()
+        else:
+            # Fallback: assume timestamp is UTC; NY = UTC-4/5; date may drift on DST edges
+            d = (ts).date()
+        return d.isoformat()
+    except Exception:
+        # As a last resort, use today's NY date by API call now()
+        try:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            if _ny_tz:
+                return now.astimezone(_ny_tz).date().isoformat()
+            return now.date().isoformat()
+        except Exception:
+            return "1970-01-01"
+
+_traded_day_by_symbol = _state_load()  # {"AAPL": "2025-09-03", ...}
 
 # =========================
 # Helpers
@@ -106,8 +161,8 @@ def wait_for_position(symbol: str, retries: int, sleep_secs: float):
 # Main
 # =========================
 logging.info(
-    "Starting bot | feed=sip | entry_pct=%.4f | trail_pct=%.4f | trail_min=$%.2f"
-    % (ENTRY_PCT, TRAIL_PCT, TRAIL_DOLLARS_MIN)
+    "Starting bot | feed=sip | entry_pct=%.4f | trail_pct=%.4f | trail_min=$%.2f | one_entry_per_symbol_per_day=%s"
+    % (ENTRY_PCT, TRAIL_PCT, TRAIL_DOLLARS_MIN, str(ONE_ENTRY_PER_SYMBOL_PER_DAY))
 )
 
 last_heartbeat = time.time()
@@ -119,14 +174,27 @@ while True:
         clock = api.get_clock()
 
         if clock.is_open:
+            market_day = _market_day(clock)
+
             for sym in SYMBOLS:
                 try:
-                    # avoid duplicates on the same symbol
-                    now = time.time()
+                    # --- One-entry-per-symbol-per-day lock ---
+                    if ONE_ENTRY_PER_SYMBOL_PER_DAY:
+                        last_day = _traded_day_by_symbol.get(sym)
+                        if last_day == market_day:
+                            # Throttle prints
+                            nowp = time.time()
+                            if nowp - last_skip_print.get(f"ONE-{sym}", 0) >= SKIP_COOLDOWN:
+                                logging.info(f"[ONE] {sym}: already traded on {market_day}. Skip.")
+                                last_skip_print[f"ONE-{sym}"] = nowp
+                            continue
+
+                    # avoid duplicates on the same symbol (open pos or orders)
+                    nowp = time.time()
                     if has_open_position(sym) or has_open_orders(sym):
-                        if now - last_skip_print.get(sym, 0) >= SKIP_COOLDOWN:
+                        if nowp - last_skip_print.get(sym, 0) >= SKIP_COOLDOWN:
                             logging.info(f"[SKIP] {sym} has open position/order.")
-                            last_skip_print[sym] = now
+                            last_skip_print[sym] = nowp
                         continue
 
                     bar = get_last_minute_bar(sym)
@@ -158,6 +226,12 @@ while True:
                         time_in_force="day"
                     )
                     logging.info(f"[BUY] Market order sent for {sym}, qty={qty}")
+
+                    # Mark symbol as traded for this market day (lock immediately)
+                    if ONE_ENTRY_PER_SYMBOL_PER_DAY:
+                        _traded_day_by_symbol[sym] = market_day
+                        _state_save(_traded_day_by_symbol)
+                        logging.info(f"[ONE] {sym}: locked for {market_day} (one trade per symbol per day).")
 
                     # --- Wait for fill (position to appear) ---
                     pos = wait_for_position(sym, FILL_RETRIES, FILL_RETRY_SECS)
