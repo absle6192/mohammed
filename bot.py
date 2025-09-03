@@ -33,71 +33,67 @@ api = REST(API_KEY, API_SECRET, BASE_URL)
 # =========================
 # Trading Parameters (ENV)
 # =========================
-# Regular session (RTH) entry threshold based on 1-min candle move
-ENTRY_PCT        = float(os.getenv("ENTRY_PCT", "0.003"))        # 0.3%
-FIXED_DPT        = float(os.getenv("FIXED_DOLLARS_PER_TRADE", "500"))   # dollars per trade
-STOP_LOSS_DOLLAR = float(os.getenv("STOP_LOSS_DOLLARS", "27"))          # dollar stop per position
-TAKE_PROFIT_PCT  = float(os.getenv("TAKE_PROFIT_PCT", "0.006"))         # 0.6% take profit
-DAILY_TARGET     = float(os.getenv("DAILY_TARGET", "133.33"))           # printed only
-
-# Optional heartbeat (0 disables)
-HEARTBEAT_SECS   = int(os.getenv("HEARTBEAT_SECS", "0"))
+ENTRY_PCT        = float(os.getenv("ENTRY_PCT", "0.003"))             # 0.3% (1-min candle move)
+FIXED_DPT        = float(os.getenv("FIXED_DOLLARS_PER_TRADE", "500")) # dollars per trade
+STOP_LOSS_DOLLAR = float(os.getenv("STOP_LOSS_DOLLARS", "27"))        # $ stop per position
+TAKE_PROFIT_PCT  = float(os.getenv("TAKE_PROFIT_PCT", "0.006"))       # 0.6% take profit
+DAILY_TARGET     = float(os.getenv("DAILY_TARGET", "133.33"))         # printed only
+HEARTBEAT_SECS   = int(os.getenv("HEARTBEAT_SECS", "60"))             # 0 disables
 
 # =========================
 # Helpers
 # =========================
+def tick_round(price: float) -> float:
+    """
+    Force price to valid tick:
+      - >= $1.00 : 0.01 ticks
+      -  < $1.00 : 0.0001 ticks
+    """
+    if price <= 0:
+        return 0.01
+    tick = 0.01 if price >= 1.0 else 0.0001
+    # round to nearest valid tick, then keep 4 dp for readability
+    steps = round(price / tick)
+    return round(steps * tick, 4)
+
 def compute_qty(last_price: float) -> int:
     """Position size as fixed dollars per trade."""
     if last_price <= 0:
         return 0
-    return int(max(1, FIXED_DPT // last_price))
+    return max(1, int(FIXED_DPT // last_price))
 
-def safe_sell(symbol: str, *, limit_price: float | None = None, stop_price: float | None = None):
-    """
-    Sell only if a position with qty > 0 exists. Works for market, limit, or stop.
-    Returns the order object or None.
-    """
+def has_open_position(symbol: str) -> bool:
     try:
         pos = api.get_position(symbol)
-        qty = int(float(pos.qty))
+        return float(pos.qty) > 0
     except Exception:
-        logging.info(f"[SELL] No open position for {symbol}")
-        return None
+        return False
 
-    if qty <= 0:
-        logging.info(f"[SELL] Qty <= 0 for {symbol}, skip")
-        return None
-
-    order_args = dict(
-        symbol=symbol,
-        qty=qty,
-        side="sell",
-        time_in_force="day",
-    )
-    if limit_price is not None:
-        order_args.update(type="limit", limit_price=round(float(limit_price), 4))
-    elif stop_price is not None:
-        order_args.update(type="stop", stop_price=round(float(stop_price), 4))
-    else:
-        order_args.update(type="market")
-
-    logging.info(f"[SELL] {symbol} qty={qty} type={order_args['type']} "
-                 f"limit={order_args.get('limit_price')} stop={order_args.get('stop_price')}")
+def has_open_orders(symbol: str) -> bool:
     try:
-        return api.submit_order(**order_args)
-    except Exception as e:
-        logging.error(f"[SELL] Submit error for {symbol}: {e}")
-        return None
+        orders = api.list_orders(status="open", symbols=[symbol])
+        return len(orders) > 0
+    except Exception:
+        return False
 
-def place_exit_orders(symbol: str, avg_fill_price: float):
+def get_last_minute_bar(symbol: str):
     """
-    Place separate TP (limit) and SL (stop) orders. Not a true OCO, but simple and robust.
+    Get the latest 1-min bar robustly across library versions.
+    Returns object with .o (open) and .c (close), or None.
     """
-    tp_price = round(avg_fill_price * (1 + TAKE_PROFIT_PCT), 4)
-    sl_price = round(max(0.01, avg_fill_price - STOP_LOSS_DOLLAR), 4)
-    safe_sell(symbol, limit_price=tp_price)
-    safe_sell(symbol, stop_price=sl_price)
-    logging.info(f"[EXIT] TP={tp_price} SL={sl_price} for {symbol}")
+    try:
+        bars = api.get_bars(symbol, TimeFrame.Minute, limit=1, feed="sip")
+        # some versions return list-like, some return iterator
+        if not bars:
+            return None
+        try:
+            bar = bars[0]
+        except Exception:
+            bar = next(iter(bars), None)
+        return bar
+    except Exception as e:
+        logging.error(f"[BARS] Fetch error for {symbol}: {e}")
+        return None
 
 # =========================
 # Main
@@ -112,24 +108,40 @@ last_heartbeat = time.time()
 while True:
     try:
         clock = api.get_clock()
+
         if clock.is_open:
             # ===== Regular Market Logic (RTH) =====
             for sym in SYMBOLS:
                 try:
-                    bars = api.get_bars(sym, TimeFrame.Minute, limit=1, feed="sip")
-                    if not bars:
-                        continue
-                    bar = bars[0]
-                    if not getattr(bar, "o", None) or not getattr(bar, "c", None):
+                    # منع التكرار على نفس السهم
+                    if has_open_position(sym) or has_open_orders(sym):
+                        logging.info(f"[SKIP] {sym} has open position/order. Skip.")
                         continue
 
-                    move_pct = (bar.c - bar.o) / bar.o if bar.o else 0.0
+                    bar = get_last_minute_bar(sym)
+                    if bar is None:
+                        continue
 
+                    o = getattr(bar, "o", None)
+                    c = getattr(bar, "c", None)
+                    if not o or not c:
+                        continue
+
+                    move_pct = (c - o) / o if o else 0.0
                     if move_pct >= ENTRY_PCT:
-                        qty = compute_qty(bar.c)
+                        qty = compute_qty(c)
                         if qty <= 0:
+                            logging.info(f"[SKIP] {sym} qty<=0 at price {c}")
                             continue
-                        logging.info(f"[BUY] {sym} qty={qty} @ {bar.c:.4f} (move={move_pct:.4%})")
+
+                        logging.info(f"[BUY] {sym} qty={qty} @ {c:.4f} (move={move_pct:.4%})")
+
+                        # نُرسل أمر شراء مع Bracket (OCO) لربط TP و SL بدون تعارض
+                        # نحتاج سعر الدخول المرجعي لحساب TP/SL بشكل تقريبي
+                        # سنستخدم سعر الإغلاق الأخير كمرجع، والوسيط يربط الأوامر تلقائياً
+                        tp_price = tick_round(c * (1.0 + TAKE_PROFIT_PCT))
+                        sl_price = tick_round(max(0.01, c - STOP_LOSS_DOLLAR))
+
                         try:
                             api.submit_order(
                                 symbol=sym,
@@ -137,26 +149,22 @@ while True:
                                 side="buy",
                                 type="market",
                                 time_in_force="day",
+                                order_class="bracket",
+                                take_profit={"limit_price": tp_price},
+                                stop_loss={"stop_price": sl_price}
                             )
-                            # small pause then fetch avg entry and place exits
-                            time.sleep(1)
-                            try:
-                                pos = api.get_position(sym)
-                                avg = float(pos.avg_entry_price)
-                                place_exit_orders(sym, avg)
-                            except Exception as e:
-                                logging.error(f"[EXIT] Could not place exits for {sym}: {e}")
+                            logging.info(f"[BRACKET] {sym} TP={tp_price} SL={sl_price}")
                         except Exception as e:
-                            logging.error(f"[BUY] Submit error for {sym}: {e}")
+                            logging.error(f"[BUY/BRACKET] Submit error for {sym}: {e}")
+
                 except Exception as e:
                     logging.error(f"[RTH] Scan error for {sym}: {e}")
 
             time.sleep(5)
 
         else:
-            # Market closed
+            # Market closed — Heartbeat
             if HEARTBEAT_SECS > 0 and (time.time() - last_heartbeat) >= HEARTBEAT_SECS:
-                # Print a lightweight "alive" message while waiting
                 try:
                     next_open = api.get_clock().next_open
                 except Exception:
