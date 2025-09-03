@@ -41,6 +41,9 @@ ENABLE_TICK      = os.getenv("ENABLE_TICK", "1") == "1"
 TICK_PCT         = float(os.getenv("TICK_PCT", "0.0005"))       # 0.05%
 TICK_LOOKBACK_S  = float(os.getenv("TICK_LOOKBACK_SECS", "3"))
 
+# Entry mode: OR (flexible) or AND (strict)
+ENTRY_MODE       = os.getenv("ENTRY_MODE", "OR").upper().strip()   # <-- default OR
+
 # ============== Risk/Exit ==============
 TRAIL_PCT          = float(os.getenv("TRAIL_PCT", "0.004"))         # 0.4% of avg entry
 TRAIL_DOLLARS_MIN  = float(os.getenv("TRAIL_DOLLARS_MIN", "0.20"))  # >= $0.20
@@ -50,7 +53,7 @@ FILL_RETRY_SECS    = float(os.getenv("FILL_RETRY_SECS", "1.5"))
 HEARTBEAT_SECS     = int(os.getenv("HEARTBEAT_SECS", "60"))
 
 # ============== Capital & Scheduling ==============
-MAX_SLOTS          = int(os.getenv("MAX_SLOTS", "4"))               # max concurrent positions
+MAX_SLOTS          = int(os.getenv("MAX_SLOTS", "1"))               # =1 uses (almost) full cash
 CASH_BUFFER        = float(os.getenv("CASH_BUFFER", "5.0"))
 
 # One-entry-per-symbol-per-day lock
@@ -265,16 +268,17 @@ def place_exits(symbol: str, avg: float, qty: int):
         logging.error(f"[EXIT] Fixed stop error for {symbol}: {e}")
 
 # ============== Realtime tick store ==============
-# For each symbol keep a small deque of (ts, price) to lookup price >= lookback seconds ago
-_tick_history = {sym: deque(maxlen=120) for sym in SYMBOLS}  # ~ up to 10 minutes at 5s cadence
+_tick_history = {sym: deque(maxlen=120) for sym in SYMBOLS}
 
 def update_tick_and_get_change(symbol: str):
     """
     Push latest trade price into history and compute tick_move vs price >= lookback seconds ago.
     Returns (tick_move, last_price, has_baseline)
     """
+    if not ENABLE_TICK:
+        return (None, None, False)
     try:
-        trade = api.get_latest_trade(symbol)  # <-- updated method
+        trade = api.get_latest_trade(symbol)  # modern method
         price = float(getattr(trade, "price", None))
         if price <= 0:
             return (0.0, None, False)
@@ -286,7 +290,6 @@ def update_tick_and_get_change(symbol: str):
     dq = _tick_history[symbol]
     dq.append((now_ts, price))
 
-    # find baseline at least TICK_LOOKBACK_S ago
     baseline_price = None
     for ts, p in reversed(dq):
         if now_ts - ts >= TICK_LOOKBACK_S:
@@ -294,7 +297,6 @@ def update_tick_and_get_change(symbol: str):
             break
 
     if baseline_price is None:
-        # not enough history yet
         return (0.0, price, False)
 
     tick_move = (price - baseline_price) / baseline_price if baseline_price else 0.0
@@ -302,8 +304,8 @@ def update_tick_and_get_change(symbol: str):
 
 # ============== Main Loop ==============
 logging.info(
-    "Starting bot | day_trend=%s(%.4f) | one_min=%s(%.4f, min_vol=%d) | tick=%s(%.4f/%ss) | slots=%d | cash_buffer=$%.2f | exits: trail=%.4f(min $%.2f) stop=$%.2f | one_entry=%s",
-    ENABLE_DAY_TREND, DAY_TREND_PCT, ENABLE_1M, ENTRY_PCT, MIN_VOL_1M,
+    "Starting bot | ENTRY_MODE=%s | day_trend=%s(%.4f) | one_min=%s(%.4f, min_vol=%d) | tick=%s(%.4f/%ss) | slots=%d | cash_buffer=$%.2f | exits: trail=%.4f(min $%.2f) stop=$%.2f | one_entry=%s",
+    ENTRY_MODE, ENABLE_DAY_TREND, DAY_TREND_PCT, ENABLE_1M, ENTRY_PCT, MIN_VOL_1M,
     ENABLE_TICK, TICK_PCT, TICK_LOOKBACK_S,
     MAX_SLOTS, CASH_BUFFER, TRAIL_PCT, TRAIL_DOLLARS_MIN, STOP_LOSS_DOLLARS, ONE_ENTRY_PER_SYMBOL_PER_DAY
 )
@@ -323,7 +325,6 @@ while True:
             sync_locks_from_orders(market_day)
 
         if clock.is_open:
-            # Respect global slots
             if count_open_positions() >= MAX_SLOTS:
                 if time.time() - last_skip_log.get("MAXSLOTS", 0) >= SKIP_LOG_COOLDOWN:
                     logging.info(f"[SLOTS] Reached MAX_SLOTS={MAX_SLOTS}. No new entries.")
@@ -361,7 +362,6 @@ while True:
                     day_move     = None
                     tick_move    = None
 
-                    # 1m bar
                     bar = get_last_minute_bar(sym)
                     if bar:
                         o = getattr(bar, "o", None)
@@ -371,12 +371,8 @@ while True:
                             one_min_move = (c - o) / o
                             one_min_vol  = int(v) if v is not None else None
 
-                    # daily open move (vs last price or 1m close)
                     today_open = get_today_open(sym) if ENABLE_DAY_TREND else None
-                    last_price_for_day = None
-
-                    # realtime price (tick)
-                    tick_move_val, last_price, has_baseline = update_tick_and_get_change(sym) if ENABLE_TICK else (None, None, False)
+                    tick_move_val, last_price, has_baseline = update_tick_and_get_change(sym)
                     if ENABLE_TICK:
                         tick_move = tick_move_val
 
@@ -385,28 +381,38 @@ while True:
                         if last_price_for_day:
                             day_move = (last_price_for_day - today_open) / today_open
 
-                    # ===== Evaluate filters =====
+                    # ===== Evaluate filters (FLEXIBLE) =====
+                    cond_day, cond_1m, cond_tick = True, True, True
                     reasons = []
-                    ok = True
 
                     if ENABLE_DAY_TREND:
-                        if day_move is None or day_move < DAY_TREND_PCT:
-                            ok = False
-                            reasons.append(f"day { (day_move or 0)*100:.2f}% < {DAY_TREND_PCT*100:.2f}%")
+                        cond_day = (day_move is not None) and (day_move >= DAY_TREND_PCT)
+                        if not cond_day:
+                            reasons.append(f"day {(day_move or 0)*100:.2f}% < {DAY_TREND_PCT*100:.2f}%")
 
                     if ENABLE_1M:
-                        if one_min_move is None or one_min_move < ENTRY_PCT:
-                            ok = False
-                            reasons.append(f"1m { (one_min_move or 0)*100:.2f}% < {ENTRY_PCT*100:.2f}%")
+                        cond_1m = (one_min_move is not None) and (one_min_move >= ENTRY_PCT)
+                        if not cond_1m:
+                            reasons.append(f"1m {(one_min_move or 0)*100:.2f}% < {ENTRY_PCT*100:.2f}%")
                         if MIN_VOL_1M > 0:
-                            if one_min_vol is None or one_min_vol < MIN_VOL_1M:
-                                ok = False
+                            vol_ok = (one_min_vol is not None) and (one_min_vol >= MIN_VOL_1M)
+                            cond_1m = cond_1m and vol_ok
+                            if not vol_ok:
                                 reasons.append(f"vol {one_min_vol or 0} < {MIN_VOL_1M}")
 
                     if ENABLE_TICK:
-                        if not has_baseline or tick_move is None or tick_move < TICK_PCT:
-                            ok = False
-                            reasons.append(f"tick { (tick_move or 0)*100:.2f}% < {TICK_PCT*100:.2f}% (lookback {TICK_LOOKBACK_S:.0f}s)")
+                        cond_tick = (tick_move is not None) and has_baseline and (tick_move >= TICK_PCT)
+                        if not cond_tick:
+                            reasons.append(f"tick {(tick_move or 0)*100:.2f}% < {TICK_PCT*100:.2f}% ({TICK_LOOKBACK_S:.0f}s)")
+
+                    if ENTRY_MODE == "OR":
+                        ok = ((not ENABLE_DAY_TREND or cond_day) or
+                              (not ENABLE_1M or cond_1m) or
+                              (not ENABLE_TICK or cond_tick))
+                    else:  # AND
+                        ok = ((not ENABLE_DAY_TREND or cond_day) and
+                              (not ENABLE_1M or cond_1m) and
+                              (not ENABLE_TICK or cond_tick))
 
                     if not ok:
                         if VERBOSE:
@@ -418,7 +424,8 @@ while True:
                         continue
 
                     # ===== Passed filters -> compute qty and buy =====
-                    price_for_qty = last_price if last_price is not None else (getattr(bar, "c", None) if bar else None)
+                    price_for_qty = (last_price if last_price is not None
+                                     else (getattr(bar, "c", None) if bar else None))
                     if not price_for_qty or price_for_qty <= 0:
                         continue
 
@@ -432,7 +439,7 @@ while True:
                         continue
 
                     logging.info(f"[BUY] {sym} qty={qty} @ ~{price_for_qty:.4f} "
-                                 f"(day={ (day_move or 0)*100:.2f}% ; 1m={ (one_min_move or 0)*100:.2f}% ; tick={ (tick_move or 0)*100:.2f}% ) "
+                                 f"(day={(day_move or 0)*100:.2f}% ; 1m={(one_min_move or 0)*100:.2f}% ; tick={(tick_move or 0)*100:.2f}%) "
                                  f"| slots={count_open_positions()}/{MAX_SLOTS}")
 
                     api.submit_order(symbol=sym, qty=qty, side="buy", type="market", time_in_force="day")
@@ -442,7 +449,6 @@ while True:
                         lock_symbol_today(sym, market_day)
                         logging.info(f"[ONE] {sym}: locked for {market_day} (one trade per symbol per day).")
 
-                    # Wait stable fill, then exits
                     pos = wait_for_stable_position(sym, FILL_RETRIES, FILL_RETRY_SECS)
                     if not pos or float(pos.qty) <= 0:
                         logging.error(f"[EXIT] No filled position for {sym}; skip exits.")
