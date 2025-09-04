@@ -3,7 +3,7 @@ import time
 import json
 import logging
 from typing import List, Dict, Tuple, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytz
 from alpaca_trade_api.rest import REST, TimeFrame
@@ -44,7 +44,9 @@ TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.01"))  # 1%
 STOP_LOSS_PCT   = float(os.getenv("STOP_LOSS_PCT", "0.01"))    # 1%
 POLL_SECONDS    = int(os.getenv("POLL_SECONDS", "15"))
 
-NY = pytz.timezone("America/New_York")
+# Times
+NY  = pytz.timezone("America/New_York")
+UTC = pytz.UTC
 
 # =========================
 # Persistent State (Daily Lock)
@@ -56,6 +58,7 @@ def new_daily_state() -> Dict:
         "date": datetime.now(NY).date().isoformat(),
         "locked_after_sell": {sym: False for sym in SYMBOLS},
         "had_position": {sym: False for sym in SYMBOLS},
+        "last_buy_ts": {sym: None for sym in SYMBOLS},
     }
 
 def load_state() -> Dict:
@@ -74,6 +77,7 @@ def load_state() -> Dict:
         for sym in SYMBOLS:
             st["locked_after_sell"].setdefault(sym, False)
             st["had_position"].setdefault(sym, False)
+            st["last_buy_ts"].setdefault(sym, None)
     return st
 
 def save_state(st: Dict):
@@ -86,8 +90,25 @@ state = load_state()
 # Helpers
 # =========================
 def two_dec(x: float) -> float:
-    """إجبار خانتين عشريتين (يتفادى sub-penny)."""
     return float(f"{x:.2f}")
+
+def _to_dt(x) -> Optional[datetime]:
+    if not x:
+        return None
+    if isinstance(x, datetime):
+        return x
+    s = str(x)
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+def is_today_ny(dt: Optional[datetime]) -> bool:
+    if not dt:
+        return False
+    return dt.astimezone(NY).date() == datetime.now(NY).date()
 
 def get_last_two_closes(sym: str) -> Tuple[Optional[float], Optional[float]]:
     try:
@@ -117,8 +138,62 @@ def calc_qty_for_dollars(sym: str, dollars: float) -> int:
         return 0
     return max(int(dollars // price), 0)
 
+def list_orders_all(limit: int = 200):
+    try:
+        return api.list_orders(status="all", limit=limit, direction="desc")
+    except Exception:
+        return []
+
+OPENLIKE = {"new", "accepted", "open", "partially_filled"}
+
+def has_open_buy_orders_today(sym: str) -> bool:
+    for o in list_orders_all():
+        try:
+            if o.symbol == sym and o.side == "buy" and o.status in OPENLIKE and is_today_ny(_to_dt(o.created_at or o.submitted_at)):
+                return True
+        except Exception:
+            continue
+    return False
+
+def has_open_sell_orders(sym: str) -> bool:
+    for o in list_orders_all():
+        try:
+            if o.symbol == sym and o.side == "sell" and o.status in OPENLIKE:
+                return True
+        except Exception:
+            continue
+    return False
+
+def has_active_stop(sym: str) -> bool:
+    for o in list_orders_all():
+        try:
+            if o.symbol == sym and o.side == "sell" and o.type in ("stop", "stop_limit") and o.status in OPENLIKE:
+                return True
+        except Exception:
+            continue
+    return False
+
+def bought_today(sym: str) -> bool:
+    for o in list_orders_all():
+        try:
+            if o.symbol == sym and o.side == "buy" and is_today_ny(_to_dt(o.filled_at)):
+                return True
+        except Exception:
+            continue
+    return False
+
+def sold_out_today(sym: str, holding_now: bool) -> bool:
+    if holding_now:
+        return False
+    for o in list_orders_all():
+        try:
+            if o.symbol == sym and o.side == "sell" and is_today_ny(_to_dt(o.filled_at)):
+                return True
+        except Exception:
+            continue
+    return False
+
 def place_bracket_buy(sym: str, qty: int):
-    """Market Buy مع Bracket TP/SL بأسعار بخانتين عشريتين."""
     if qty <= 0:
         return
     last_trade = api.get_latest_trade(sym)
@@ -137,42 +212,22 @@ def place_bracket_buy(sym: str, qty: int):
         take_profit={'limit_price': take_profit},
         stop_loss={'stop_price': stop_loss}
     )
+    state["last_buy_ts"][sym] = datetime.now(UTC).isoformat()
+    state["had_position"][sym] = True
+    save_state(state)
 
-def has_open_sell_orders(sym: str) -> bool:
-    """هل يوجد أي أوامر بيع مفتوحة (بما فيها أوامر bracket للأطفال)؟"""
+def seconds_since_last_buy(sym: str) -> float:
+    ts = state["last_buy_ts"].get(sym)
+    if not ts:
+        return 1e9
     try:
-        open_orders = api.list_orders(status="open", direction="asc")
+        dt = _to_dt(ts).astimezone(UTC)
+        return (datetime.now(UTC) - dt).total_seconds()
     except Exception:
-        return False
-    for o in open_orders:
-        try:
-            if o.symbol == sym and o.side == "sell":
-                return True
-        except Exception:
-            continue
-    return False
-
-def has_active_stop(sym: str) -> bool:
-    """يتأكد من وجود أمر وقف نشط لهذا الرمز."""
-    try:
-        open_orders = api.list_orders(status="open", direction="asc")
-    except Exception:
-        return False
-    for o in open_orders:
-        try:
-            if o.symbol == sym and o.side == "sell" and o.type in ("stop", "stop_limit"):
-                return True
-        except Exception:
-            continue
-    return False
+        return 1e9
 
 def ensure_protective_stop(sym: str):
-    """
-    يضيف STOP حماية فقط إذا:
-    - عندك مركز (qty > 0)
-    - ما فيه أي أوامر بيع مفتوحة (أوامر bracket موجودة = بيع)
-    - ما فيه وقف نشط
-    """
+    """أضف STOP حماية فقط إذا لا يوجد bracket/بيع مفتوح، ولا وقف نشط، ومضت 20s بعد الشراء."""
     # 1) هل ماسك مركز؟
     try:
         pos = api.get_position(sym)
@@ -182,22 +237,25 @@ def ensure_protective_stop(sym: str):
     if qty <= 0:
         return
 
-    # 2) إذا فيه أي أوامر بيع مفتوحة (من bracket) -> لا تحط وقف حماية
+    # امنح وقت قصير بعد الشراء حتى تُنشأ أوامر bracket على السيرفر
+    if seconds_since_last_buy(sym) < 20:
+        return
+
+    # 2) لو فيه أي أوامر بيع مفتوحة (من bracket) -> لا تركّب حماية
     if has_open_sell_orders(sym):
         return
 
-    # 3) إذا فيه وقف نشط أصلًا -> خلاص
+    # 3) لو فيه وقف نشط -> خلاص
     if has_active_stop(sym):
         return
 
-    # 4) ضع وقف حماية بخانتين عشريتين
+    # 4) ضع وقف حماية
     try:
         last = float(api.get_latest_trade(sym).price)
     except Exception:
         return
     stop_price = two_dec(last * (1 - STOP_LOSS_PCT))
-
-    logging.warning(f"{sym}: No active STOP found & no sell orders. Placing protective STOP at {stop_price}")
+    logging.warning(f"{sym}: No active STOP & no sell orders. Placing protective STOP at {stop_price}")
     try:
         api.submit_order(
             symbol=sym,
@@ -217,15 +275,16 @@ logging.info(f"Bot started | TOTAL_CAPITAL={TOTAL_CAPITAL} | NUM_SLOTS={NUM_SLOT
 
 while True:
     try:
-        # إعادة ضبط الأقفال عند يوم تداول جديد (بتوقيت نيويورك)
+        # Reset daily locks if new NY day
         today = datetime.now(NY).date().isoformat()
         if state["date"] != today:
             logging.info("New trading day detected. Resetting daily locks.")
             state = new_daily_state()
             save_state(state)
 
-        # متابعة حالة المراكز + تفعيل القفل بعد البيع
+        # Maintain positions & infer locks from real orders
         for sym in SYMBOLS:
+            # هل ماسك مركز الآن؟
             holding = False
             try:
                 pos = api.get_position(sym)
@@ -233,38 +292,41 @@ while True:
             except Exception:
                 holding = False
 
-            # انتقال من ماسك -> فلات = بيع تم => اقفل الرمز لباقي اليوم
-            if state["had_position"].get(sym, False) and not holding and not state["locked_after_sell"].get(sym, False):
-                state["locked_after_sell"][sym] = True
-                logging.info(f"{sym}: position closed -> LOCKED for the rest of the day.")
-                save_state(state)
+            # إذا خرجنا من المركز واليوم عندنا بيع منفذ -> اقفل اليوم
+            if sold_out_today(sym, holding):
+                if not state["locked_after_sell"].get(sym, False):
+                    state["locked_after_sell"][sym] = True
+                    logging.info(f"{sym}: sold today -> LOCKED for the rest of the day.")
+                    save_state(state)
 
             state["had_position"][sym] = holding
 
-            # ضمان وجود وقف حماية لو (ما فيه أوامر بيع مفتوحة) و (ما فيه وقف نشط)
+            # أضف وقف حماية عند الحاجة فقط
             ensure_protective_stop(sym)
 
-        # مسح الدخول
+        # Scan entries
         for sym in SYMBOLS:
-            # تخطَّ الرمز إذا مقفول اليوم أو عندك مركز فيه
+            # لا تدخل إذا الرمز مقفول اليوم
             if state["locked_after_sell"].get(sym, False):
                 continue
+
+            # لا تدخل إذا ماسك أو عندك أوامر شراء مفتوحة اليوم أو شراء منفذ اليوم
             is_holding = False
             try:
                 pos = api.get_position(sym)
                 is_holding = float(pos.qty) > 0
             except Exception:
                 is_holding = False
-            if is_holding:
+            if is_holding or has_open_buy_orders_today(sym) or bought_today(sym):
                 continue
 
-            # شرط A: لحظي (دقيقة)
+            # شرط A: لحظي
             c1, c2 = get_last_two_closes(sym)
             mom_ok = False
             if c1 is not None and c2 is not None and c1 > 0:
                 mom_ok = ((c2 - c1) / c1) >= MOMENTUM_THRESHOLD
 
-            # شرط B: يومي مقابل الافتتاح
+            # شرط B: يومي
             day_open = get_today_open(sym)
             daily_ok = False
             if day_open is not None and day_open > 0 and c2 is not None:
@@ -274,9 +336,6 @@ while True:
                 qty = calc_qty_for_dollars(sym, PER_TRADE_DOLLARS)
                 if qty > 0:
                     place_bracket_buy(sym, qty)
-                    # دخلنا مركز -> لا دخول ثاني لنفس الرمز إلا بعد الخروج
-                    state["had_position"][sym] = True
-                    save_state(state)
 
         time.sleep(POLL_SECONDS)
 
