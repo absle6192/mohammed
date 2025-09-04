@@ -11,10 +11,7 @@ from alpaca_trade_api.rest import REST, TimeFrame
 # =========================
 # Logging
 # =========================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 # =========================
 # Environment / API client
@@ -32,24 +29,26 @@ api = REST(API_KEY, API_SECRET, BASE_URL)
 # =========================
 # Strategy Params
 # =========================
-SYMBOLS: List[str] = [s.strip().upper() for s in os.getenv("SYMBOLS", "AAPL,MSFT,NVDA,TSLA,AMZN").split(",") if s.strip()]
+# ضع بالضبط 8 أسهم هنا (أو غيّر NUM_SLOTS لو تبي رقم آخر)
+SYMBOLS: List[str] = [s.strip().upper() for s in os.getenv(
+    "SYMBOLS", "AAPL,MSFT,NVDA,TSLA,AMZN,GOOGL,META,AMD"
+).split(",") if s.strip()]
 
-MOMENTUM_THRESHOLD = float(os.getenv("MOMENTUM_THRESHOLD", "0.003"))  # مثال: 0.003 = 0.3% على دقيقة
-DAILY_THRESHOLD    = float(os.getenv("DAILY_THRESHOLD", "0.01"))      # مثال: 0.01 = 1% فوق افتتاح اليوم
+TOTAL_CAPITAL = float(os.getenv("TOTAL_CAPITAL", "50000"))  # رأس المال الكلي
+NUM_SLOTS     = int(os.getenv("NUM_SLOTS", "8"))            # توزيع ثابت على 8 خانات
+PER_TRADE_DOLLARS = TOTAL_CAPITAL / max(NUM_SLOTS, 1)
 
-FIXED_DOLLARS_PER_TRADE = float(os.getenv("FIXED_DOLLARS_PER_TRADE", "5000"))
+MOMENTUM_THRESHOLD = float(os.getenv("MOMENTUM_THRESHOLD", "0.003"))  # 0.3% دقيقة
+DAILY_THRESHOLD    = float(os.getenv("DAILY_THRESHOLD", "0.01"))      # 1% فوق افتتاح اليوم
+
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.01"))  # 1%
-STOP_LOSS_PCT   = float(os.getenv("STOP_LOSS_PCT", "0.01"))   # 1%
+STOP_LOSS_PCT   = float(os.getenv("STOP_LOSS_PCT", "0.01"))    # 1%
 POLL_SECONDS    = int(os.getenv("POLL_SECONDS", "15"))
 
-# توقيت السوق
 NY = pytz.timezone("America/New_York")
 
 # =========================
-# Persistent State
-#   locked_after_sell[sym] = True  -> لا يُسمح بالشراء لهذا الرمز لباقي اليوم
-#   had_position[sym]      = True  -> كان ماسك مركز آخر دورة
-#   date = YYYY-MM-DD بتوقيت نيويورك
+# Persistent State (Daily Lock)
 # =========================
 STATE_FILE = "state.json"
 
@@ -73,7 +72,7 @@ def load_state() -> Dict:
     if st.get("date") != today:
         st = new_daily_state()
     else:
-        # sync with current SYMBOLS
+        # تأكيد وجود مفاتيح لكل رمز حالي
         for sym in SYMBOLS:
             st["locked_after_sell"].setdefault(sym, False)
             st["had_position"].setdefault(sym, False)
@@ -89,29 +88,27 @@ state = load_state()
 # Helpers
 # =========================
 def get_last_two_closes(sym: str) -> Tuple[Optional[float], Optional[float]]:
-    """Return last two minute close prices (prev_close, last_close)"""
+    """آخر إغلاقين (شمعة دقيقة)"""
     try:
         bars = api.get_bars(sym, TimeFrame.Minute, limit=2)
         if len(bars) < 2:
             return None, None
         return float(bars[-2].c), float(bars[-1].c)
-    except Exception as e:
-        logging.debug(f"{sym} get_bars minute failed: {e}")
+    except Exception:
         return None, None
 
 def get_today_open(sym: str) -> Optional[float]:
-    """Return today's (or latest) daily open price."""
+    """افتتاح اليوم"""
     try:
         daily_bars = api.get_bars(sym, TimeFrame.Day, limit=1)
         if not daily_bars:
             return None
         return float(daily_bars[0].o)
-    except Exception as e:
-        logging.debug(f"{sym} get_bars day failed: {e}")
+    except Exception:
         return None
 
 def calc_qty_for_dollars(sym: str, dollars: float) -> int:
-    """Position sizing by fixed dollars per trade."""
+    """حاسبة كمية الشراء حسب مبلغ مخصص"""
     try:
         last_trade = api.get_latest_trade(sym)
         price = float(last_trade.price)
@@ -119,11 +116,10 @@ def calc_qty_for_dollars(sym: str, dollars: float) -> int:
         return 0
     if price <= 0:
         return 0
-    qty = int(dollars // price)
-    return max(qty, 0)
+    return max(int(dollars // price), 0)
 
 def place_bracket_buy(sym: str, qty: int):
-    """Market buy + bracket TP/SL."""
+    """شراء Market مع TP/SL (Bracket)"""
     last_trade = api.get_latest_trade(sym)
     entry = float(last_trade.price)
     take_profit = round(entry * (1 + TAKE_PROFIT_PCT), 4)
@@ -143,38 +139,33 @@ def place_bracket_buy(sym: str, qty: int):
 
 def ensure_protective_stop(sym: str):
     """
-    If holding a position but there is no active stop, place a protective STOP immediately.
-    Protects you in case the buy was sent without a bracket for any reason.
+    لو فيه مركز مفتوح لكن ما فيه أمر وقف نشط، يركّب STOP حماية فورًا
+    (حماية لو لأي سبب ما اتركّب الـ bracket).
     """
-    # Are we holding a position?
+    # هل ماسك مركز؟
     try:
         pos = api.get_position(sym)
         qty = int(float(pos.qty))
         if qty <= 0:
             return
     except Exception:
-        return  # no position
+        return
 
-    # Check if a stop order exists for this symbol
+    # هل يوجد أمر وقف؟
     try:
         open_orders = api.list_orders(status="open", direction="asc")
     except Exception as e:
         logging.warning(f"list_orders failed: {e}")
         return
 
-    has_stop = False
     for o in open_orders:
         try:
             if o.symbol == sym and o.side == "sell" and o.type in ("stop", "stop_limit"):
-                has_stop = True
-                break
+                return  # عندنا وقف بالفعل
         except Exception:
             continue
 
-    if has_stop:
-        return
-
-    # Place protective stop based on latest price
+    # ضع وقف حماية
     try:
         last = float(api.get_latest_trade(sym).price)
     except Exception:
@@ -197,18 +188,18 @@ def ensure_protective_stop(sym: str):
 # =========================
 # Main Loop
 # =========================
-logging.info("Started bot (per-symbol daily lock after sell + dual entry conditions + auto protective stop).")
+logging.info(f"Bot started | TOTAL_CAPITAL={TOTAL_CAPITAL} | NUM_SLOTS={NUM_SLOTS} | PER_TRADE_DOLLARS={PER_TRADE_DOLLARS}")
 
 while True:
     try:
-        # Reset daily state if new day (NY time)
+        # إعادة ضبط للأقفال عند يوم تداول جديد (نيويورك)
         today = datetime.now(NY).date().isoformat()
         if state["date"] != today:
-            logging.info("New trading day detected. Resetting locks.")
+            logging.info("New trading day detected. Resetting daily locks.")
             state = new_daily_state()
             save_state(state)
 
-        # Update positions & lock after sell
+        # متابعة حالة المراكز + تفعيل القفل بعد البيع
         for sym in SYMBOLS:
             holding = False
             try:
@@ -217,7 +208,7 @@ while True:
             except Exception:
                 holding = False
 
-            # if previously holding and now flat -> a sell happened -> lock for rest of day
+            # انتقال من ماسك -> فلات = بيع تم => اقفل الرمز لباقي اليوم
             if state["had_position"].get(sym, False) and not holding and not state["locked_after_sell"].get(sym, False):
                 state["locked_after_sell"][sym] = True
                 logging.info(f"{sym}: position closed -> LOCKED for the rest of the day.")
@@ -225,16 +216,16 @@ while True:
 
             state["had_position"][sym] = holding
 
-            # ensure protective stop exists if holding
+            # ضمان وجود وقف حماية لو ما فيه bracket
             ensure_protective_stop(sym)
 
-        # Entry signals
+        # مسح الدخول
         for sym in SYMBOLS:
-            # skip if this symbol is locked for the day
-            if state["locked_after_sell"][sym]:
+            # تخطَّ الرمز إذا:
+            # - مقفول لهذا اليوم، أو
+            # - عندك مركز مفتوح فيه
+            if state["locked_after_sell"].get(sym, False):
                 continue
-
-            # skip if already holding this symbol
             is_holding = False
             try:
                 pos = api.get_position(sym)
@@ -244,29 +235,25 @@ while True:
             if is_holding:
                 continue
 
-            # --- Condition A: minute momentum ---
+            # شرط A: لحظي (دقيقة)
             c1, c2 = get_last_two_closes(sym)
             mom_ok = False
             if c1 is not None and c2 is not None and c1 > 0:
-                minute_mom = (c2 - c1) / c1
-                mom_ok = minute_mom >= MOMENTUM_THRESHOLD
+                mom_ok = ((c2 - c1) / c1) >= MOMENTUM_THRESHOLD
 
-            # --- Condition B: daily return vs today's open ---
+            # شرط B: يومي مقابل الافتتاح
             day_open = get_today_open(sym)
             daily_ok = False
             if day_open is not None and day_open > 0 and c2 is not None:
-                daily_ret = (c2 - day_open) / day_open
-                daily_ok = daily_ret >= DAILY_THRESHOLD
+                daily_ok = ((c2 - day_open) / day_open) >= DAILY_THRESHOLD
 
-            # Buy if ANY condition is true
             if mom_ok or daily_ok:
-                qty = calc_qty_for_dollars(sym, FIXED_DOLLARS_PER_TRADE)
-                if qty <= 0:
-                    continue
-                place_bracket_buy(sym, qty)
-                # mark holding to avoid re-entry until flat again
-                state["had_position"][sym] = True
-                save_state(state)
+                qty = calc_qty_for_dollars(sym, PER_TRADE_DOLLARS)
+                if qty > 0:
+                    place_bracket_buy(sym, qty)
+                    # اعتبر أننا دخلنا مركز -> لا تدخل مرة ثانية إلا بعد ما يصير فلات
+                    state["had_position"][sym] = True
+                    save_state(state)
 
         time.sleep(POLL_SECONDS)
 
