@@ -71,7 +71,6 @@ def load_state() -> Dict:
     if st.get("date") != today:
         st = new_daily_state()
     else:
-        # تأكيد وجود مفاتيح لكل رمز حالي
         for sym in SYMBOLS:
             st["locked_after_sell"].setdefault(sym, False)
             st["had_position"].setdefault(sym, False)
@@ -87,11 +86,10 @@ state = load_state()
 # Helpers
 # =========================
 def two_dec(x: float) -> float:
-    """إجبار خانتين عشريتين بالضبط (يتفادى sub-penny)."""
+    """إجبار خانتين عشريتين (يتفادى sub-penny)."""
     return float(f"{x:.2f}")
 
 def get_last_two_closes(sym: str) -> Tuple[Optional[float], Optional[float]]:
-    """آخر إغلاقين (شمعة دقيقة)"""
     try:
         bars = api.get_bars(sym, TimeFrame.Minute, limit=2)
         if len(bars) < 2:
@@ -101,7 +99,6 @@ def get_last_two_closes(sym: str) -> Tuple[Optional[float], Optional[float]]:
         return None, None
 
 def get_today_open(sym: str) -> Optional[float]:
-    """افتتاح اليوم"""
     try:
         daily_bars = api.get_bars(sym, TimeFrame.Day, limit=1)
         if not daily_bars:
@@ -111,7 +108,6 @@ def get_today_open(sym: str) -> Optional[float]:
         return None
 
 def calc_qty_for_dollars(sym: str, dollars: float) -> int:
-    """حاسبة كمية الشراء حسب مبلغ مخصص"""
     try:
         last_trade = api.get_latest_trade(sym)
         price = float(last_trade.price)
@@ -122,7 +118,7 @@ def calc_qty_for_dollars(sym: str, dollars: float) -> int:
     return max(int(dollars // price), 0)
 
 def place_bracket_buy(sym: str, qty: int):
-    """شراء Market مع TP/SL (Bracket) بأسعار بخانتين عشريتين"""
+    """Market Buy مع Bracket TP/SL بأسعار بخانتين عشريتين."""
     if qty <= 0:
         return
     last_trade = api.get_latest_trade(sym)
@@ -142,12 +138,42 @@ def place_bracket_buy(sym: str, qty: int):
         stop_loss={'stop_price': stop_loss}
     )
 
+def has_open_sell_orders(sym: str) -> bool:
+    """هل يوجد أي أوامر بيع مفتوحة (بما فيها أوامر bracket للأطفال)؟"""
+    try:
+        open_orders = api.list_orders(status="open", direction="asc")
+    except Exception:
+        return False
+    for o in open_orders:
+        try:
+            if o.symbol == sym and o.side == "sell":
+                return True
+        except Exception:
+            continue
+    return False
+
+def has_active_stop(sym: str) -> bool:
+    """يتأكد من وجود أمر وقف نشط لهذا الرمز."""
+    try:
+        open_orders = api.list_orders(status="open", direction="asc")
+    except Exception:
+        return False
+    for o in open_orders:
+        try:
+            if o.symbol == sym and o.side == "sell" and o.type in ("stop", "stop_limit"):
+                return True
+        except Exception:
+            continue
+    return False
+
 def ensure_protective_stop(sym: str):
     """
-    لو فيه مركز مفتوح لكن ما فيه أمر وقف نشط، يركّب STOP حماية فورًا
-    بأسعار بخانتين عشريتين.
+    يضيف STOP حماية فقط إذا:
+    - عندك مركز (qty > 0)
+    - ما فيه أي أوامر بيع مفتوحة (أوامر bracket موجودة = بيع)
+    - ما فيه وقف نشط
     """
-    # هل ماسك مركز؟
+    # 1) هل ماسك مركز؟
     try:
         pos = api.get_position(sym)
         qty = int(float(pos.qty))
@@ -156,28 +182,22 @@ def ensure_protective_stop(sym: str):
     if qty <= 0:
         return
 
-    # هل يوجد أمر وقف بالفعل؟
-    try:
-        open_orders = api.list_orders(status="open", direction="asc")
-    except Exception as e:
-        logging.warning(f"list_orders failed: {e}")
+    # 2) إذا فيه أي أوامر بيع مفتوحة (من bracket) -> لا تحط وقف حماية
+    if has_open_sell_orders(sym):
         return
 
-    for o in open_orders:
-        try:
-            if o.symbol == sym and o.side == "sell" and o.type in ("stop", "stop_limit"):
-                return  # عندنا وقف
-        except Exception:
-            continue
+    # 3) إذا فيه وقف نشط أصلًا -> خلاص
+    if has_active_stop(sym):
+        return
 
-    # ضع وقف حماية بخانتين عشريتين
+    # 4) ضع وقف حماية بخانتين عشريتين
     try:
         last = float(api.get_latest_trade(sym).price)
     except Exception:
         return
     stop_price = two_dec(last * (1 - STOP_LOSS_PCT))
 
-    logging.warning(f"{sym}: No active STOP found. Placing protective STOP at {stop_price}")
+    logging.warning(f"{sym}: No active STOP found & no sell orders. Placing protective STOP at {stop_price}")
     try:
         api.submit_order(
             symbol=sym,
@@ -221,7 +241,7 @@ while True:
 
             state["had_position"][sym] = holding
 
-            # ضمان وجود وقف حماية لو ما فيه bracket
+            # ضمان وجود وقف حماية لو (ما فيه أوامر بيع مفتوحة) و (ما فيه وقف نشط)
             ensure_protective_stop(sym)
 
         # مسح الدخول
