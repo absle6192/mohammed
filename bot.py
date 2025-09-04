@@ -122,8 +122,8 @@ def place_bracket_buy(sym: str, qty: int):
     """شراء Market مع TP/SL (Bracket)"""
     last_trade = api.get_latest_trade(sym)
     entry = float(last_trade.price)
-    take_profit = round(entry * (1 + TAKE_PROFIT_PCT), 4)
-    stop_loss   = round(entry * (1 - STOP_LOSS_PCT), 4)
+    take_profit = round(entry * (1 + TAKE_PROFIT_PCT), 2)
+    stop_loss   = round(entry * (1 - STOP_LOSS_PCT), 2)
 
     logging.info(f"{sym} BUY {qty} @~{entry} TP={take_profit} SL={stop_loss}")
     api.submit_order(
