@@ -29,17 +29,16 @@ api = REST(API_KEY, API_SECRET, BASE_URL)
 # =========================
 # Strategy Params
 # =========================
-# ضع بالضبط 8 أسهم هنا (أو غيّر NUM_SLOTS لو تبي رقم آخر)
 SYMBOLS: List[str] = [s.strip().upper() for s in os.getenv(
     "SYMBOLS", "AAPL,MSFT,NVDA,TSLA,AMZN,GOOGL,META,AMD"
 ).split(",") if s.strip()]
 
 TOTAL_CAPITAL = float(os.getenv("TOTAL_CAPITAL", "50000"))  # رأس المال الكلي
-NUM_SLOTS     = int(os.getenv("NUM_SLOTS", "8"))            # توزيع ثابت على 8 خانات
+NUM_SLOTS     = int(os.getenv("NUM_SLOTS", "8"))            # تقسيم ثابت على 8 خانات
 PER_TRADE_DOLLARS = TOTAL_CAPITAL / max(NUM_SLOTS, 1)
 
 MOMENTUM_THRESHOLD = float(os.getenv("MOMENTUM_THRESHOLD", "0.003"))  # 0.3% دقيقة
-DAILY_THRESHOLD    = float(os.getenv("DAILY_THRESHOLD", "0.01"))      # 1% فوق افتتاح اليوم
+DAILY_THRESHOLD    = float(os.getenv("DAILY_THRESHOLD", "0.01"))      # 1% يومي
 
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.01"))  # 1%
 STOP_LOSS_PCT   = float(os.getenv("STOP_LOSS_PCT", "0.01"))    # 1%
@@ -72,7 +71,6 @@ def load_state() -> Dict:
     if st.get("date") != today:
         st = new_daily_state()
     else:
-        # تأكيد وجود مفاتيح لكل رمز حالي
         for sym in SYMBOLS:
             st["locked_after_sell"].setdefault(sym, False)
             st["had_position"].setdefault(sym, False)
@@ -119,11 +117,11 @@ def calc_qty_for_dollars(sym: str, dollars: float) -> int:
     return max(int(dollars // price), 0)
 
 def place_bracket_buy(sym: str, qty: int):
-    """شراء Market مع TP/SL (Bracket)"""
+    """شراء Market مع TP/SL (Bracket) بأسعار بخانتين عشريتين"""
     last_trade = api.get_latest_trade(sym)
     entry = float(last_trade.price)
-    take_profit = round(entry * (1 + TAKE_PROFIT_PCT), 2)
-    stop_loss   = round(entry * (1 - STOP_LOSS_PCT), 2)
+    take_profit = round(entry * (1 + TAKE_PROFIT_PCT), 2)  # <-- خانتين
+    stop_loss   = round(entry * (1 - STOP_LOSS_PCT), 2)    # <-- خانتين
 
     logging.info(f"{sym} BUY {qty} @~{entry} TP={take_profit} SL={stop_loss}")
     api.submit_order(
@@ -140,7 +138,7 @@ def place_bracket_buy(sym: str, qty: int):
 def ensure_protective_stop(sym: str):
     """
     لو فيه مركز مفتوح لكن ما فيه أمر وقف نشط، يركّب STOP حماية فورًا
-    (حماية لو لأي سبب ما اتركّب الـ bracket).
+    بأسعار بخانتين عشريتين.
     """
     # هل ماسك مركز؟
     try:
@@ -151,7 +149,7 @@ def ensure_protective_stop(sym: str):
     except Exception:
         return
 
-    # هل يوجد أمر وقف؟
+    # هل يوجد أمر وقف بالفعل؟
     try:
         open_orders = api.list_orders(status="open", direction="asc")
     except Exception as e:
@@ -161,16 +159,16 @@ def ensure_protective_stop(sym: str):
     for o in open_orders:
         try:
             if o.symbol == sym and o.side == "sell" and o.type in ("stop", "stop_limit"):
-                return  # عندنا وقف بالفعل
+                return  # عندنا وقف
         except Exception:
             continue
 
-    # ضع وقف حماية
+    # ضع وقف حماية بخانتين عشريتين
     try:
         last = float(api.get_latest_trade(sym).price)
     except Exception:
         return
-    stop_price = round(last * (1 - STOP_LOSS_PCT), 4)
+    stop_price = round(last * (1 - STOP_LOSS_PCT), 2)  # <-- خانتين
 
     logging.warning(f"{sym}: No active STOP found. Placing protective STOP at {stop_price}")
     try:
@@ -192,7 +190,7 @@ logging.info(f"Bot started | TOTAL_CAPITAL={TOTAL_CAPITAL} | NUM_SLOTS={NUM_SLOT
 
 while True:
     try:
-        # إعادة ضبط للأقفال عند يوم تداول جديد (نيويورك)
+        # إعادة ضبط للأقفال عند يوم تداول جديد (بتوقيت نيويورك)
         today = datetime.now(NY).date().isoformat()
         if state["date"] != today:
             logging.info("New trading day detected. Resetting daily locks.")
@@ -221,9 +219,7 @@ while True:
 
         # مسح الدخول
         for sym in SYMBOLS:
-            # تخطَّ الرمز إذا:
-            # - مقفول لهذا اليوم، أو
-            # - عندك مركز مفتوح فيه
+            # تخطَّ الرمز إذا مقفول اليوم أو عندك مركز فيه
             if state["locked_after_sell"].get(sym, False):
                 continue
             is_holding = False
@@ -251,7 +247,7 @@ while True:
                 qty = calc_qty_for_dollars(sym, PER_TRADE_DOLLARS)
                 if qty > 0:
                     place_bracket_buy(sym, qty)
-                    # اعتبر أننا دخلنا مركز -> لا تدخل مرة ثانية إلا بعد ما يصير فلات
+                    # دخلنا مركز -> لا دخول ثاني لنفس الرمز إلا بعد الخروج
                     state["had_position"][sym] = True
                     save_state(state)
 
