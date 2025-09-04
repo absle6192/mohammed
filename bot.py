@@ -71,6 +71,7 @@ def load_state() -> Dict:
     if st.get("date") != today:
         st = new_daily_state()
     else:
+        # تأكيد وجود مفاتيح لكل رمز حالي
         for sym in SYMBOLS:
             st["locked_after_sell"].setdefault(sym, False)
             st["had_position"].setdefault(sym, False)
@@ -85,6 +86,10 @@ state = load_state()
 # =========================
 # Helpers
 # =========================
+def two_dec(x: float) -> float:
+    """إجبار خانتين عشريتين بالضبط (يتفادى sub-penny)."""
+    return float(f"{x:.2f}")
+
 def get_last_two_closes(sym: str) -> Tuple[Optional[float], Optional[float]]:
     """آخر إغلاقين (شمعة دقيقة)"""
     try:
@@ -118,10 +123,12 @@ def calc_qty_for_dollars(sym: str, dollars: float) -> int:
 
 def place_bracket_buy(sym: str, qty: int):
     """شراء Market مع TP/SL (Bracket) بأسعار بخانتين عشريتين"""
+    if qty <= 0:
+        return
     last_trade = api.get_latest_trade(sym)
     entry = float(last_trade.price)
-    take_profit = round(entry * (1 + TAKE_PROFIT_PCT), 2)  # <-- خانتين
-    stop_loss   = round(entry * (1 - STOP_LOSS_PCT), 2)    # <-- خانتين
+    take_profit = two_dec(entry * (1 + TAKE_PROFIT_PCT))
+    stop_loss   = two_dec(entry * (1 - STOP_LOSS_PCT))
 
     logging.info(f"{sym} BUY {qty} @~{entry} TP={take_profit} SL={stop_loss}")
     api.submit_order(
@@ -144,9 +151,9 @@ def ensure_protective_stop(sym: str):
     try:
         pos = api.get_position(sym)
         qty = int(float(pos.qty))
-        if qty <= 0:
-            return
     except Exception:
+        return
+    if qty <= 0:
         return
 
     # هل يوجد أمر وقف بالفعل؟
@@ -168,7 +175,7 @@ def ensure_protective_stop(sym: str):
         last = float(api.get_latest_trade(sym).price)
     except Exception:
         return
-    stop_price = round(last * (1 - STOP_LOSS_PCT), 2)  # <-- خانتين
+    stop_price = two_dec(last * (1 - STOP_LOSS_PCT))
 
     logging.warning(f"{sym}: No active STOP found. Placing protective STOP at {stop_price}")
     try:
@@ -190,7 +197,7 @@ logging.info(f"Bot started | TOTAL_CAPITAL={TOTAL_CAPITAL} | NUM_SLOTS={NUM_SLOT
 
 while True:
     try:
-        # إعادة ضبط للأقفال عند يوم تداول جديد (بتوقيت نيويورك)
+        # إعادة ضبط الأقفال عند يوم تداول جديد (بتوقيت نيويورك)
         today = datetime.now(NY).date().isoformat()
         if state["date"] != today:
             logging.info("New trading day detected. Resetting daily locks.")
