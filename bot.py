@@ -31,7 +31,7 @@ NUM_SLOTS           = 8
 PER_TRADE_DOLLARS   = TOTAL_CAPITAL // NUM_SLOTS
 
 MOMENTUM_LOOKBACK_MIN = 1
-MOMENTUM_THRESHOLD    = 0.003     # +0.3% على آخر دقيقة
+MOMENTUM_THRESHOLD    = 0.001     # +0.3% على آخر دقيقة
 TAKE_PROFIT_PCT       = 0.012     # +1.2%
 STOP_LOSS_PCT         = 0.010     # -1.0%
 USE_TRAILING_STOP     = False
