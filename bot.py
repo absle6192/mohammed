@@ -15,7 +15,7 @@ log = logging.getLogger("bot")
 API_KEY    = os.getenv("APCA_API_KEY_ID", "")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY", "")
 BASE_URL   = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
-DATA_FEED  = os.getenv("APCA_API_DATA_FEED", "iex")  # اجعله sip في Render لو عندك اشتراك
+DATA_FEED  = os.getenv("APCA_API_DATA_FEED", "iex")  # اجعله 'sip' في Render لو عندك اشتراك
 
 if not API_KEY or not API_SECRET:
     log.error("Missing API keys. Set APCA_API_KEY_ID / APCA_API_SECRET_KEY in environment.")
@@ -43,11 +43,18 @@ MAX_SPREAD_PCT        = 0.004     # 0.4% أقصى سبريد
 FLATTEN_BEFORE_CLOSE_MIN = 10     # لا فتح صفقات جديدة قبل الإغلاق بـ N دقيقة
 POLL_SECONDS             = 2.0
 
+# معدل تحديث المراكز من API (لتخفيف الضغط على /v2/positions)
+POS_REFRESH_SECONDS      = 10.0
+
 # ---------- Day state ----------
 locked_today = set()
 entered_today = set()       # أسهم تم الدخول فيها اليوم (شراء)
-had_position_today = set()  # أسهم تَكوّن فيها مركز اليوم (أي كمية > 0 خلال اليوم)
+had_position_today = set()  # أسهم تَكوّن فيها مركز اليوم
 _day_key = None
+
+# ---------- Positions cache ----------
+_pos_cache = []
+_pos_cache_ts = 0.0
 
 def now_utc(): return datetime.now(timezone.utc)
 
@@ -91,30 +98,50 @@ def submit_with_retry(fn, what: str, tries=4, base=1.2):
             last = e
             if _retryable(e) and i < tries-1:
                 sleep = base*(i+1)
-                log.warning(f"{what}: retryable error -> retry in {sleep:.1f}s | {e}")
+                if i >= 1:  # خفّض الضجيج: لا نطبع كل مرة
+                    log.warning(f"{what}: retry in {sleep:.1f}s | {e}")
                 time.sleep(sleep)
                 continue
             break
     log.error(f"{what}: failed after retries -> {last}")
     raise last
 
-# ---------- Orders & positions ----------
+# ---------- Positions (cached) ----------
+def refresh_positions(force=False):
+    """حدث قائمة المراكز من API كل POS_REFRESH_SECONDS أو بالإجبار."""
+    global _pos_cache, _pos_cache_ts
+    now_ts = time.time()
+    if force or (now_ts - _pos_cache_ts) >= POS_REFRESH_SECONDS:
+        try:
+            _pos_cache = api.list_positions()
+            _pos_cache_ts = now_ts
+        except Exception as e:
+            # لا نُسقط البوت؛ نحتفظ بالكاش القديم ونحاول لاحقاً
+            log.warning(f"positions refresh error (kept cache): {e}")
+
+def get_positions_cached():
+    """ارجع نسخة من الكاش الحالي (تأكد من التحديث الدوري خارجياً)."""
+    return _pos_cache or []
+
+def get_qty(sym: str) -> int:
+    for p in get_positions_cached():
+        if p.symbol == sym:
+            try:
+                return int(p.qty)
+            except Exception:
+                return int(float(p.qty))
+    return 0
+
+def open_positions_count() -> int:
+    return len(get_positions_cached())
+
+# ---------- Orders & positions helpers ----------
 def list_open_orders(sym: str):
     try:
         return [o for o in api.list_orders(status="open") if o.symbol == sym]
     except Exception as e:
         log.warning(f"list_open_orders({sym}) error: {e}")
         return []
-
-def get_qty(sym: str) -> int:
-    try:
-        for p in api.list_positions():
-            if p.symbol == sym:
-                return int(p.qty)
-        return 0
-    except Exception as e:
-        log.warning(f"get_qty({sym}) error: {e}")
-        return 0
 
 def cancel_child_orders(sym: str):
     for o in list_open_orders(sym):
@@ -196,8 +223,11 @@ def place_bracket_buy(sym: str, dollars: float):
         )
     submit_with_retry(_submit, f"{sym} BUY (bracket)")
 
-    # سجل أننا دخلنا السهم اليوم (شراء فعلي)
+    # سجل أننا دخلنا السهم اليوم
     entered_today.add(sym)
+
+    # بعد أمر جديد، حدّث المراكز فوراً كي تعكس الكاش
+    refresh_positions(force=True)
 
     log.info(f"{sym}: BUY {qty} @~{lt.price:.2f} -> TP {tp} / {'TRAIL '+str(TRAIL_PCT*100)+'%' if USE_TRAILING_STOP else 'SL '+str(slp)}")
 
@@ -216,10 +246,8 @@ def place_protective_stop(sym: str, qty: int, stop_price: float):
 def after_fill_housekeeping(sym: str):
     qty = get_qty(sym)
 
-    # لو عندي مركز مفتوح الآن
     if qty > 0:
         had_position_today.add(sym)
-        # تأكد من وجود STOP فعّال
         if not has_active_stop(sym):
             lt = last_trade(sym)
             if lt and lt.price>0:
@@ -231,19 +259,13 @@ def after_fill_housekeeping(sym: str):
                     log.error(f"{sym}: protective stop failed: {e}")
         return
 
-    # qty == 0: لا تقفل إلا إذا فعلاً دخلناه اليوم أو كان لدينا مركز خلال اليوم
+    # qty == 0: لا تقفل إلا إذا حصل دخول فعلي اليوم
     if sym in entered_today or sym in had_position_today:
         cancel_child_orders(sym)
         if sym not in locked_today:
             lock_for_today(sym)
-    # لو ما اشتريناه اليوم إطلاقًا، لا تطبع أي LOCKED
 
 # ---------- Core loop ----------
-def open_positions_count():
-    try: return len(api.list_positions())
-    except Exception as e:
-        log.warning(f"list_positions error: {e}"); return 0
-
 def eligible_to_buy(sym: str) -> bool:
     return (sym not in locked_today and
             spread_ok(sym) and
@@ -254,6 +276,9 @@ def main():
     log.info(f"Bot started | CAPITAL={TOTAL_CAPITAL} | SLOTS={NUM_SLOTS} | PER_TRADE={PER_TRADE_DOLLARS} | FEED={DATA_FEED}")
     log.info(f"MOMENTUM_THRESHOLD in use = {MOMENTUM_THRESHOLD:.4f} ({MOMENTUM_THRESHOLD*100:.2f}%)")
 
+    # تحديث أولي للمراكز
+    refresh_positions(force=True)
+
     while True:
         try:
             reset_day_if_needed()
@@ -262,9 +287,14 @@ def main():
                 time.sleep(5); continue
 
             if minutes_to_close() <= FLATTEN_BEFORE_CLOSE_MIN:
+                # حتى في هذا الوقت، حدّث الكاش دورياً
+                refresh_positions(force=False)
                 time.sleep(POLL_SECONDS); continue
 
-            # مزامنة بعد أي تنفيذ يدوي
+            # حدث المراكز من الواجهة كل فترة فقط (لتخفيف الضغط)
+            refresh_positions(force=False)
+
+            # مزامنة بعد أي تنفيذ يدوي (تعتمد على الكاش الحالي)
             for s in SYMBOLS:
                 after_fill_housekeeping(s)
 
