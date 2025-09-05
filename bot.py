@@ -15,7 +15,7 @@ log = logging.getLogger("bot")
 API_KEY    = os.getenv("APCA_API_KEY_ID", "")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY", "")
 BASE_URL   = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
-DATA_FEED  = os.getenv("APCA_API_DATA_FEED", "iex")  # أنت مخلّيها sip في Render
+DATA_FEED  = os.getenv("APCA_API_DATA_FEED", "iex")  # اجعله sip في Render لو عندك اشتراك
 
 if not API_KEY or not API_SECRET:
     log.error("Missing API keys. Set APCA_API_KEY_ID / APCA_API_SECRET_KEY in environment.")
@@ -45,17 +45,21 @@ POLL_SECONDS             = 2.0
 
 # ---------- Day state ----------
 locked_today = set()
+entered_today = set()       # أسهم تم الدخول فيها اليوم (شراء)
+had_position_today = set()  # أسهم تَكوّن فيها مركز اليوم (أي كمية > 0 خلال اليوم)
 _day_key = None
 
 def now_utc(): return datetime.now(timezone.utc)
 
 def reset_day_if_needed():
-    global _day_key, locked_today
+    global _day_key, locked_today, entered_today, had_position_today
     k = now_utc().date().isoformat()
     if k != _day_key:
         _day_key = k
-        locked_today = set()
-        log.info("New trading day -> cleared locks.")
+        locked_today.clear()
+        entered_today.clear()
+        had_position_today.clear()
+        log.info("New trading day -> cleared locks & markers.")
 
 def market_open() -> bool:
     try:
@@ -191,6 +195,10 @@ def place_bracket_buy(sym: str, dollars: float):
             client_order_id=str(uuid.uuid4())
         )
     submit_with_retry(_submit, f"{sym} BUY (bracket)")
+
+    # سجل أننا دخلنا السهم اليوم (شراء فعلي)
+    entered_today.add(sym)
+
     log.info(f"{sym}: BUY {qty} @~{lt.price:.2f} -> TP {tp} / {'TRAIL '+str(TRAIL_PCT*100)+'%' if USE_TRAILING_STOP else 'SL '+str(slp)}")
 
 def place_protective_stop(sym: str, qty: int, stop_price: float):
@@ -208,20 +216,27 @@ def place_protective_stop(sym: str, qty: int, stop_price: float):
 def after_fill_housekeeping(sym: str):
     qty = get_qty(sym)
 
-    # لو مافي مركز: الغِ الأوامر اليتيمة واقفل السهم لليوم
-    if qty <= 0:
-        cancel_child_orders(sym)
-        lock_for_today(sym)
+    # لو عندي مركز مفتوح الآن
+    if qty > 0:
+        had_position_today.add(sym)
+        # تأكد من وجود STOP فعّال
+        if not has_active_stop(sym):
+            lt = last_trade(sym)
+            if lt and lt.price>0:
+                sp = lt.price*(1-STOP_LOSS_PCT)
+                log.warning(f"{sym}: No active STOP -> placing protective at {sp:.2f}")
+                try:
+                    place_protective_stop(sym, qty, sp)
+                except Exception as e:
+                    log.error(f"{sym}: protective stop failed: {e}")
         return
 
-    # لو مافي STOP فعّال (أحيانًا يفشل إنشاء أولي بسبب 500)، نضيف وقف وقائي
-    if not has_active_stop(sym):
-        lt = last_trade(sym)
-        if lt and lt.price>0:
-            sp = lt.price*(1-STOP_LOSS_PCT)
-            log.warning(f"{sym}: No active STOP -> placing protective at {sp:.2f}")
-            try: place_protective_stop(sym, qty, sp)
-            except Exception as e: log.error(f"{sym}: protective stop failed: {e}")
+    # qty == 0: لا تقفل إلا إذا فعلاً دخلناه اليوم أو كان لدينا مركز خلال اليوم
+    if sym in entered_today or sym in had_position_today:
+        cancel_child_orders(sym)
+        if sym not in locked_today:
+            lock_for_today(sym)
+    # لو ما اشتريناه اليوم إطلاقًا، لا تطبع أي LOCKED
 
 # ---------- Core loop ----------
 def open_positions_count():
