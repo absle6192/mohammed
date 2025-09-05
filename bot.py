@@ -31,7 +31,7 @@ NUM_SLOTS           = 8
 PER_TRADE_DOLLARS   = TOTAL_CAPITAL // NUM_SLOTS
 
 MOMENTUM_LOOKBACK_MIN = 1
-MOMENTUM_THRESHOLD    = 0.001     # +0.3% على آخر دقيقة
+MOMENTUM_THRESHOLD    = 0.001     # +0.1% على آخر دقيقة
 TAKE_PROFIT_PCT       = 0.012     # +1.2%
 STOP_LOSS_PCT         = 0.010     # -1.0%
 USE_TRAILING_STOP     = False
@@ -237,6 +237,7 @@ def eligible_to_buy(sym: str) -> bool:
 
 def main():
     log.info(f"Bot started | CAPITAL={TOTAL_CAPITAL} | SLOTS={NUM_SLOTS} | PER_TRADE={PER_TRADE_DOLLARS} | FEED={DATA_FEED}")
+    log.info(f"MOMENTUM_THRESHOLD in use = {MOMENTUM_THRESHOLD:.4f} ({MOMENTUM_THRESHOLD*100:.2f}%)")
 
     while True:
         try:
