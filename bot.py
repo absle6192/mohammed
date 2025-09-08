@@ -1,323 +1,307 @@
 import os
 import time
 import math
-import uuid
 import logging
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Set
 from datetime import datetime, timedelta, timezone
 
 from alpaca_trade_api.rest import REST, TimeFrame, TimeFrameUnit
 
-# ---------- Logging ----------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("bot")
+# =========================
+# Logging
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 
-# ---------- API (from ENV ONLY) ----------
+# =========================
+# Environment / API client
+# =========================
 API_KEY    = os.getenv("APCA_API_KEY_ID", "")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY", "")
 BASE_URL   = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
-DATA_FEED  = os.getenv("APCA_API_DATA_FEED", "iex")  # اجعله 'sip' في Render لو عندك اشتراك
+DATA_FEED  = os.getenv("APCA_API_DATA_FEED", "sip").strip().lower()  # use 'sip' for best coverage
+SYMBOLS: List[str] = [s.strip().upper() for s in os.getenv("SYMBOLS", "AAPL,MSFT,AMZN,NVDA,AMD,TSLA,META,GOOGL").split(",") if s.strip()]
 
 if not API_KEY or not API_SECRET:
-    log.error("Missing API keys. Set APCA_API_KEY_ID / APCA_API_SECRET_KEY in environment.")
+    logging.error("Missing API keys in environment. Set APCA_API_KEY_ID / APCA_API_SECRET_KEY.")
     raise SystemExit(1)
 
-api = REST(API_KEY, API_SECRET, BASE_URL)
+api = REST(API_KEY, API_SECRET, BASE_URL, api_version="v2")
 
-# ---------- CONFIG (INLINE) ----------
-SYMBOLS = ["AAPL","MSFT","AMZN","NVDA","AMD","TSLA","META","GOOGL"]
+# =========================
+# CONFIG (INLINE)
+# =========================
+TOTAL_CAPITAL: float = float(os.getenv("TOTAL_CAPITAL", "50000"))
+NUM_SLOTS: int       = int(os.getenv("NUM_SLOTS", "8"))           # concurrent positions
+PER_TRADE_DOLLARS: float = math.floor(TOTAL_CAPITAL / NUM_SLOTS)
 
-TOTAL_CAPITAL       = 50000
-NUM_SLOTS           = 8
-PER_TRADE_DOLLARS   = TOTAL_CAPITAL // NUM_SLOTS
+LOOKBACK_MIN           = 1        # momentum lookback (minutes)
+MOMENTUM_THRESHOLD     = 0.0005   # +0.05% (reduced from 0.10%) – entry threshold on 1m change
+TAKE_PROFIT_PCT        = 0.012    # +1.2%
+STOP_LOSS_PCT          = 0.010    # -1.0%
+USE_TRAILING_STOP      = True
+TRAIL_PCT              = 0.006    # 0.6% trailing stop if enabled
 
-MOMENTUM_LOOKBACK_MIN = 1
-MOMENTUM_THRESHOLD    = 0.001     # +0.1% على آخر دقيقة
-TAKE_PROFIT_PCT       = 0.012     # +1.2%
-STOP_LOSS_PCT         = 0.010     # -1.0%
-USE_TRAILING_STOP     = False
-TRAIL_PCT             = 0.008     # 0.8% (لو فعلت التريلينغ)
+VOLUME_1M              = 100000   # min 1-minute volume (reduced)
+MAX_SPREAD_PCT         = 0.006    # max spread 0.60%
 
-MIN_DOLLAR_VOLUME_1M  = 200000    # سيولة دنيا لشمعة 1د
-MAX_SPREAD_PCT        = 0.004     # 0.4% أقصى سبريد
+MINUTES_BEFORE_CLOSE   = 10       # don't open new positions this many minutes before close
+MAX_HOLD_HOURS         = 6        # safety: liquidate very old intraday positions (if any)
 
-FLATTEN_BEFORE_CLOSE_MIN = 10     # لا فتح صفقات جديدة قبل الإغلاق بـ N دقيقة
-POLL_SECONDS             = 2.0
+SLEEP_SECONDS          = 5.0      # polling interval
+CLOCK_SLOWDOWN_ON_ERR  = 2.0
 
-# معدل تحديث المراكز من API (لتخفيف الضغط على /v2/positions)
-POS_REFRESH_SECONDS      = 10.0
+# =========================
+# Day state
+# =========================
+entered_today: Set[str] = set()        # symbols we opened today (to avoid re-entry after exit)
+exited_today: Set[str]  = set()        # symbols we closed today
+positions_today: Set[str] = set()      # symbols currently open today
 
-# ---------- Day state ----------
-locked_today = set()
-entered_today = set()       # أسهم تم الدخول فيها اليوم (شراء)
-had_position_today = set()  # أسهم تَكوّن فيها مركز اليوم
-_day_key = None
+# =========================
+# Helpers
+# =========================
+def us_now() -> datetime:
+    return datetime.now(timezone.utc)
 
-# ---------- Positions cache ----------
-_pos_cache = []
-_pos_cache_ts = 0.0
-
-def now_utc(): return datetime.now(timezone.utc)
-
-def reset_day_if_needed():
-    global _day_key, locked_today, entered_today, had_position_today
-    k = now_utc().date().isoformat()
-    if k != _day_key:
-        _day_key = k
-        locked_today.clear()
-        entered_today.clear()
-        had_position_today.clear()
-        log.info("New trading day -> cleared locks & markers.")
-
-def market_open() -> bool:
+def get_clock():
     try:
-        return bool(api.get_clock().is_open)
+        return api.get_clock()
     except Exception as e:
-        log.warning(f"clock error: {e}")
-        return True
+        logging.warning(f"clock fetch failed: {e}")
+        return None
 
-def minutes_to_close() -> int:
+def minutes_to_close(clock) -> Optional[int]:
     try:
-        nxt = api.get_clock().next_close
-        return max(0, int((nxt - now_utc()).total_seconds() // 60))
-    except Exception:
-        return 999
+        if not clock or not clock.is_open:
+            return None
+        remaining = clock.next_close - us_now()
+        return max(0, int(remaining.total_seconds() // 60))
+    except Exception as e:
+        logging.warning(f"minutes_to_close err: {e}")
+        return None
 
-# ---------- Retry helper ----------
-def _retryable(e: Exception) -> bool:
-    s = str(e).lower()
-    return ("500" in s) or ("timeout" in s) or ("temporar" in s) or ("connection" in s)
-
-def submit_with_retry(fn, what: str, tries=4, base=1.2):
-    last = None
-    for i in range(tries):
-        try:
-            r = fn()
-            if i: log.info(f"{what}: succeeded on retry #{i}")
-            return r
-        except Exception as e:
-            last = e
-            if _retryable(e) and i < tries-1:
-                sleep = base*(i+1)
-                if i >= 1:  # خفّض الضجيج: لا نطبع كل مرة
-                    log.warning(f"{what}: retry in {sleep:.1f}s | {e}")
-                time.sleep(sleep)
-                continue
-            break
-    log.error(f"{what}: failed after retries -> {last}")
-    raise last
-
-# ---------- Positions (cached) ----------
-def refresh_positions(force=False):
-    """حدث قائمة المراكز من API كل POS_REFRESH_SECONDS أو بالإجبار."""
-    global _pos_cache, _pos_cache_ts
-    now_ts = time.time()
-    if force or (now_ts - _pos_cache_ts) >= POS_REFRESH_SECONDS:
-        try:
-            _pos_cache = api.list_positions()
-            _pos_cache_ts = now_ts
-        except Exception as e:
-            # لا نُسقط البوت؛ نحتفظ بالكاش القديم ونحاول لاحقاً
-            log.warning(f"positions refresh error (kept cache): {e}")
-
-def get_positions_cached():
-    """ارجع نسخة من الكاش الحالي (تأكد من التحديث الدوري خارجياً)."""
-    return _pos_cache or []
-
-def get_qty(sym: str) -> int:
-    for p in get_positions_cached():
-        if p.symbol == sym:
-            try:
-                return int(p.qty)
-            except Exception:
-                return int(float(p.qty))
-    return 0
-
-def open_positions_count() -> int:
-    return len(get_positions_cached())
-
-# ---------- Orders & positions helpers ----------
-def list_open_orders(sym: str):
+def get_spread_pct(sym: str) -> Optional[float]:
     try:
-        return [o for o in api.list_orders(status="open") if o.symbol == sym]
+        quote = api.get_latest_quote(sym, feed=DATA_FEED)
+        if not quote or quote.ask_price <= 0 or quote.bid_price <= 0:
+            return None
+        mid = (quote.ask_price + quote.bid_price) / 2.0
+        spread = (quote.ask_price - quote.bid_price) / mid
+        return max(0.0, spread)
     except Exception as e:
-        log.warning(f"list_open_orders({sym}) error: {e}")
-        return []
+        logging.debug(f"quote err {sym}: {e}")
+        return None
 
-def cancel_child_orders(sym: str):
-    for o in list_open_orders(sym):
-        try:
-            api.cancel_order(o.id)
-            log.info(f"{sym}: canceled {o.side} {o.type} {o.id}")
-        except Exception as e:
-            log.warning(f"{sym}: cancel {o.id} failed: {e}")
-
-def has_active_stop(sym: str) -> bool:
-    for o in list_open_orders(sym):
-        if o.side == "sell" and o.type in ("stop","stop_limit","trailing_stop"):
-            return True
-    return False
-
-def lock_for_today(sym: str):
-    locked_today.add(sym)
-    log.info(f"{sym}: sold today -> LOCKED for the rest of the day.")
-
-# ---------- Market data & signal ----------
-def _bars_1m(sym: str, limit=3):
-    end = now_utc(); start = end - timedelta(minutes=limit+1)
-    return api.get_bars(sym, TimeFrame(TimeFrameUnit.Minute,1),
-                        start.isoformat(), end.isoformat(),
-                        feed=DATA_FEED, limit=limit)
-
-def last_trade(sym: str):
-    try: return api.get_latest_trade(sym, feed=DATA_FEED)
-    except Exception as e:
-        log.warning(f"{sym}: last_trade error: {e}"); return None
-
-def last_quote(sym: str):
-    try: return api.get_latest_quote(sym, feed=DATA_FEED)
-    except Exception as e:
-        log.warning(f"{sym}: last_quote error: {e}"); return None
-
-def calc_momentum(sym: str) -> float:
+def get_1m_momentum_and_volume(sym: str) -> Optional[Dict[str, float]]:
+    """Return last 2 bars to compute 1m momentum and last bar volume."""
     try:
-        bars = _bars_1m(sym, 3)
-        if not bars or len(bars) < 2: return 0.0
-        a, b = bars[-2].c, bars[-1].c
-        return (b-a)/a if a>0 else 0.0
+        end   = us_now()
+        start = end - timedelta(minutes=LOOKBACK_MIN + 2)
+        bars = api.get_bars(
+            sym,
+            TimeFrame(1, TimeFrameUnit.Minute),
+            start.isoformat(),
+            end.isoformat(),
+            adjustment="raw",
+            feed=DATA_FEED,
+            limit=3
+        )
+        bars = list(bars)
+        if len(bars) < 2:
+            return None
+        last = bars[-1]
+        prev = bars[-2]
+        momentum = (last.c - prev.c) / prev.c if prev.c > 0 else 0.0
+        return {"momentum": momentum, "vol1m": float(last.v), "last_close": last.c}
     except Exception as e:
-        log.warning(f"{sym}: momentum error: {e}")
-        return 0.0
+        logging.debug(f"bars err {sym}: {e}")
+        return None
 
-def spread_ok(sym: str) -> bool:
-    q = last_quote(sym)
-    if not q or q.ask_price<=0 or q.bid_price<=0: return False
-    return (q.ask_price - q.bid_price)/q.ask_price <= MAX_SPREAD_PCT
-
-def liquidity_ok(sym: str) -> bool:
+def already_in_position(sym: str) -> bool:
     try:
-        b = _bars_1m(sym, 2)
-        if not b: return False
-        last = b[-1]
-        dollar = (last.v or 0) * ((last.h + last.l)/2.0)
-        return dollar >= MIN_DOLLAR_VOLUME_1M
+        pos = api.get_position(sym)
+        return float(pos.qty) != 0
     except Exception:
         return False
 
-# ---------- Place orders ----------
-def place_bracket_buy(sym: str, dollars: float):
-    lt = last_trade(sym)
-    if not lt or lt.price <= 0:
-        raise RuntimeError(f"{sym}: no last trade price.")
-    qty = max(1, int(dollars // lt.price))
-    tp  = round(lt.price*(1+TAKE_PROFIT_PCT), 2)
-    slp = round(lt.price*(1-STOP_LOSS_PCT),   2)
-
-    def _submit():
-        return api.submit_order(
-            symbol=sym, qty=qty, side="buy", type="market", time_in_force="day",
-            order_class="bracket",
-            take_profit={"limit_price": tp},
-            stop_loss=({"stop_price": slp} if not USE_TRAILING_STOP
-                       else {"trail_percent": round(TRAIL_PCT*100,3)}),
-            client_order_id=str(uuid.uuid4())
+def place_buy(sym: str, dollars: float):
+    # use notional to buy
+    try:
+        api.submit_order(
+            symbol=sym,
+            notional=str(dollars),
+            side="buy",
+            type="market",
+            time_in_force="day"
         )
-    submit_with_retry(_submit, f"{sym} BUY (bracket)")
+        logging.info(f"BUY sent: {sym} notional ~${dollars:,.0f}")
+    except Exception as e:
+        logging.error(f"BUY failed {sym}: {e}")
 
-    # سجل أننا دخلنا السهم اليوم
-    entered_today.add(sym)
+def place_tp_sl_or_trailing(sym: str, entry_price: float):
+    try:
+        if USE_TRAILING_STOP:
+            # trailing stop only (exchange OCO notional not supported directly, use separate order)
+            api.submit_order(
+                symbol=sym,
+                side="sell",
+                type="trailing_stop",
+                time_in_force="day",
+                trail_percent=str(TRAIL_PCT * 100.0)
+            )
+            logging.info(f"TRAIL set {sym} at {TRAIL_PCT:.2%}")
+        else:
+            take_profit = round(entry_price * (1.0 + TAKE_PROFIT_PCT), 2)
+            stop_loss   = round(entry_price * (1.0 - STOP_LOSS_PCT), 2)
+            api.submit_order(
+                symbol=sym,
+                side="sell",
+                type="limit",
+                limit_price=str(take_profit),
+                time_in_force="day"
+            )
+            api.submit_order(
+                symbol=sym,
+                side="sell",
+                type="stop",
+                stop_price=str(stop_loss),
+                time_in_force="day"
+            )
+            logging.info(f"TP/SL set {sym} TP={take_profit} SL={stop_loss}")
+    except Exception as e:
+        logging.error(f"protective orders failed {sym}: {e}")
 
-    # بعد أمر جديد، حدّث المراكز فوراً كي تعكس الكاش
-    refresh_positions(force=True)
+def close_all_positions(reason: str):
+    try:
+        api.close_all_positions(cancel_orders=True)
+        logging.info(f"Flattened all positions: {reason}")
+    except Exception as e:
+        logging.error(f"close_all_positions err: {e}")
 
-    log.info(f"{sym}: BUY {qty} @~{lt.price:.2f} -> TP {tp} / {'TRAIL '+str(TRAIL_PCT*100)+'%' if USE_TRAILING_STOP else 'SL '+str(slp)}")
+def refresh_today_sets():
+    """Clear daily locks at start of a new trading day."""
+    global entered_today, exited_today, positions_today
+    entered_today.clear()
+    exited_today.clear()
+    positions_today.clear()
+    logging.info("New trading day -> cleared locks & markers.")
 
-def place_protective_stop(sym: str, qty: int, stop_price: float):
-    if qty <= 0: return
-    def _submit():
-        return api.submit_order(
-            symbol=sym, qty=qty, side="sell", type="stop",
-            stop_price=round(stop_price,2), time_in_force="day",
-            client_order_id=str(uuid.uuid4())
-        )
-    submit_with_retry(_submit, f"{sym} protective STOP @{stop_price:.2f}")
-    log.info(f"{sym}: placed protective STOP @{stop_price:.2f}")
+# =========================
+# Boot message
+# =========================
+logging.info(f"Bot started | CAPITAL={TOTAL_CAPITAL} | SLOTS={NUM_SLOTS} | PER_TRADE={PER_TRADE_DOLLARS} | FEED={DATA_FEED}")
+logging.info(f"MOMENTUM_THRESHOLD in use = {MOMENTUM_THRESHOLD:.4f} ({MOMENTUM_THRESHOLD:.2%})")
 
-# ---------- Housekeeping ----------
-def after_fill_housekeeping(sym: str):
-    qty = get_qty(sym)
+last_calendar_day = None
 
-    if qty > 0:
-        had_position_today.add(sym)
-        if not has_active_stop(sym):
-            lt = last_trade(sym)
-            if lt and lt.price>0:
-                sp = lt.price*(1-STOP_LOSS_PCT)
-                log.warning(f"{sym}: No active STOP -> placing protective at {sp:.2f}")
-                try:
-                    place_protective_stop(sym, qty, sp)
-                except Exception as e:
-                    log.error(f"{sym}: protective stop failed: {e}")
-        return
+# =========================
+# Main loop
+# =========================
+while True:
+    try:
+        clock = get_clock()
+        if not clock:
+            time.sleep(SLEEP_SECONDS * CLOCK_SLOWDOWN_ON_ERR)
+            continue
 
-    # qty == 0: لا تقفل إلا إذا حصل دخول فعلي اليوم
-    if sym in entered_today or sym in had_position_today:
-        cancel_child_orders(sym)
-        if sym not in locked_today:
-            lock_for_today(sym)
+        # Reset daily state if we rolled into a new trading day
+        today_date = datetime.now(timezone.utc).date()
+        if last_calendar_day != today_date:
+            last_calendar_day = today_date
+            refresh_today_sets()
 
-# ---------- Core loop ----------
-def eligible_to_buy(sym: str) -> bool:
-    return (sym not in locked_today and
-            spread_ok(sym) and
-            liquidity_ok(sym) and
-            calc_momentum(sym) >= MOMENTUM_THRESHOLD)
+        if not clock.is_open:
+            logging.info("Market closed. Sleeping…")
+            time.sleep(max(30.0, SLEEP_SECONDS * 6))
+            continue
 
-def main():
-    log.info(f"Bot started | CAPITAL={TOTAL_CAPITAL} | SLOTS={NUM_SLOTS} | PER_TRADE={PER_TRADE_DOLLARS} | FEED={DATA_FEED}")
-    log.info(f"MOMENTUM_THRESHOLD in use = {MOMENTUM_THRESHOLD:.4f} ({MOMENTUM_THRESHOLD*100:.2f}%)")
+        mins_to_close = minutes_to_close(clock) or 0
 
-    # تحديث أولي للمراكز
-    refresh_positions(force=True)
-
-    while True:
+        # Track current positions list
         try:
-            reset_day_if_needed()
-
-            if not market_open():
-                time.sleep(5); continue
-
-            if minutes_to_close() <= FLATTEN_BEFORE_CLOSE_MIN:
-                # حتى في هذا الوقت، حدّث الكاش دورياً
-                refresh_positions(force=False)
-                time.sleep(POLL_SECONDS); continue
-
-            # حدث المراكز من الواجهة كل فترة فقط (لتخفيف الضغط)
-            refresh_positions(force=False)
-
-            # مزامنة بعد أي تنفيذ يدوي (تعتمد على الكاش الحالي)
-            for s in SYMBOLS:
-                after_fill_housekeeping(s)
-
-            # دخول صفقات جديدة حتى امتلاء الـ Slots
-            slots_left = max(0, NUM_SLOTS - open_positions_count())
-            if slots_left > 0:
-                for s in SYMBOLS:
-                    if slots_left <= 0: break
-                    if get_qty(s) > 0 or s in locked_today: continue
-                    if eligible_to_buy(s):
-                        try:
-                            place_bracket_buy(s, PER_TRADE_DOLLARS)
-                            slots_left -= 1
-                        except Exception as e:
-                            log.warning(f"{s}: buy failed: {e}")
-
-            time.sleep(POLL_SECONDS)
-
-        except KeyboardInterrupt:
-            log.info("Interrupted, exiting."); break
+            open_positions = api.list_positions()
+            positions_today = {p.symbol for p in open_positions}
         except Exception as e:
-            log.error(f"Main loop error: {e}")
-            time.sleep(2.0)
+            logging.debug(f"list_positions err: {e}")
+            open_positions = []
 
-if __name__ == "__main__":
-    main()
+        # Don’t open new trades close to the bell
+        allow_new = mins_to_close > MINUTES_BEFORE_CLOSE
+
+        # Iterate watchlist
+        for sym in SYMBOLS:
+            if sym in positions_today:
+                continue  # already in position
+            if sym in entered_today:
+                continue  # day lock: don't re-enter same day after exit
+            if not allow_new:
+                continue
+
+            info = get_1m_momentum_and_volume(sym)
+            spread = get_spread_pct(sym)
+
+            if info is None or spread is None:
+                logging.debug(f"SKIP {sym} | missing data")
+                continue
+
+            mom   = info["momentum"]
+            vol1m = info["vol1m"]
+
+            # Diagnostic log to know why we skipped/entered
+            logging.info(
+                f"CHK {sym} | mom={mom:.2%} need>{MOMENTUM_THRESHOLD:.2%} | "
+                f"vol1m={int(vol1m):,} need>={VOLUME_1M:,} | spread={spread:.2%} max<{MAX_SPREAD_PCT:.2%}"
+            )
+
+            # Entry filters
+            if mom < MOMENTUM_THRESHOLD:
+                continue
+            if vol1m < VOLUME_1M:
+                continue
+            if spread > MAX_SPREAD_PCT:
+                continue
+
+            # Position sizing & submit buy
+            dollars = PER_TRADE_DOLLARS
+            place_buy(sym, dollars)
+            entered_today.add(sym)
+
+            # Fetch fill/avg price to set protection (best-effort)
+            time.sleep(1.0)
+            try:
+                # find the most recent buy order for the symbol
+                orders = api.list_orders(status="all", limit=50, nested=False)
+                fills = [o for o in orders if o.symbol == sym and o.side == "buy"]
+                fills.sort(key=lambda o: o.submitted_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+                if fills and fills[0].filled_avg_price:
+                    entry_price = float(fills[0].filled_avg_price)
+                else:
+                    # fallback: use last close from bars
+                    entry_price = float(info["last_close"])
+            except Exception:
+                entry_price = float(info["last_close"])
+            place_tp_sl_or_trailing(sym, entry_price)
+
+        # Housekeeping: close any super-old intraday positions (safety)
+        try:
+            for p in open_positions:
+                # if position open too long intraday and near the bell, flatten
+                if mins_to_close <= MINUTES_BEFORE_CLOSE:
+                    api.close_position(p.symbol, cancel_orders=True)
+                    exited_today.add(p.symbol)
+                    logging.info(f"Flatten near close: {p.symbol}")
+        except Exception as e:
+            logging.debug(f"housekeeping err: {e}")
+
+        time.sleep(SLEEP_SECONDS)
+
+    except KeyboardInterrupt:
+        logging.info("Interrupted — shutting down.")
+        break
+    except Exception as e:
+        logging.error(f"Main loop error: {e}")
+        time.sleep(SLEEP_SECONDS * CLOCK_SLOWDOWN_ON_ERR)
