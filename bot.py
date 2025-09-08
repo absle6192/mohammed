@@ -45,7 +45,10 @@ CLOCK_SLOWDOWN_ON_ERR= 2.0
 
 # 🔴 حد الخسارة اليومية — عند تجاوزه نبيع "أسوأ" مركز خاسر فقط
 DAILY_MAX_LOSS_DOLLARS = float(os.getenv("DAILY_MAX_LOSS_DOLLARS", "20"))
-LOSS_TRIM_COOLDOWN_SEC = 60  # ما يبيع أكثر من مركز واحد في الدقيقة
+LOSS_TRIM_COOLDOWN_SEC = 60  # لا يبيع أكثر من مركز واحد في الدقيقة
+
+# 🆕 إلغاء الأوامر المعلّقة قبل التصفية قرب الإغلاق
+CANCEL_ALL_ORDERS_BEFORE_CLOSE = True
 
 # ============ State ============
 entered_today: Set[str]   = set()
@@ -151,13 +154,15 @@ def place_protection(sym: str, entry_price: float, qty: float):
             logging.error(f"{sym}: fallback stop failed: {ee}")
 
 def flatten_one(symbol: str):
+    """Close one position (no cancel_orders arg here)."""
     try:
-        api.close_position(symbol, cancel_orders=True)
+        api.close_position(symbol)  # لا نمرر cancel_orders هنا
         logging.info(f"Trimmed losing position: {symbol}")
     except Exception as e:
         logging.error(f"close_position {symbol} err: {e}")
 
 def get_daily_change_dollars() -> Optional[float]:
+    """equity - last_equity (نفس الداشبورد)."""
     try:
         acct = api.get_account()
         return float(acct.equity) - float(acct.last_equity)
@@ -166,12 +171,12 @@ def get_daily_change_dollars() -> Optional[float]:
         return None
 
 def pick_worst_loser(open_positions) -> Optional[Tuple[str, float]]:
-    """يرجع (الرمز, الخسارة) لأسوأ مركز خاسر الآن."""
+    """يرجع (الرمز, P/L$) لأسوأ مركز خاسر الآن."""
     worst_sym, worst_pl = None, 0.0
     for p in open_positions:
         try:
-            pl = float(p.unrealized_pl)  # بالدولار
-            if pl < worst_pl:  # خاسر وأسوَأ من الحالي
+            pl = float(p.unrealized_pl)
+            if pl < worst_pl:
                 worst_pl = pl
                 worst_sym = p.symbol
         except Exception:
@@ -216,7 +221,6 @@ while True:
         if daily_change is not None:
             logging.info(f"Daily P/L = ${daily_change:,.2f} (limit -${DAILY_MAX_LOSS_DOLLARS:.2f})")
             if daily_change <= -abs(DAILY_MAX_LOSS_DOLLARS):
-                # اختَر أسوأ خاسر حاليًا وبيعه (مرة واحدة كل cooldown)
                 now_ts = time.time()
                 if now_ts - last_trim_ts >= LOSS_TRIM_COOLDOWN_SEC:
                     open_positions = list_open_positions()
@@ -272,11 +276,17 @@ while True:
                 else:
                     place_protection(sym, fill["price"], fill["qty"])
 
-        # قرب الإغلاق: صفّي السلامة
+        # قرب الإغلاق: ألغِ كل الأوامر ثم صفِّ المراكز (بدون cancel_orders)
         if mins_to_bell <= MINUTES_BEFORE_CLOSE and open_positions:
+            if CANCEL_ALL_ORDERS_BEFORE_CLOSE:
+                try:
+                    api.cancel_all_orders()
+                    logging.info("Canceled all open orders before close.")
+                except Exception as e:
+                    logging.warning(f"cancel_all_orders failed: {e}")
             for p in open_positions:
                 try:
-                    api.close_position(p.symbol, cancel_orders=True)
+                    api.close_position(p.symbol)
                     logging.info(f"Flatten near close: {p.symbol}")
                 except Exception as e:
                     logging.debug(f"flatten {p.symbol} err: {e}")
