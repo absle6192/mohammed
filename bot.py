@@ -30,7 +30,8 @@ SYMBOLS: List[str] = [s.strip().upper() for s in os.getenv(
 ).split(",") if s.strip()]
 
 # entry & risk
-MOMENTUM_THRESHOLD = float(os.getenv("MOMENTUM_THRESHOLD", "0.001"))  # 0.1% 1-min momentum
+# ↓↓↓ تم تقليل شرط الدخول إلى 0.0005 (0.05%) ↓↓↓
+MOMENTUM_THRESHOLD = float(os.getenv("MOMENTUM_THRESHOLD", "0.0005"))
 NOTIONAL_PER_TRADE = float(os.getenv("NOTIONAL_PER_TRADE", "6250"))   # $ per buy
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "8"))
 
@@ -42,10 +43,9 @@ TRAIL_PRICE = float(os.getenv("TRAIL_PRICE", "0.0")) # 0 to disable, prefer TRAI
 NO_REENTRY_TODAY = os.getenv("NO_REENTRY_TODAY", "true").lower() == "true"
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "60"))  # after any sell on same symbol
 
-# >>> ADDED: loop cadence & watchdog
+# loop cadence & watchdog
 INTERVAL_SECONDS   = int(os.getenv("INTERVAL_SECONDS", "60"))  # دورة كل دقيقة
 MAX_CYCLE_SECONDS  = int(os.getenv("MAX_CYCLE_SECONDS", "20")) # تحذير لو الدورة طولت
-# <<< ADDED
 
 if not API_KEY or not API_SECRET:
     log.error("Missing API keys in environment.")
@@ -62,17 +62,14 @@ def utc_now():
 def utc_today():
     return utc_now().date()
 
-# >>> ADDED: heartbeat + precise sleep
 def heartbeat(msg: str):
     now = datetime.now(timezone.utc).strftime("%H:%M:%S")
     log.info(f"✅ {msg} at {now}Z")
 
 def sleep_until_next_interval(interval_seconds: int, started_at: float):
-    """ينام حتى بداية الفاصل القادم بحيث تظل الدورات منضبطة زمنياً."""
     elapsed = time.time() - started_at
     sleep_left = max(0.0, interval_seconds - elapsed)
     time.sleep(sleep_left)
-# <<< ADDED
 
 # =========================
 # Re-entry Registry
@@ -255,44 +252,38 @@ def main_loop():
     while True:
         cycle_started = time.time()
         try:
-            # حالة السوق
             is_open = market_open_now()
             if not is_open:
                 heartbeat("Market closed - sleeping")
-                # حتى أثناء الإغلاق نخلي النبض بالدقيقة
             else:
                 heartbeat("Market open - cycle begin")
 
-                # تحديث سجل البيعات & سحب Snapshot للأوامر المفتوحة
+                # refresh sell registry & open orders snapshot
                 record_today_sells(api, SYMBOLS)
                 open_map = open_orders_map()
 
-                # إدارة الدخول (الخروج مسلّم للـ trailing stop)
+                # entry management (exit handled via trailing stop)
                 for symbol in SYMBOLS:
                     if entry_signal_for(symbol) and can_open_new_long(symbol, open_map):
                         cancel_symbol_open_orders(symbol)  # safety
                         buy_id = place_market_buy(symbol, NOTIONAL_PER_TRADE)
                         if buy_id:
-                            # نمهل قليلاً حتى تتحدث الكمية ثم نربط Trailing
-                            time.sleep(1.5)
+                            time.sleep(1.5)  # wait for qty to update
                             try_attach_trailing_stop(symbol)
 
-                # تحديث سجل البيعات مرّة أخرى لنلتقط أي بيع سريع
+                # update sells registry again to catch quick exits
                 record_today_sells(api, SYMBOLS)
 
-                # نهاية دورة ناجحة
                 elapsed = time.time() - cycle_started
                 log.info(f"🫀 Cycle done in {elapsed:.2f}s")
 
         except Exception as e:
             log.error(f"Loop error: {e}")
 
-        # تحذير إن كانت الدورة بطيئة
         total_elapsed = time.time() - cycle_started
         if total_elapsed > MAX_CYCLE_SECONDS:
             log.warning(f"⚠️ Slow cycle: {total_elapsed:.1f}s (limit {MAX_CYCLE_SECONDS}s)")
 
-        # نوم مضبوط حتى بداية الفاصل القادم
         sleep_until_next_interval(INTERVAL_SECONDS, cycle_started)
 
 # =========================
