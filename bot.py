@@ -30,18 +30,18 @@ SYMBOLS: List[str] = [s.strip().upper() for s in os.getenv(
 ).split(",") if s.strip()]
 
 # entry & risk
-# ↓↓↓ تم تقليل شرط الدخول إلى 0.0005 (0.05%) ↓↓↓
+# تم تقليل شرط الدخول: 0.05% على شمعة الدقيقة
 MOMENTUM_THRESHOLD = float(os.getenv("MOMENTUM_THRESHOLD", "0.0005"))
-NOTIONAL_PER_TRADE = float(os.getenv("NOTIONAL_PER_TRADE", "6250"))   # $ per buy
+NOTIONAL_PER_TRADE = float(os.getenv("NOTIONAL_PER_TRADE", "6250"))   # ميزانية الصفقة (سنحوّلها إلى qty)
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "8"))
 
 # trailing stop
 TRAIL_PCT   = float(os.getenv("TRAIL_PCT", "0.7"))   # 0.7% trailing
-TRAIL_PRICE = float(os.getenv("TRAIL_PRICE", "0.0")) # 0 to disable, prefer TRAIL_PCT
+TRAIL_PRICE = float(os.getenv("TRAIL_PRICE", "0.0")) # 0 لتعطيله، نستخدم TRAIL_PCT غالباً
 
 # re-entry guards
 NO_REENTRY_TODAY = os.getenv("NO_REENTRY_TODAY", "true").lower() == "true"
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "60"))  # after any sell on same symbol
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "60"))  # بعد أي بيع على نفس السهم
 
 # loop cadence & watchdog
 INTERVAL_SECONDS   = int(os.getenv("INTERVAL_SECONDS", "60"))  # دورة كل دقيقة
@@ -74,10 +74,9 @@ def sleep_until_next_interval(interval_seconds: int, started_at: float):
 # =========================
 # Re-entry Registry
 # =========================
-sold_registry: Dict[str, datetime] = {}  # last sell time per symbol (UTC)
+sold_registry: Dict[str, datetime] = {}  # آخر وقت بيع لكل سهم (UTC)
 
 def record_today_sells(api: REST, symbols: List[str]) -> None:
-    """Scan recent closed orders and record sell times (today only)."""
     try:
         closed = api.list_orders(status="closed", limit=200, direction="desc")
     except Exception as e:
@@ -116,13 +115,14 @@ def market_open_now() -> bool:
         return bool(clock.is_open)
     except Exception as e:
         log.error(f"clock error: {e}")
-        return True  # fail-open to keep loop alive
+        return True  # fail-open لإبقاء اللوب حي
 
 def last_trade_price(symbol: str) -> Optional[float]:
     try:
-        quote = api.get_latest_trade(symbol)
-        return float(quote.price)
-    except Exception:
+        trade = api.get_latest_trade(symbol)
+        return float(trade.price)
+    except Exception as e:
+        log.debug(f"last_trade_price error {symbol}: {e}")
         return None
 
 def has_open_position(symbol: str) -> bool:
@@ -160,11 +160,11 @@ def cancel_symbol_open_orders(symbol: str):
         pass
 
 # =========================
-# Entry Signal (simple 1-min momentum)
+# Entry Signal (1-min momentum)
 # =========================
 def entry_signal_for(symbol: str) -> bool:
     """
-    Simple signal: last 1m bar close vs open >= MOMENTUM_THRESHOLD.
+    شرط الدخول: نسبة (إغلاق الدقيقة - افتتاحها) / الافتتاح >= MOMENTUM_THRESHOLD
     """
     try:
         bars = api.get_bars(symbol, TimeFrame(1, TimeFrameUnit.Minute), limit=2).df
@@ -180,7 +180,7 @@ def entry_signal_for(symbol: str) -> bool:
         return False
 
 # =========================
-# Guard: Can open new long?
+# Guards
 # =========================
 def can_open_new_long(symbol: str, open_orders: Dict[str, bool]) -> bool:
     if has_open_position(symbol):
@@ -196,18 +196,18 @@ def can_open_new_long(symbol: str, open_orders: Dict[str, bool]) -> bool:
     return True
 
 # =========================
-# Place Orders
+# Place Orders (QTY-based to enable trailing stop)
 # =========================
-def place_market_buy(symbol: str, notional: float) -> Optional[str]:
+def place_market_buy_qty(symbol: str, qty: int) -> Optional[str]:
     try:
         o = api.submit_order(
             symbol=symbol,
             side="buy",
             type="market",
             time_in_force="day",
-            notional=notional
+            qty=str(qty)  # whole shares
         )
-        log.info(f"[BUY] {symbol} notional ${notional}")
+        log.info(f"[BUY] {symbol} qty {qty}")
         return o.id
     except Exception as e:
         log.error(f"BUY failed {symbol}: {e}")
@@ -232,10 +232,6 @@ def place_trailing_stop(symbol: str, qty: float) -> Optional[str]:
         return None
 
 def try_attach_trailing_stop(symbol: str):
-    """
-    If we just bought using notional (fractional qty), fetch position qty
-    and attach trailing stop once qty is available.
-    """
     try:
         pos = api.get_position(symbol)
         qty = float(pos.qty)
@@ -252,26 +248,39 @@ def main_loop():
     while True:
         cycle_started = time.time()
         try:
-            is_open = market_open_now()
-            if not is_open:
+            if not market_open_now():
                 heartbeat("Market closed - sleeping")
             else:
                 heartbeat("Market open - cycle begin")
 
-                # refresh sell registry & open orders snapshot
+                # تحديث سجل البيعات & Snapshot للأوامر المفتوحة
                 record_today_sells(api, SYMBOLS)
                 open_map = open_orders_map()
 
-                # entry management (exit handled via trailing stop)
+                # إدارة الدخول (الخروج عبر Trailing Stop)
                 for symbol in SYMBOLS:
-                    if entry_signal_for(symbol) and can_open_new_long(symbol, open_map):
-                        cancel_symbol_open_orders(symbol)  # safety
-                        buy_id = place_market_buy(symbol, NOTIONAL_PER_TRADE)
-                        if buy_id:
-                            time.sleep(1.5)  # wait for qty to update
-                            try_attach_trailing_stop(symbol)
+                    if not (entry_signal_for(symbol) and can_open_new_long(symbol, open_map)):
+                        continue
 
-                # update sells registry again to catch quick exits
+                    # حساب الكمية الصحيحة بناءً على الميزانية
+                    price = last_trade_price(symbol)
+                    if not price or price <= 0:
+                        log.warning(f"[SKIP] {symbol} no price available.")
+                        continue
+
+                    qty = int(NOTIONAL_PER_TRADE // price)  # whole shares
+                    if qty < 1:
+                        log.warning(f"[SKIP] {symbol} price too high for budget ${NOTIONAL_PER_TRADE:.2f} (last={price:.2f})")
+                        continue
+
+                    cancel_symbol_open_orders(symbol)  # safety
+                    buy_id = place_market_buy_qty(symbol, qty)
+                    if buy_id:
+                        # نمهل قليلاً حتى تتحدث الكمية ثم نربط Trailing
+                        time.sleep(1.5)
+                        try_attach_trailing_stop(symbol)
+
+                # تحديث سجل البيعات مرة أخرى لالتقاط أي خروج سريع
                 record_today_sells(api, SYMBOLS)
 
                 elapsed = time.time() - cycle_started
