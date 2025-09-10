@@ -31,7 +31,7 @@ SYMBOLS: List[str] = [s.strip().upper() for s in os.getenv(
 
 # entry & risk
 # تم تقليل شرط الدخول: 0.05% على شمعة الدقيقة
-MOMENTUM_THRESHOLD = float(os.getenv("MOMENTUM_THRESHOLD", "0.0005"))
+MOMENTUM_THRESHOLD = float(os.getenv("MOMENTUM_THRESHOLD", "0.0002"))
 NOTIONAL_PER_TRADE = float(os.getenv("NOTIONAL_PER_TRADE", "6250"))   # ميزانية الصفقة (سنحوّلها إلى qty)
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "8"))
 
