@@ -3,7 +3,7 @@ import time
 import math
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta, timezone
 
 from alpaca_trade_api.rest import REST, TimeFrame, TimeFrameUnit
@@ -77,6 +77,7 @@ def sleep_until_next_interval(interval_seconds: int, started_at: float):
 sold_registry: Dict[str, datetime] = {}  # آخر وقت بيع لكل سهم (UTC)
 
 def record_today_sells(api: REST, symbols: List[str]) -> None:
+    """يسجل أحدث عمليات البيع لليوم الحالي لكل سهم في القائمة."""
     try:
         closed = api.list_orders(status="closed", limit=200, direction="desc")
     except Exception as e:
@@ -89,8 +90,9 @@ def record_today_sells(api: REST, symbols: List[str]) -> None:
                 continue
             if not getattr(o, "filled_at", None):
                 continue
-            if o.filled_at.date() == utc_today():
-                sold_registry[o.symbol] = o.filled_at if o.filled_at.tzinfo else o.filled_at.replace(tzinfo=timezone.utc)
+            filled_at = o.filled_at if o.filled_at.tzinfo else o.filled_at.replace(tzinfo=timezone.utc)
+            if filled_at.date() == utc_today():
+                sold_registry[o.symbol] = filled_at
         except Exception:
             continue
 
@@ -115,7 +117,8 @@ def market_open_now() -> bool:
         return bool(clock.is_open)
     except Exception as e:
         log.error(f"clock error: {e}")
-        return True  # fail-open لإبقاء اللوب حي
+        # fail-open لإبقاء اللوب حي في حال تعثر API
+        return True
 
 def last_trade_price(symbol: str) -> Optional[float]:
     try:
@@ -162,38 +165,50 @@ def cancel_symbol_open_orders(symbol: str):
 # =========================
 # Entry Signal (1-min momentum)
 # =========================
-def entry_signal_for(symbol: str) -> bool:
+def momentum_for_last_min(symbol: str) -> Optional[float]:
     """
-    شرط الدخول: نسبة (إغلاق الدقيقة - افتتاحها) / الافتتاح >= MOMENTUM_THRESHOLD
+    يحسب المومنتم للدقيقة الأخيرة: (close - open) / open
+    يعيد None إذا لم تتوفر بيانات.
     """
     try:
         bars = api.get_bars(symbol, TimeFrame(1, TimeFrameUnit.Minute), limit=2).df
         if bars.empty:
-            return False
+            return None
         last = bars.iloc[-1]
         if last["open"] <= 0:
-            return False
-        momentum = (last["close"] - last["open"]) / last["open"]
-        return momentum >= MOMENTUM_THRESHOLD
+            return None
+        return float((last["close"] - last["open"]) / last["open"])
     except Exception as e:
-        log.debug(f"entry_signal error {symbol}: {e}")
-        return False
+        log.debug(f"momentum calc error {symbol}: {e}")
+        return None
 
 # =========================
 # Guards
 # =========================
-def can_open_new_long(symbol: str, open_orders: Dict[str, bool]) -> bool:
-    if has_open_position(symbol):
-        return False
-    if open_orders.get(symbol, False):
-        return False
-    if sold_today(symbol):
-        return False
-    if in_cooldown(symbol):
-        return False
-    if count_open_positions() >= MAX_OPEN_POSITIONS:
-        return False
-    return True
+def guard_states(symbol: str, open_orders: Dict[str, bool]) -> Dict[str, bool]:
+    """يرجع حالة الحمايات لكل سهم لغايات اللوق."""
+    states = {
+        "has_pos": has_open_position(symbol),
+        "has_open_order": open_orders.get(symbol, False),
+        "sold_today": sold_today(symbol),
+        "cooldown": in_cooldown(symbol),
+        "max_positions_reached": count_open_positions() >= MAX_OPEN_POSITIONS
+    }
+    return states
+
+def can_open_new_long(symbol: str, states: Dict[str, bool]) -> Tuple[bool, str]:
+    """يرجع (مسموح, سبب_المنع)"""
+    if states["has_pos"]:
+        return False, "already have position"
+    if states["has_open_order"]:
+        return False, "open order exists"
+    if states["sold_today"]:
+        return False, "no-reentry-today"
+    if states["cooldown"]:
+        return False, "in cooldown"
+    if states["max_positions_reached"]:
+        return False, "max positions reached"
+    return True, ""
 
 # =========================
 # Place Orders (QTY-based to enable trailing stop)
@@ -207,7 +222,7 @@ def place_market_buy_qty(symbol: str, qty: int) -> Optional[str]:
             time_in_force="day",
             qty=str(qty)  # whole shares
         )
-        log.info(f"[BUY] {symbol} qty {qty}")
+        log.info(f"[BUY] {symbol} qty={qty}")
         return o.id
     except Exception as e:
         log.error(f"BUY failed {symbol}: {e}")
@@ -225,7 +240,7 @@ def place_trailing_stop(symbol: str, qty: float) -> Optional[str]:
                 symbol=symbol, side="sell", type="trailing_stop",
                 time_in_force="day", trail_percent=str(TRAIL_PCT), qty=str(qty)
             )
-        log.info(f"[TRAIL] {symbol} qty {qty}")
+        log.info(f"[TRAIL] {symbol} qty={qty}")
         return o.id
     except Exception as e:
         log.error(f"TRAIL failed {symbol}: {e}")
@@ -244,6 +259,15 @@ def try_attach_trailing_stop(symbol: str):
 # Main loop
 # =========================
 def main_loop():
+    # طباعة إعدادات البداية لمرة واحدة
+    log.info(f"SYMBOLS LOADED: {SYMBOLS}")
+    log.info(f"SETTINGS: thr={MOMENTUM_THRESHOLD} "
+             f"budget={NOTIONAL_PER_TRADE} "
+             f"max_pos={MAX_OPEN_POSITIONS} "
+             f"trail_pct={TRAIL_PCT} trail_price={TRAIL_PRICE} "
+             f"no_reentry_today={NO_REENTRY_TODAY} cooldown_min={COOLDOWN_MINUTES} "
+             f"interval_s={INTERVAL_SECONDS}")
+
     log.info("Bot started.")
     while True:
         cycle_started = time.time()
@@ -259,7 +283,29 @@ def main_loop():
 
                 # إدارة الدخول (الخروج عبر Trailing Stop)
                 for symbol in SYMBOLS:
-                    if not (entry_signal_for(symbol) and can_open_new_long(symbol, open_map)):
+                    mom = momentum_for_last_min(symbol)
+                    if mom is None:
+                        log.info(f"{symbol}: ❌ no bar data / bad open; skip")
+                        continue
+
+                    states = guard_states(symbol, open_map)
+                    allowed, reason = can_open_new_long(symbol, states)
+
+                    # لوق تفصيلي قبل قرار الدخول
+                    log.info(
+                        f"{symbol}: mom={mom:.5f} thr={MOMENTUM_THRESHOLD} | "
+                        f"guards: pos={states['has_pos']}, "
+                        f"open_order={states['has_open_order']}, "
+                        f"sold_today={states['sold_today']}, "
+                        f"cooldown={states['cooldown']}, "
+                        f"maxpos={states['max_positions_reached']}"
+                    )
+
+                    if mom < MOMENTUM_THRESHOLD:
+                        log.info(f"{symbol}: ✋ momentum below threshold")
+                        continue
+                    if not allowed:
+                        log.info(f"{symbol}: ✋ guard blocked -> {reason}")
                         continue
 
                     # حساب الكمية الصحيحة بناءً على الميزانية
@@ -273,7 +319,9 @@ def main_loop():
                         log.warning(f"[SKIP] {symbol} price too high for budget ${NOTIONAL_PER_TRADE:.2f} (last={price:.2f})")
                         continue
 
+                    log.info(f"{symbol}: ✅ ENTRY signal confirmed at price={price:.2f}, qty={qty}")
                     cancel_symbol_open_orders(symbol)  # safety
+
                     buy_id = place_market_buy_qty(symbol, qty)
                     if buy_id:
                         # نمهل قليلاً حتى تتحدث الكمية ثم نربط Trailing
