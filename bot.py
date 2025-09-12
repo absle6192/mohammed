@@ -30,22 +30,22 @@ SYMBOLS: List[str] = [s.strip().upper() for s in os.getenv(
 ).split(",") if s.strip()]
 
 # entry & risk
-# تم تقليل شرط الدخول: 0.05% على شمعة الدقيقة
-MOMENTUM_THRESHOLD = float(os.getenv("MOMENTUM_THRESHOLD", "0.0002"))
-NOTIONAL_PER_TRADE = float(os.getenv("NOTIONAL_PER_TRADE", "6250"))   # ميزانية الصفقة (سنحوّلها إلى qty)
+# شرط الدخول: 0.01% على شمعة الدقيقة
+MOMENTUM_THRESHOLD = float(os.getenv("MOMENTUM_THRESHOLD", "0.0001"))
+NOTIONAL_PER_TRADE = float(os.getenv("NOTIONAL_PER_TRADE", "6250"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "8"))
 
 # trailing stop
 TRAIL_PCT   = float(os.getenv("TRAIL_PCT", "0.7"))   # 0.7% trailing
-TRAIL_PRICE = float(os.getenv("TRAIL_PRICE", "0.0")) # 0 لتعطيله، نستخدم TRAIL_PCT غالباً
+TRAIL_PRICE = float(os.getenv("TRAIL_PRICE", "0.0")) # 0 لتعطيله
 
 # re-entry guards
 NO_REENTRY_TODAY = os.getenv("NO_REENTRY_TODAY", "true").lower() == "true"
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "60"))  # بعد أي بيع على نفس السهم
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "60"))
 
 # loop cadence & watchdog
-INTERVAL_SECONDS   = int(os.getenv("INTERVAL_SECONDS", "60"))  # دورة كل دقيقة
-MAX_CYCLE_SECONDS  = int(os.getenv("MAX_CYCLE_SECONDS", "20")) # تحذير لو الدورة طولت
+INTERVAL_SECONDS   = int(os.getenv("INTERVAL_SECONDS", "30"))  # كل 30 ثانية
+MAX_CYCLE_SECONDS  = int(os.getenv("MAX_CYCLE_SECONDS", "20"))
 
 if not API_KEY or not API_SECRET:
     log.error("Missing API keys in environment.")
@@ -117,8 +117,7 @@ def market_open_now() -> bool:
         return bool(clock.is_open)
     except Exception as e:
         log.error(f"clock error: {e}")
-        # fail-open لإبقاء اللوب حي في حال تعثر API
-        return True
+        return True  # fail-open
 
 def last_trade_price(symbol: str) -> Optional[float]:
     try:
@@ -220,7 +219,7 @@ def place_market_buy_qty(symbol: str, qty: int) -> Optional[str]:
             side="buy",
             type="market",
             time_in_force="day",
-            qty=str(qty)  # whole shares
+            qty=str(qty)
         )
         log.info(f"[BUY] {symbol} qty={qty}")
         return o.id
@@ -308,7 +307,7 @@ def main_loop():
                         log.info(f"{symbol}: ✋ guard blocked -> {reason}")
                         continue
 
-                    # حساب الكمية الصحيحة بناءً على الميزانية
+                    # حساب الكمية بناءً على الميزانية
                     price = last_trade_price(symbol)
                     if not price or price <= 0:
                         log.warning(f"[SKIP] {symbol} no price available.")
