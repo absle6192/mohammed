@@ -29,22 +29,32 @@ SYMBOLS: List[str] = [s.strip().upper() for s in os.getenv(
     "TSLA,NVDA,AAPL,MSFT,AMZN,META,GOOGL,AMD"
 ).split(",") if s.strip()]
 
-# entry & risk
-# شرط الدخول: 0.01% على شمعة الدقيقة
+# -------- الدخول & الحماية --------
+# شرط الدخول: مومنتم شمعة الدقيقة (close-open)/open
 MOMENTUM_THRESHOLD = float(os.getenv("MOMENTUM_THRESHOLD", "0.0001"))
-NOTIONAL_PER_TRADE = float(os.getenv("NOTIONAL_PER_TRADE", "6250"))
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "8"))
 
-# trailing stop
+# أقصى عدد مراكز مفتوحة إجمالاً (خله 2 لو تبغى يشتغل فقط على أفضل سهمين)
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
+
+# عدد الأسهم المراد اختيارها من القائمة (أفضل K)
+TOP_K = int(os.getenv("TOP_K", "2"))
+
+# تقسيم قوة الشراء على أفضل K بشكل متساوٍ
+# ملاحظة: نتجاهل NOTIONAL_PER_TRADE ونحسب الميزانية تلقائياً من قوة الشراء
+# (إذا حاب ترجع للطريقة القديمة، عطّل ALLOCATE_FROM_CASH)
+ALLOCATE_FROM_CASH = os.getenv("ALLOCATE_FROM_CASH", "true").lower() == "true"
+FALLBACK_NOTIONAL_PER_TRADE = float(os.getenv("NOTIONAL_PER_TRADE", "6250"))
+
+# -------- Trailing Stop --------
 TRAIL_PCT   = float(os.getenv("TRAIL_PCT", "0.7"))   # 0.7% trailing
 TRAIL_PRICE = float(os.getenv("TRAIL_PRICE", "0.0")) # 0 لتعطيله
 
-# re-entry guards
+# -------- إعادة الدخول --------
 NO_REENTRY_TODAY = os.getenv("NO_REENTRY_TODAY", "true").lower() == "true"
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "60"))
 
-# loop cadence & watchdog
-INTERVAL_SECONDS   = int(os.getenv("INTERVAL_SECONDS", "30"))  # كل 30 ثانية
+# -------- دورة التشغيل --------
+INTERVAL_SECONDS   = int(os.getenv("INTERVAL_SECONDS", "30"))
 MAX_CYCLE_SECONDS  = int(os.getenv("MAX_CYCLE_SECONDS", "20"))
 
 if not API_KEY or not API_SECRET:
@@ -134,6 +144,12 @@ def has_open_position(symbol: str) -> bool:
     except Exception:
         return False
 
+def list_open_positions_symbols() -> List[str]:
+    try:
+        return [p.symbol for p in api.list_positions()]
+    except Exception:
+        return []
+
 def count_open_positions() -> int:
     try:
         return len(api.list_positions())
@@ -210,7 +226,7 @@ def can_open_new_long(symbol: str, states: Dict[str, bool]) -> Tuple[bool, str]:
     return True, ""
 
 # =========================
-# Place Orders (QTY-based to enable trailing stop)
+# Orders
 # =========================
 def place_market_buy_qty(symbol: str, qty: int) -> Optional[str]:
     try:
@@ -255,17 +271,48 @@ def try_attach_trailing_stop(symbol: str):
         log.debug(f"attach trail skipped {symbol}: {e}")
 
 # =========================
+# Allocation helpers
+# =========================
+def get_buying_power_cash() -> float:
+    """
+    نحاول استخدام cash أولاً (أكثر تحفظًا)، وإذا غير متاح نستخدم buying_power.
+    """
+    try:
+        acct = api.get_account()
+        # سترينغ غالباً، نحوله إلى float
+        cash = float(getattr(acct, "cash", "0") or 0)
+        if cash and cash > 0:
+            return cash
+        bp = float(getattr(acct, "buying_power", "0") or 0)
+        return bp
+    except Exception as e:
+        log.warning(f"account read failed: {e}")
+        return 0.0
+
+def compute_qty_for_budget(symbol: str, budget: float) -> int:
+    price = last_trade_price(symbol)
+    if not price or price <= 0:
+        log.warning(f"[SKIP] {symbol} no price available.")
+        return 0
+    qty = int(budget // price)
+    if qty < 1:
+        log.warning(f"[SKIP] {symbol} budget too small: ${budget:.2f}, price={price:.2f}")
+        return 0
+    return qty
+
+# =========================
 # Main loop
 # =========================
 def main_loop():
-    # طباعة إعدادات البداية لمرة واحدة
     log.info(f"SYMBOLS LOADED: {SYMBOLS}")
-    log.info(f"SETTINGS: thr={MOMENTUM_THRESHOLD} "
-             f"budget={NOTIONAL_PER_TRADE} "
-             f"max_pos={MAX_OPEN_POSITIONS} "
-             f"trail_pct={TRAIL_PCT} trail_price={TRAIL_PRICE} "
-             f"no_reentry_today={NO_REENTRY_TODAY} cooldown_min={COOLDOWN_MINUTES} "
-             f"interval_s={INTERVAL_SECONDS}")
+    log.info(
+        "SETTINGS: "
+        f"thr={MOMENTUM_THRESHOLD} max_pos={MAX_OPEN_POSITIONS} top_k={TOP_K} "
+        f"allocate_from_cash={ALLOCATE_FROM_CASH} "
+        f"trail_pct={TRAIL_PCT} trail_price={TRAIL_PRICE} "
+        f"no_reentry_today={NO_REENTRY_TODAY} cooldown_min={COOLDOWN_MINUTES} "
+        f"interval_s={INTERVAL_SECONDS}"
+    )
 
     log.info("Bot started.")
     while True:
@@ -276,11 +323,12 @@ def main_loop():
             else:
                 heartbeat("Market open - cycle begin")
 
-                # تحديث سجل البيعات & Snapshot للأوامر المفتوحة
+                # تحديث سجلات البيع + Snapshot أوامر مفتوحة
                 record_today_sells(api, SYMBOLS)
                 open_map = open_orders_map()
 
-                # إدارة الدخول (الخروج عبر Trailing Stop)
+                # ==== 1) حساب المومنتم لكل سهم واختيار أفضل K ====
+                candidates = []  # (symbol, momentum, price)
                 for symbol in SYMBOLS:
                     mom = momentum_for_last_min(symbol)
                     if mom is None:
@@ -290,7 +338,6 @@ def main_loop():
                     states = guard_states(symbol, open_map)
                     allowed, reason = can_open_new_long(symbol, states)
 
-                    # لوق تفصيلي قبل قرار الدخول
                     log.info(
                         f"{symbol}: mom={mom:.5f} thr={MOMENTUM_THRESHOLD} | "
                         f"guards: pos={states['has_pos']}, "
@@ -301,33 +348,53 @@ def main_loop():
                     )
 
                     if mom < MOMENTUM_THRESHOLD:
-                        log.info(f"{symbol}: ✋ momentum below threshold")
                         continue
                     if not allowed:
-                        log.info(f"{symbol}: ✋ guard blocked -> {reason}")
                         continue
 
-                    # حساب الكمية بناءً على الميزانية
                     price = last_trade_price(symbol)
                     if not price or price <= 0:
-                        log.warning(f"[SKIP] {symbol} no price available.")
                         continue
 
-                    qty = int(NOTIONAL_PER_TRADE // price)  # whole shares
-                    if qty < 1:
-                        log.warning(f"[SKIP] {symbol} price too high for budget ${NOTIONAL_PER_TRADE:.2f} (last={price:.2f})")
-                        continue
+                    candidates.append((symbol, mom, price))
 
-                    log.info(f"{symbol}: ✅ ENTRY signal confirmed at price={price:.2f}, qty={qty}")
-                    cancel_symbol_open_orders(symbol)  # safety
+                # ترتيب حسب أعلى مومنتم
+                candidates.sort(key=lambda x: x[1], reverse=True)
+                best = [c[0] for c in candidates[:TOP_K]]
 
-                    buy_id = place_market_buy_qty(symbol, qty)
-                    if buy_id:
-                        # نمهل قليلاً حتى تتحدث الكمية ثم نربط Trailing
-                        time.sleep(1.5)
-                        try_attach_trailing_stop(symbol)
+                # ==== 2) حساب عدد الفتحات المتاحة فعلياً ====
+                currently_open_syms = set(list_open_positions_symbols())
+                open_count = len(currently_open_syms)
+                slots_left = max(0, min(MAX_OPEN_POSITIONS, TOP_K) - open_count)
 
-                # تحديث سجل البيعات مرة أخرى لالتقاط أي خروج سريع
+                # استبعد أي سهم موجود عندك أصلاً
+                symbols_to_open = [s for s in best if s not in currently_open_syms][:slots_left]
+
+                log.info(f"BEST={best} | currently_open={list(currently_open_syms)} | to_open={symbols_to_open} | slots_left={slots_left}")
+
+                # ==== 3) الميزانية لكل مركز ====
+                if symbols_to_open:
+                    if ALLOCATE_FROM_CASH:
+                        cash_or_bp = get_buying_power_cash()
+                        # قسمة عادلة على عدد الفتحات المتاحة الآن
+                        per_budget = (cash_or_bp / len(symbols_to_open)) if cash_or_bp > 0 else FALLBACK_NOTIONAL_PER_TRADE
+                    else:
+                        per_budget = FALLBACK_NOTIONAL_PER_TRADE
+
+                    log.info(f"Per-position budget ≈ ${per_budget:.2f}")
+
+                    # ==== 4) تنفيذ الشراء وتعليق Trailing ====
+                    for sym in symbols_to_open:
+                        cancel_symbol_open_orders(sym)  # safety
+                        qty = compute_qty_for_budget(sym, per_budget)
+                        if qty < 1:
+                            continue
+                        buy_id = place_market_buy_qty(sym, qty)
+                        if buy_id:
+                            time.sleep(1.5)  # مهلة بسيطة لتحديث الكمية
+                            try_attach_trailing_stop(sym)
+
+                # تحديث سجل البيعات مرة أخرى
                 record_today_sells(api, SYMBOLS)
 
                 elapsed = time.time() - cycle_started
