@@ -31,7 +31,7 @@ SYMBOLS: List[str] = [s.strip().upper() for s in os.getenv(
 
 # -------- الدخول & الحماية --------
 # شرط الدخول: مومنتم شمعة الدقيقة (close-open)/open
-MOMENTUM_THRESHOLD = float(os.getenv("MOMENTUM_THRESHOLD", "0.0001"))
+MOMENTUM_THRESHOLD = float(os.getenv("MOMENTUM_THRESHOLD", "0.00005"))
 
 # أقصى عدد مراكز مفتوحة إجمالاً (خله 2 لو تبغى يشتغل فقط على أفضل سهمين)
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
