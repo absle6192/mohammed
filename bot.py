@@ -30,18 +30,9 @@ SYMBOLS: List[str] = [s.strip().upper() for s in os.getenv(
 ).split(",") if s.strip()]
 
 # -------- الدخول & الحماية --------
-# شرط الدخول: مومنتم شمعة الدقيقة (close-open)/open
 MOMENTUM_THRESHOLD = float(os.getenv("MOMENTUM_THRESHOLD", "0.00005"))
-
-# أقصى عدد مراكز مفتوحة إجمالاً (خله 2 لو تبغى يشتغل فقط على أفضل سهمين)
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
-
-# عدد الأسهم المراد اختيارها من القائمة (أفضل K)
 TOP_K = int(os.getenv("TOP_K", "2"))
-
-# تقسيم قوة الشراء على أفضل K بشكل متساوٍ
-# ملاحظة: نتجاهل NOTIONAL_PER_TRADE ونحسب الميزانية تلقائياً من قوة الشراء
-# (إذا حاب ترجع للطريقة القديمة، عطّل ALLOCATE_FROM_CASH)
 ALLOCATE_FROM_CASH = os.getenv("ALLOCATE_FROM_CASH", "true").lower() == "true"
 FALLBACK_NOTIONAL_PER_TRADE = float(os.getenv("NOTIONAL_PER_TRADE", "6250"))
 
@@ -84,10 +75,9 @@ def sleep_until_next_interval(interval_seconds: int, started_at: float):
 # =========================
 # Re-entry Registry
 # =========================
-sold_registry: Dict[str, datetime] = {}  # آخر وقت بيع لكل سهم (UTC)
+sold_registry: Dict[str, datetime] = {}
 
 def record_today_sells(api: REST, symbols: List[str]) -> None:
-    """يسجل أحدث عمليات البيع لليوم الحالي لكل سهم في القائمة."""
     try:
         closed = api.list_orders(status="closed", limit=200, direction="desc")
     except Exception as e:
@@ -178,13 +168,9 @@ def cancel_symbol_open_orders(symbol: str):
         pass
 
 # =========================
-# Entry Signal (1-min momentum)
+# Entry Signal
 # =========================
 def momentum_for_last_min(symbol: str) -> Optional[float]:
-    """
-    يحسب المومنتم للدقيقة الأخيرة: (close - open) / open
-    يعيد None إذا لم تتوفر بيانات.
-    """
     try:
         bars = api.get_bars(symbol, TimeFrame(1, TimeFrameUnit.Minute), limit=2).df
         if bars.empty:
@@ -201,7 +187,6 @@ def momentum_for_last_min(symbol: str) -> Optional[float]:
 # Guards
 # =========================
 def guard_states(symbol: str, open_orders: Dict[str, bool]) -> Dict[str, bool]:
-    """يرجع حالة الحمايات لكل سهم لغايات اللوق."""
     states = {
         "has_pos": has_open_position(symbol),
         "has_open_order": open_orders.get(symbol, False),
@@ -212,7 +197,6 @@ def guard_states(symbol: str, open_orders: Dict[str, bool]) -> Dict[str, bool]:
     return states
 
 def can_open_new_long(symbol: str, states: Dict[str, bool]) -> Tuple[bool, str]:
-    """يرجع (مسموح, سبب_المنع)"""
     if states["has_pos"]:
         return False, "already have position"
     if states["has_open_order"]:
@@ -228,19 +212,34 @@ def can_open_new_long(symbol: str, states: Dict[str, bool]) -> Tuple[bool, str]:
 # =========================
 # Orders
 # =========================
-def place_market_buy_qty(symbol: str, qty: int) -> Optional[str]:
+def place_limit_buy_auto(symbol: str, budget: float) -> Optional[str]:
+    """Limit Buy عند سعر العرض (Ask) مع extended_hours=True"""
     try:
+        quote = api.get_latest_quote(symbol)
+        ask_price = float(quote.ap) if quote and quote.ap > 0 else last_trade_price(symbol)
+
+        if not ask_price:
+            log.warning(f"[SKIP] {symbol} no valid price")
+            return None
+
+        qty = int(budget // ask_price)
+        if qty < 1:
+            log.warning(f"[SKIP] {symbol} budget too small for price={ask_price:.2f}")
+            return None
+
         o = api.submit_order(
             symbol=symbol,
             side="buy",
-            type="market",
+            type="limit",
+            qty=str(qty),
+            limit_price=str(round(ask_price, 2)),
             time_in_force="day",
-            qty=str(qty)
+            extended_hours=True
         )
-        log.info(f"[BUY] {symbol} qty={qty}")
+        log.info(f"[BUY] {symbol} qty={qty} @ {ask_price:.2f}")
         return o.id
     except Exception as e:
-        log.error(f"BUY failed {symbol}: {e}")
+        log.error(f"Limit BUY failed {symbol}: {e}")
         return None
 
 def place_trailing_stop(symbol: str, qty: float) -> Optional[str]:
@@ -274,12 +273,8 @@ def try_attach_trailing_stop(symbol: str):
 # Allocation helpers
 # =========================
 def get_buying_power_cash() -> float:
-    """
-    نحاول استخدام cash أولاً (أكثر تحفظًا)، وإذا غير متاح نستخدم buying_power.
-    """
     try:
         acct = api.get_account()
-        # سترينغ غالباً، نحوله إلى float
         cash = float(getattr(acct, "cash", "0") or 0)
         if cash and cash > 0:
             return cash
@@ -288,17 +283,6 @@ def get_buying_power_cash() -> float:
     except Exception as e:
         log.warning(f"account read failed: {e}")
         return 0.0
-
-def compute_qty_for_budget(symbol: str, budget: float) -> int:
-    price = last_trade_price(symbol)
-    if not price or price <= 0:
-        log.warning(f"[SKIP] {symbol} no price available.")
-        return 0
-    qty = int(budget // price)
-    if qty < 1:
-        log.warning(f"[SKIP] {symbol} budget too small: ${budget:.2f}, price={price:.2f}")
-        return 0
-    return qty
 
 # =========================
 # Main loop
@@ -318,87 +302,75 @@ def main_loop():
     while True:
         cycle_started = time.time()
         try:
-            if not market_open_now():
-                heartbeat("Market closed - sleeping")
-            else:
-                heartbeat("Market open - cycle begin")
+            heartbeat("Cycle begin")
 
-                # تحديث سجلات البيع + Snapshot أوامر مفتوحة
-                record_today_sells(api, SYMBOLS)
-                open_map = open_orders_map()
+            record_today_sells(api, SYMBOLS)
+            open_map = open_orders_map()
 
-                # ==== 1) حساب المومنتم لكل سهم واختيار أفضل K ====
-                candidates = []  # (symbol, momentum, price)
-                for symbol in SYMBOLS:
-                    mom = momentum_for_last_min(symbol)
-                    if mom is None:
-                        log.info(f"{symbol}: ❌ no bar data / bad open; skip")
-                        continue
+            # ==== 1) حساب المومنتم لكل سهم واختيار أفضل K ====
+            candidates = []
+            for symbol in SYMBOLS:
+                mom = momentum_for_last_min(symbol)
+                if mom is None:
+                    log.info(f"{symbol}: ❌ no bar data; skip")
+                    continue
 
-                    states = guard_states(symbol, open_map)
-                    allowed, reason = can_open_new_long(symbol, states)
+                states = guard_states(symbol, open_map)
+                allowed, reason = can_open_new_long(symbol, states)
 
-                    log.info(
-                        f"{symbol}: mom={mom:.5f} thr={MOMENTUM_THRESHOLD} | "
-                        f"guards: pos={states['has_pos']}, "
-                        f"open_order={states['has_open_order']}, "
-                        f"sold_today={states['sold_today']}, "
-                        f"cooldown={states['cooldown']}, "
-                        f"maxpos={states['max_positions_reached']}"
-                    )
+                log.info(
+                    f"{symbol}: mom={mom:.5f} thr={MOMENTUM_THRESHOLD} | "
+                    f"guards: pos={states['has_pos']}, "
+                    f"open_order={states['has_open_order']}, "
+                    f"sold_today={states['sold_today']}, "
+                    f"cooldown={states['cooldown']}, "
+                    f"maxpos={states['max_positions_reached']}"
+                )
 
-                    if mom < MOMENTUM_THRESHOLD:
-                        continue
-                    if not allowed:
-                        continue
+                if mom < MOMENTUM_THRESHOLD:
+                    continue
+                if not allowed:
+                    continue
 
-                    price = last_trade_price(symbol)
-                    if not price or price <= 0:
-                        continue
+                price = last_trade_price(symbol)
+                if not price or price <= 0:
+                    continue
 
-                    candidates.append((symbol, mom, price))
+                candidates.append((symbol, mom, price))
 
-                # ترتيب حسب أعلى مومنتم
-                candidates.sort(key=lambda x: x[1], reverse=True)
-                best = [c[0] for c in candidates[:TOP_K]]
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            best = [c[0] for c in candidates[:TOP_K]]
 
-                # ==== 2) حساب عدد الفتحات المتاحة فعلياً ====
-                currently_open_syms = set(list_open_positions_symbols())
-                open_count = len(currently_open_syms)
-                slots_left = max(0, min(MAX_OPEN_POSITIONS, TOP_K) - open_count)
+            # ==== 2) حساب عدد الفتحات المتاحة ====
+            currently_open_syms = set(list_open_positions_symbols())
+            open_count = len(currently_open_syms)
+            slots_left = max(0, min(MAX_OPEN_POSITIONS, TOP_K) - open_count)
+            symbols_to_open = [s for s in best if s not in currently_open_syms][:slots_left]
 
-                # استبعد أي سهم موجود عندك أصلاً
-                symbols_to_open = [s for s in best if s not in currently_open_syms][:slots_left]
+            log.info(f"BEST={best} | currently_open={list(currently_open_syms)} | to_open={symbols_to_open} | slots_left={slots_left}")
 
-                log.info(f"BEST={best} | currently_open={list(currently_open_syms)} | to_open={symbols_to_open} | slots_left={slots_left}")
+            # ==== 3) الميزانية لكل مركز ====
+            if symbols_to_open:
+                if ALLOCATE_FROM_CASH:
+                    cash_or_bp = get_buying_power_cash()
+                    per_budget = (cash_or_bp / len(symbols_to_open)) if cash_or_bp > 0 else FALLBACK_NOTIONAL_PER_TRADE
+                else:
+                    per_budget = FALLBACK_NOTIONAL_PER_TRADE
 
-                # ==== 3) الميزانية لكل مركز ====
-                if symbols_to_open:
-                    if ALLOCATE_FROM_CASH:
-                        cash_or_bp = get_buying_power_cash()
-                        # قسمة عادلة على عدد الفتحات المتاحة الآن
-                        per_budget = (cash_or_bp / len(symbols_to_open)) if cash_or_bp > 0 else FALLBACK_NOTIONAL_PER_TRADE
-                    else:
-                        per_budget = FALLBACK_NOTIONAL_PER_TRADE
+                log.info(f"Per-position budget ≈ ${per_budget:.2f}")
 
-                    log.info(f"Per-position budget ≈ ${per_budget:.2f}")
+                # ==== 4) تنفيذ الشراء وتعليق Trailing ====
+                for sym in symbols_to_open:
+                    cancel_symbol_open_orders(sym)
+                    buy_id = place_limit_buy_auto(sym, per_budget)
+                    if buy_id:
+                        time.sleep(1.5)
+                        try_attach_trailing_stop(sym)
 
-                    # ==== 4) تنفيذ الشراء وتعليق Trailing ====
-                    for sym in symbols_to_open:
-                        cancel_symbol_open_orders(sym)  # safety
-                        qty = compute_qty_for_budget(sym, per_budget)
-                        if qty < 1:
-                            continue
-                        buy_id = place_market_buy_qty(sym, qty)
-                        if buy_id:
-                            time.sleep(1.5)  # مهلة بسيطة لتحديث الكمية
-                            try_attach_trailing_stop(sym)
+            record_today_sells(api, SYMBOLS)
 
-                # تحديث سجل البيعات مرة أخرى
-                record_today_sells(api, SYMBOLS)
-
-                elapsed = time.time() - cycle_started
-                log.info(f"🫀 Cycle done in {elapsed:.2f}s")
+            elapsed = time.time() - cycle_started
+            log.info(f"🫀 Cycle done in {elapsed:.2f}s")
 
         except Exception as e:
             log.error(f"Loop error: {e}")
