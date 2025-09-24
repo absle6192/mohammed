@@ -48,6 +48,11 @@ COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "60"))
 INTERVAL_SECONDS   = int(os.getenv("INTERVAL_SECONDS", "30"))
 MAX_CYCLE_SECONDS  = int(os.getenv("MAX_CYCLE_SECONDS", "20"))
 
+# -------- Extended Hours / Pre-market sell --------
+EXTENDED_HOURS = os.getenv("EXTENDED_HOURS", "true").lower() == "true"
+AUTO_SELL_BEFORE_OPEN = os.getenv("AUTO_SELL_BEFORE_OPEN", "true").lower() == "true"
+SELL_BID_OFFSET_CENTS = int(os.getenv("SELL_BID_OFFSET_CENTS", "2"))  # خصم 2 سنت من أفضل Bid
+
 if not API_KEY or not API_SECRET:
     log.error("Missing API keys in environment.")
     raise SystemExit(1)
@@ -167,6 +172,13 @@ def cancel_symbol_open_orders(symbol: str):
     except Exception:
         pass
 
+def latest_quote(symbol: str):
+    try:
+        return api.get_latest_quote(symbol)
+    except Exception as e:
+        log.debug(f"latest_quote error {symbol}: {e}")
+        return None
+
 # =========================
 # Entry Signal
 # =========================
@@ -215,7 +227,7 @@ def can_open_new_long(symbol: str, states: Dict[str, bool]) -> Tuple[bool, str]:
 def place_limit_buy_auto(symbol: str, budget: float) -> Optional[str]:
     """Limit Buy عند سعر العرض (Ask) مع extended_hours=True"""
     try:
-        quote = api.get_latest_quote(symbol)
+        quote = latest_quote(symbol)
         ask_price = float(quote.ap) if quote and quote.ap > 0 else last_trade_price(symbol)
 
         if not ask_price:
@@ -234,7 +246,7 @@ def place_limit_buy_auto(symbol: str, budget: float) -> Optional[str]:
             qty=str(qty),
             limit_price=str(round(ask_price, 2)),
             time_in_force="day",
-            extended_hours=True
+            extended_hours=EXTENDED_HOURS
         )
         log.info(f"[BUY] {symbol} qty={qty} @ {ask_price:.2f}")
         return o.id
@@ -242,17 +254,54 @@ def place_limit_buy_auto(symbol: str, budget: float) -> Optional[str]:
         log.error(f"Limit BUY failed {symbol}: {e}")
         return None
 
+def place_limit_sell_auto(symbol: str, qty: float) -> Optional[str]:
+    """
+    يضع أمر بيع Limit قبل/بعد السوق عند أفضل Bid - خصم بسيط (SELL_BID_OFFSET_CENTS).
+    يستخدم extended_hours=True لضمان التنفيذ في الفترات الممتدة.
+    """
+    try:
+        if qty <= 0:
+            return None
+
+        quote = latest_quote(symbol)
+        if not quote or float(quote.bp) <= 0:
+            # كحل بديل، نستخدم آخر سعر تداول
+            ref = last_trade_price(symbol)
+            if not ref:
+                log.warning(f"[SKIP SELL] {symbol} no bid/last price")
+                return None
+            px = max(0.01, ref - SELL_BID_OFFSET_CENTS / 100.0)
+        else:
+            px = max(0.01, float(quote.bp) - SELL_BID_OFFSET_CENTS / 100.0)
+
+        o = api.submit_order(
+            symbol=symbol,
+            side="sell",
+            type="limit",
+            qty=str(int(qty)),
+            limit_price=str(round(px, 2)),
+            time_in_force="day",
+            extended_hours=EXTENDED_HOURS
+        )
+        log.info(f"[SELL-LIMIT] {symbol} qty={int(qty)} @ {px:.2f} (ext-hours)")
+        return o.id
+    except Exception as e:
+        log.error(f"Limit SELL failed {symbol}: {e}")
+        return None
+
 def place_trailing_stop(symbol: str, qty: float) -> Optional[str]:
     try:
         if TRAIL_PRICE > 0:
             o = api.submit_order(
                 symbol=symbol, side="sell", type="trailing_stop",
-                time_in_force="day", trail_price=str(TRAIL_PRICE), qty=str(qty)
+                time_in_force="day", trail_price=str(TRAIL_PRICE), qty=str(qty),
+                extended_hours=EXTENDED_HOURS
             )
         else:
             o = api.submit_order(
                 symbol=symbol, side="sell", type="trailing_stop",
-                time_in_force="day", trail_percent=str(TRAIL_PCT), qty=str(qty)
+                time_in_force="day", trail_percent=str(TRAIL_PCT), qty=str(qty),
+                extended_hours=EXTENDED_HOURS
             )
         log.info(f"[TRAIL] {symbol} qty={qty}")
         return o.id
@@ -285,6 +334,40 @@ def get_buying_power_cash() -> float:
         return 0.0
 
 # =========================
+# Pre-market exit helper
+# =========================
+def premarket_mass_exit(open_map: Dict[str, bool]):
+    """
+    إذا السوق مغلق (قبل الافتتاح) و AUTO_SELL_BEFORE_OPEN=True:
+    ضع أوامر بيع Limit لكل المراكز المفتوحة التي ليس عليها أوامر مفتوحة.
+    """
+    if not AUTO_SELL_BEFORE_OPEN:
+        return
+    if market_open_now():
+        return
+
+    try:
+        positions = api.list_positions()
+    except Exception as e:
+        log.warning(f"list_positions failed: {e}")
+        return
+
+    for p in positions:
+        sym = p.symbol
+        if open_map.get(sym, False):
+            continue
+        try:
+            qty = float(p.qty)
+        except Exception:
+            continue
+        if qty <= 0:
+            continue
+        # ألغِ أي أمر قديم ثم ضع بيع ليمت ممتد الساعات
+        cancel_symbol_open_orders(sym)
+        place_limit_sell_auto(sym, qty)
+        time.sleep(0.5)
+
+# =========================
 # Main loop
 # =========================
 def main_loop():
@@ -295,7 +378,8 @@ def main_loop():
         f"allocate_from_cash={ALLOCATE_FROM_CASH} "
         f"trail_pct={TRAIL_PCT} trail_price={TRAIL_PRICE} "
         f"no_reentry_today={NO_REENTRY_TODAY} cooldown_min={COOLDOWN_MINUTES} "
-        f"interval_s={INTERVAL_SECONDS}"
+        f"interval_s={INTERVAL_SECONDS} "
+        f"extended_hours={EXTENDED_HOURS} auto_sell_premarket={AUTO_SELL_BEFORE_OPEN}"
     )
 
     log.info("Bot started.")
@@ -306,6 +390,9 @@ def main_loop():
 
             record_today_sells(api, SYMBOLS)
             open_map = open_orders_map()
+
+            # ===== NEW: بيع قبل الافتتاح =====
+            premarket_mass_exit(open_map)
 
             # ==== 1) حساب المومنتم لكل سهم واختيار أفضل K ====
             candidates = []
