@@ -53,6 +53,9 @@ EXTENDED_HOURS = os.getenv("EXTENDED_HOURS", "true").lower() == "true"
 AUTO_SELL_BEFORE_OPEN = os.getenv("AUTO_SELL_BEFORE_OPEN", "true").lower() == "true"
 SELL_BID_OFFSET_CENTS = int(os.getenv("SELL_BID_OFFSET_CENTS", "2"))  # خصم 2 سنت من أفضل Bid
 
+# -------- Auto-fix manual market sells when market is closed --------
+AUTO_FIX_MARKET_SELL = os.getenv("AUTO_FIX_MARKET_SELL", "true").lower() == "true"
+
 if not API_KEY or not API_SECRET:
     log.error("Missing API keys in environment.")
     raise SystemExit(1)
@@ -334,6 +337,69 @@ def get_buying_power_cash() -> float:
         return 0.0
 
 # =========================
+# Auto-fix manual Market Sell when closed
+# =========================
+def fix_manual_market_sells_when_closed():
+    """
+    إذا السوق مقفّل: حوّل أي أمر Market Sell مفتوح (يدوي) إلى Limit Sell مع extended_hours،
+    وبسعر قريب من أفضل Bid (نستخدم place_limit_sell_auto).
+    """
+    if not AUTO_FIX_MARKET_SELL:
+        return
+    if market_open_now():
+        return  # داخل السوق نتركها كما هي
+
+    try:
+        open_orders = api.list_orders(status="open")
+    except Exception as e:
+        log.warning(f"list_orders (open) failed: {e}")
+        return
+
+    for o in open_orders:
+        try:
+            if str(o.side).lower() != "sell":
+                continue
+            if str(o.type).lower() != "market":
+                continue
+
+            # لم يُنفّذ شيء من الأمر
+            filled_qty = 0.0
+            try:
+                filled_qty = float(getattr(o, "filled_qty", "0") or 0)
+            except Exception:
+                pass
+            if filled_qty > 0:
+                continue
+
+            sym = o.symbol
+
+            # تأكد فيه مركز فعلي على السهم
+            try:
+                pos = api.get_position(sym)
+                qty = float(pos.qty)
+            except Exception:
+                qty = 0.0
+            if qty <= 0:
+                continue
+
+            # ألغِ أمر السوق وافتح بداله ليمت ممتد الساعات (Bid - offset)
+            try:
+                api.cancel_order(o.id)
+                log.info(f"[AUTO-FIX] Canceled Market Sell for {sym} (market closed)")
+            except Exception as ce:
+                log.warning(f"[AUTO-FIX] Cancel failed for {sym}: {ce}")
+                continue
+
+            placed_id = place_limit_sell_auto(sym, qty)
+            if placed_id:
+                log.info(f"[AUTO-FIX] Replaced with Limit Sell (ext-hours) for {sym}, qty={int(qty)}")
+            else:
+                log.warning(f"[AUTO-FIX] Failed to place replacement Limit Sell for {sym}")
+            time.sleep(0.2)
+        except Exception as e:
+            log.debug(f"[AUTO-FIX] loop error: {e}")
+
+# =========================
 # Pre-market exit helper
 # =========================
 def premarket_mass_exit(open_map: Dict[str, bool]):
@@ -379,7 +445,8 @@ def main_loop():
         f"trail_pct={TRAIL_PCT} trail_price={TRAIL_PRICE} "
         f"no_reentry_today={NO_REENTRY_TODAY} cooldown_min={COOLDOWN_MINUTES} "
         f"interval_s={INTERVAL_SECONDS} "
-        f"extended_hours={EXTENDED_HOURS} auto_sell_premarket={AUTO_SELL_BEFORE_OPEN}"
+        f"extended_hours={EXTENDED_HOURS} auto_sell_premarket={AUTO_SELL_BEFORE_OPEN} "
+        f"auto_fix_market_sell={AUTO_FIX_MARKET_SELL}"
     )
 
     log.info("Bot started.")
@@ -389,9 +456,14 @@ def main_loop():
             heartbeat("Cycle begin")
 
             record_today_sells(api, SYMBOLS)
+
+            # 🔒 صحّح أوامر Market Sell اليدوية إذا السوق مقفّل
+            fix_manual_market_sells_when_closed()
+
+            # أبني خريطة الأوامر بعد التصحيح
             open_map = open_orders_map()
 
-            # ===== NEW: بيع قبل الافتتاح =====
+            # ===== بيع قبل الافتتاح (Limit + ext-hours) إذا فيه مراكز =====
             premarket_mass_exit(open_map)
 
             # ==== 1) حساب المومنتم لكل سهم واختيار أفضل K ====
