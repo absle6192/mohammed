@@ -48,13 +48,13 @@ COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "60"))
 INTERVAL_SECONDS   = int(os.getenv("INTERVAL_SECONDS", "30"))
 MAX_CYCLE_SECONDS  = int(os.getenv("MAX_CYCLE_SECONDS", "20"))
 
-# -------- Extended Hours / Pre-market sell --------
+# -------- Extended Hours / session behavior --------
 EXTENDED_HOURS = os.getenv("EXTENDED_HOURS", "true").lower() == "true"
 AUTO_SELL_BEFORE_OPEN = os.getenv("AUTO_SELL_BEFORE_OPEN", "true").lower() == "true"
-SELL_BID_OFFSET_CENTS = int(os.getenv("SELL_BID_OFFSET_CENTS", "2"))  # خصم 2 سنت من أفضل Bid
-
-# -------- Auto-fix manual market sells when market is closed --------
+SELL_BID_OFFSET_CENTS = int(os.getenv("SELL_BID_OFFSET_CENTS", "2"))  # خصم من أفضل Bid
+BUY_ASK_OFFSET_CENTS  = int(os.getenv("BUY_ASK_OFFSET_CENTS", "2"))   # إضافة على أفضل Ask
 AUTO_FIX_MARKET_SELL = os.getenv("AUTO_FIX_MARKET_SELL", "true").lower() == "true"
+AUTO_FLIP_ON_OPEN    = os.getenv("AUTO_FLIP_ON_OPEN", "true").lower() == "true"  # قلب أوامر premarket إلى MARKET عند الافتتاح
 
 if not API_KEY or not API_SECRET:
     log.error("Missing API keys in environment.")
@@ -225,10 +225,10 @@ def can_open_new_long(symbol: str, states: Dict[str, bool]) -> Tuple[bool, str]:
     return True, ""
 
 # =========================
-# Orders
+# Orders (session-aware)
 # =========================
 def place_limit_buy_auto(symbol: str, budget: float) -> Optional[str]:
-    """Limit Buy عند سعر العرض (Ask) مع extended_hours=True"""
+    """(Retained) Limit Buy قبل/بعد السوق @ Ask مع extended_hours=True"""
     try:
         quote = latest_quote(symbol)
         ask_price = float(quote.ap) if quote and quote.ap > 0 else last_trade_price(symbol)
@@ -236,6 +236,9 @@ def place_limit_buy_auto(symbol: str, budget: float) -> Optional[str]:
         if not ask_price:
             log.warning(f"[SKIP] {symbol} no valid price")
             return None
+
+        # أضفنا offset على الـ Ask لزيادة احتمال التنفيذ
+        ask_price = max(0.01, ask_price + BUY_ASK_OFFSET_CENTS / 100.0)
 
         qty = int(budget // ask_price)
         if qty < 1:
@@ -249,9 +252,9 @@ def place_limit_buy_auto(symbol: str, budget: float) -> Optional[str]:
             qty=str(qty),
             limit_price=str(round(ask_price, 2)),
             time_in_force="day",
-            extended_hours=EXTENDED_HOURS
+            extended_hours=True
         )
-        log.info(f"[BUY] {symbol} qty={qty} @ {ask_price:.2f}")
+        log.info(f"[BUY-LIMIT ext] {symbol} qty={qty} @ {ask_price:.2f}")
         return o.id
     except Exception as e:
         log.error(f"Limit BUY failed {symbol}: {e}")
@@ -284,13 +287,73 @@ def place_limit_sell_auto(symbol: str, qty: float) -> Optional[str]:
             qty=str(int(qty)),
             limit_price=str(round(px, 2)),
             time_in_force="day",
-            extended_hours=EXTENDED_HOURS
+            extended_hours=True
         )
-        log.info(f"[SELL-LIMIT] {symbol} qty={int(qty)} @ {px:.2f} (ext-hours)")
+        log.info(f"[SELL-LIMIT ext] {symbol} qty={int(qty)} @ {px:.2f}")
         return o.id
     except Exception as e:
         log.error(f"Limit SELL failed {symbol}: {e}")
         return None
+
+def place_market_buy(symbol: str, notional_usd: float) -> Optional[str]:
+    """Market Buy داخل السوق باستخدام notional."""
+    try:
+        if notional_usd <= 0:
+            return None
+        o = api.submit_order(
+            symbol=symbol,
+            side="buy",
+            type="market",
+            notional=str(round(notional_usd, 2)),
+            time_in_force="day",
+            extended_hours=False
+        )
+        log.info(f"[BUY-MARKET] {symbol} notional=${notional_usd:.2f}")
+        return o.id
+    except Exception as e:
+        log.error(f"Market BUY failed {symbol}: {e}")
+        return None
+
+def place_market_sell(symbol: str, qty: float) -> Optional[str]:
+    """Market Sell داخل السوق."""
+    try:
+        if qty <= 0:
+            return None
+        o = api.submit_order(
+            symbol=symbol,
+            side="sell",
+            type="market",
+            qty=str(int(qty)),
+            time_in_force="day",
+            extended_hours=False
+        )
+        log.info(f"[SELL-MARKET] {symbol} qty={int(qty)}")
+        return o.id
+    except Exception as e:
+        log.error(f"Market SELL failed {symbol}: {e}")
+        return None
+
+def place_smart_buy(symbol: str, budget: float) -> Optional[str]:
+    """
+    يختار نوع أمر الشراء تلقائي:
+    - إذا السوق مفتوح -> MARKET بـ notional = budget
+    - إذا مقفّل      -> LIMIT @ Ask+offset مع extended_hours
+    """
+    if market_open_now():
+        return place_market_buy(symbol, budget)
+    else:
+        return place_limit_buy_auto(symbol, budget)
+
+def place_smart_sell(symbol: str, qty: float) -> Optional[str]:
+    """
+    يختار نوع أمر البيع تلقائي:
+    - إذا السوق مفتوح -> MARKET
+    - إذا مقفّل      -> LIMIT @ Bid-offset مع extended_hours
+    """
+    if market_open_now():
+        return place_market_sell(symbol, qty)
+    else:
+        return place_limit_sell_auto(symbol, qty)
 
 def place_trailing_stop(symbol: str, qty: float) -> Optional[str]:
     try:
@@ -400,6 +463,76 @@ def fix_manual_market_sells_when_closed():
             log.debug(f"[AUTO-FIX] loop error: {e}")
 
 # =========================
+# Flip premarket limit orders to market on open
+# =========================
+def flip_premarket_open_orders_to_market():
+    """
+    عند الافتتاح: اقلب أي أمر LIMIT (extended_hours=True) معلّق إلى MARKET.
+    - للبيع: استخدم qty كما هو.
+    - للشراء: إن وُجد qty نستخدمه، وإن وُجد notional نستخدمه، وإلا نتخطّى.
+    """
+    if not AUTO_FLIP_ON_OPEN:
+        return
+    if not market_open_now():
+        return
+
+    try:
+        open_orders = api.list_orders(status="open")
+    except Exception as e:
+        log.warning(f"list_orders (open) failed: {e}")
+        return
+
+    for o in open_orders:
+        try:
+            if str(o.type).lower() != "limit":
+                continue
+            if not getattr(o, "extended_hours", False):
+                continue
+
+            sym  = o.symbol
+            side = str(o.side).lower()
+
+            # حاول نقرأ الحجم
+            qty = 0.0
+            try:
+                qty = float(getattr(o, "qty", "0") or 0)
+            except Exception:
+                pass
+
+            notional = None
+            try:
+                notional = float(getattr(o, "notional", "0") or 0) or None
+            except Exception:
+                pass
+
+            # الغِ الأمر القديم
+            try:
+                api.cancel_order(o.id)
+                log.info(f"[FLIP-OPEN] Canceled ext-hours LIMIT {side} for {sym}")
+            except Exception as ce:
+                log.warning(f"[FLIP-OPEN] Cancel failed for {sym}: {ce}")
+                continue
+
+            if side == "sell":
+                if qty > 0:
+                    place_market_sell(sym, qty)
+            else:  # buy
+                if notional and notional > 0:
+                    place_market_buy(sym, notional)
+                elif qty > 0:
+                    # إذا عندنا qty فقط، نحولها إلى MARKET بنفس الكمية
+                    place_market_buy_qty = api.submit_order(
+                        symbol=sym, side="buy", type="market",
+                        qty=str(int(qty)), time_in_force="day", extended_hours=False
+                    )
+                    log.info(f"[BUY-MARKET qty] {sym} qty={int(qty)} (flipped)")
+                else:
+                    log.warning(f"[FLIP-OPEN] No size info to flip BUY for {sym}")
+            time.sleep(0.2)
+        except Exception as e:
+            log.debug(f"[FLIP-OPEN] loop error: {e}")
+
+# =========================
 # Pre-market exit helper
 # =========================
 def premarket_mass_exit(open_map: Dict[str, bool]):
@@ -446,7 +579,9 @@ def main_loop():
         f"no_reentry_today={NO_REENTRY_TODAY} cooldown_min={COOLDOWN_MINUTES} "
         f"interval_s={INTERVAL_SECONDS} "
         f"extended_hours={EXTENDED_HOURS} auto_sell_premarket={AUTO_SELL_BEFORE_OPEN} "
-        f"auto_fix_market_sell={AUTO_FIX_MARKET_SELL}"
+        f"auto_fix_market_sell={AUTO_FIX_MARKET_SELL} "
+        f"buy_ask_offset_cents={BUY_ASK_OFFSET_CENTS} sell_bid_offset_cents={SELL_BID_OFFSET_CENTS} "
+        f"auto_flip_on_open={AUTO_FLIP_ON_OPEN}"
     )
 
     log.info("Bot started.")
@@ -460,7 +595,10 @@ def main_loop():
             # 🔒 صحّح أوامر Market Sell اليدوية إذا السوق مقفّل
             fix_manual_market_sells_when_closed()
 
-            # أبني خريطة الأوامر بعد التصحيح
+            # إذا فتح السوق، اقلب أوامر premarket المعلّقة إلى MARKET
+            flip_premarket_open_orders_to_market()
+
+            # أبني خريطة الأوامر بعد التصحيح / القلب
             open_map = open_orders_map()
 
             # ===== بيع قبل الافتتاح (Limit + ext-hours) إذا فيه مراكز =====
@@ -521,7 +659,8 @@ def main_loop():
                 # ==== 4) تنفيذ الشراء وتعليق Trailing ====
                 for sym in symbols_to_open:
                     cancel_symbol_open_orders(sym)
-                    buy_id = place_limit_buy_auto(sym, per_budget)
+                    # ✨ هنا التبديل التلقائي حسب حالة السوق
+                    buy_id = place_smart_buy(sym, per_budget)
                     if buy_id:
                         time.sleep(1.5)
                         try_attach_trailing_stop(sym)
