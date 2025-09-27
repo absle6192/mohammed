@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # filename: alert_orderflow.py
 import os, time, threading, requests, logging, traceback
 from dataclasses import dataclass
@@ -28,11 +29,16 @@ WATCH_REFRESH_SEC = float(os.getenv("WATCH_REFRESH_SEC","1.0"))
 MIN_MOVE_USD      = float(os.getenv("MIN_MOVE_USD","0.05"))
 MAX_SILENCE_SEC   = float(os.getenv("MAX_SILENCE_SEC","60"))
 
+STREAM_RETRY_SEC  = int(os.getenv("STREAM_RETRY_SEC","30"))   # مهلة إعادة المحاولة للـ WS
+
 WATCH = ["AAPL","NVDA","TSLA","MSFT","AMZN","META","GOOGL","AMD"]
 
 # ==== Telegram ====
 def tg(msg: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
+    if not TELEGRAM_BOT_TOKEN or not TELELEGRAM_CHAT_ID:  # safeguard typo
+        pass
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -161,35 +167,55 @@ def stop_track_if_closed(sym: str):
             tracks[sym].running = False
             tg(f"🛑 إيقاف متابعة {sym} (المركز أغلق).")
 
-# ==== WebSocket + Fallback Polling ====
-def run_stream():
-    stream = Stream(APCA_API_KEY_ID, APCA_API_SECRET_KEY, base_url=APCA_API_BASE_URL)
+# ==== تحقق من المفاتيح ====
+def check_auth_or_exit():
+    try:
+        acct = api.get_account()
+        tg(f"✅ Alpaca connected: {acct.account_number} | status={acct.status}")
+        return True
+    except Exception as e:
+        tg(f"❌ فشل التحقق من مفاتيح Alpaca:\n{e}")
+        log.error(f"Account auth failed: {e}")
+        return False
 
-    async def on_trade_update(data):
+# ==== WebSocket (محاولات هادئة) + Fallback Polling ====
+def run_stream_forever():
+    """يشغّل trading WebSocket ويعيد المحاولة كل STREAM_RETRY_SEC إذا فشل."""
+    while True:
         try:
-            ev     = data.event
-            order  = data.order
-            side   = order.get("side")
-            status = order.get("status")
-            sym    = order.get("symbol")
-            avg_p  = float(order.get("filled_avg_price") or 0.0)
-            qty    = float(order.get("filled_qty") or 0.0)
+            stream = Stream(APCA_API_KEY_ID, APCA_API_SECRET_KEY, base_url=APCA_API_BASE_URL)
 
-            if ev == "fill" and status == "filled":
-                if side == "buy":
-                    start_track(sym, avg_p, qty)
-                    tg(f"🟢 تم شراء {sym}\nسعر الدخول: ${fmt2(avg_p)} | كمية: {qty}")
-                elif side == "sell":
-                    stop_track_if_closed(sym)
+            async def on_trade_update(data):
+                try:
+                    ev     = data.event
+                    order  = data.order
+                    side   = order.get("side")
+                    status = order.get("status")
+                    sym    = order.get("symbol")
+                    avg_p  = float(order.get("filled_avg_price") or 0.0)
+                    qty    = float(order.get("filled_qty") or 0.0)
+
+                    if ev == "fill" and status == "filled":
+                        if side == "buy":
+                            start_track(sym, avg_p, qty)
+                            tg(f"🟢 تم شراء {sym}\nسعر الدخول: ${fmt2(avg_p)} | كمية: {qty}")
+                        elif side == "sell":
+                            stop_track_if_closed(sym)
+                except Exception as e:
+                    log.warning(f"on_trade_update error: {e}")
+
+            stream.subscribe_trade_updates(on_trade_update)
+            log.info("starting trading websocket connection")
+            stream.run()  # يبقى شغال لحد ما ينقطع
+
         except Exception as e:
-            log.warning(f"on_trade_update error: {e}")
-
-    # الاشتراك الصحيح (بدل decorator)
-    stream.subscribe_trade_updates(on_trade_update)
-    stream.run()
+            msg = f"⚠️ WS انتهى/فشل: {e}\nنعيد المحاولة بعد {STREAM_RETRY_SEC}s"
+            log.warning(msg)
+            tg(msg)
+            time.sleep(STREAM_RETRY_SEC)
 
 def polling_fallback():
-    """لو فشل WS (429/auth)، نراقب الأوامر كل 5 ثواني."""
+    """مراقبة الأوامر كل 5 ثواني لو احتجناها."""
     seen = set()
     tg("ℹ️ التحويل إلى وضع Polling للأوامر كل 5s")
     while True:
@@ -208,16 +234,6 @@ def polling_fallback():
             log.warning(f"polling error: {e}")
         time.sleep(5)
 
-def check_auth_or_exit():
-    try:
-        acct = api.get_account()
-        tg(f"✅ Alpaca connected: {acct.account_number} | status={acct.status}")
-        return True
-    except Exception as e:
-        tg(f"❌ فشل التحقق من مفاتيح Alpaca:\n{e}")
-        log.error(f"Account auth failed: {e}")
-        return False
-
 # ==== main ====
 if __name__ == "__main__":
     tg("✅ البوت الثاني بدأ: إشارات مبكّرة + متابعة السعر بعد الشراء.")
@@ -227,11 +243,9 @@ if __name__ == "__main__":
 
     if ok:
         try:
-            run_stream()
+            run_stream_forever()
         except Exception as e:
-            # مشاكل 429/فشل WS → نروح لخطة احتياط
             log.error(f"WS failed, switching to polling. Reason: {e}\n{traceback.format_exc()}")
             polling_fallback()
     else:
-        # مفاتيح غلط؟ تبقى على Polling (قد ينجح لو REST فقط مفعّل)
         polling_fallback()
