@@ -1,151 +1,118 @@
+# alert_orderflow.py
+# Minimal Alpaca market watcher with safe ASCII-only headers & UTF-8 stdout.
+
 import os
 import sys
 import time
 import json
-from typing import Optional, Dict, Any
-
 import requests
 
-
-# ---------- Output encoding: force UTF-8 ----------
+# ----- stdout in UTF-8 (safe on Render) -----
 try:
-    # Render (and some environments) sometimes default to latin-1
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
 
+# ----- helpers -----
+RTL_MARKS = ("\u200f", "\u200e")  # invisible RTL/LTR marks
 
-# ---------- Configuration ----------
-API_KEY = os.getenv("APCA_API_KEY_ID", "")
-API_SECRET = os.getenv("APCA_API_SECRET_KEY", "")
+def clean_header_value(val: str) -> str:
+    """
+    Remove invisible marks and non-ASCII from header values to avoid
+    urllib3/http.client latin-1 encode errors.
+    """
+    if not isinstance(val, str):
+        val = str(val)
+    for m in RTL_MARKS:
+        val = val.replace(m, "")
+    # keep headers strictly ASCII
+    val = val.encode("ascii", "ignore").decode("ascii")
+    return val.strip()
 
-# Use Alpaca Market Data v2 API (not the trading/paper URL)
-DATA_BASE = "https://data.alpaca.markets/v2"
+def safe_json(resp: requests.Response) -> dict:
+    try:
+        return resp.json()
+    except Exception:
+        # show a short preview to debug invalid JSON without unicode noise
+        text = (resp.text or "")[:200].encode("ascii", "ignore").decode("ascii")
+        print(f"[WARN] Invalid JSON (status {resp.status_code}): {text}")
+        return {}
 
-# Symbols to watch
-SYMBOLS = ["TSLA", "NVDA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "AMD"]
+# ----- config from environment -----
+# For market data, use data.alpaca.markets
+BASE_URL  = os.getenv("APCA_API_BASE_URL", "https://data.alpaca.markets").strip()
+API_KEY   = os.getenv("APCA_API_KEY_ID", "").strip()
+API_SECRET= os.getenv("APCA_API_SECRET_KEY", "").strip()
 
-# Polling seconds between requests (avoid rate limits)
-POLL_SECONDS = 10
+# Clean any hidden chars that might have slipped into env values
+BASE_URL   = clean_header_value(BASE_URL)
+API_KEY    = clean_header_value(API_KEY)
+API_SECRET = clean_header_value(API_SECRET)
 
-# Requests settings
-TIMEOUT = (5, 15)  # (connect timeout, read timeout)
+# HTTP headers (ASCII-only)
 HEADERS = {
+    "Accept": "application/json",
+    "Content-Type": "application/json; charset=utf-8",
     "APCA-API-KEY-ID": API_KEY,
     "APCA-API-SECRET-KEY": API_SECRET,
-    "Accept": "application/json",
-    "User-Agent": "orderflow-watcher/1.0",
 }
 
+# Symbols to watch (ASCII only)
+SYMBOLS = ["TSLA", "NVDA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "AMD"]
 
-# ---------- Helpers ----------
-def log(msg: str) -> None:
-    """Simple UTF-8 safe log."""
+# ----- data fetch -----
+def get_last_price(symbol: str):
+    """
+    Fetch last trade price from Alpaca v2 market data.
+    Endpoint: /v2/stocks/{symbol}/trades/latest
+    """
+    url = f"{BASE_URL}/v2/stocks/{symbol}/trades/latest"
     try:
-        print(msg, flush=True)
-    except Exception:
-        # Fallback to ASCII-only (strip non-ascii) if something goes wrong
-        safe = msg.encode("ascii", "ignore").decode("ascii")
-        print(safe, flush=True)
-
-
-def parse_json_safely(resp: requests.Response) -> Optional[Dict[str, Any]]:
-    """
-    Try to parse JSON. If it fails, log a short snippet of text body.
-    Returns dict or None.
-    """
-    # Some errors return text/html or plain text
-    ctype = resp.headers.get("Content-Type", "")
-    try:
-        data = resp.json()
-        return data
-    except Exception:
-        snippet = resp.text[:200].replace("\n", " ")
-        log(f"PARSE ERROR {resp.status_code}: invalid JSON (Content-Type={ctype}) body_snippet='{snippet}'")
-        return None
-
-
-def get_latest_trade_price(symbol: str) -> Optional[float]:
-    """
-    Fetch latest trade price for a symbol using Alpaca Market Data v2.
-    Handles both response shapes:
-      { "trade": { "p": ... } }  OR  { "data": { "trade": { "p": ... } } }
-    Returns price or None.
-    """
-    url = f"{DATA_BASE}/stocks/{symbol}/trades/latest"
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-        # Explicit auth/HTTP errors
-        if resp.status_code == 401:
-            log(f"AUTH ERROR {symbol}: check APCA_API_KEY_ID / APCA_API_SECRET_KEY")
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        if r.status_code == 401:
+            print(f"[AUTH] Check API keys (401) for {symbol}")
             return None
-        if resp.status_code == 403:
-            log(f"FORBIDDEN {symbol}: plan may not include this endpoint")
+        if r.status_code == 404:
+            print(f"[NOT FOUND] {symbol} not available (404)")
             return None
-        if resp.status_code == 404:
-            log(f"NOT FOUND {symbol}: symbol or endpoint")
-            return None
-        resp.raise_for_status()
+        r.raise_for_status()
+        data = safe_json(r)
+        # Expected shape: {"symbol":"TSLA","trade":{"p": <price>, ...}}
+        price = None
+        trade = data.get("trade") or {}
+        if isinstance(trade, dict):
+            price = trade.get("p")
+        if price is None:
+            print(f"[PARSE] Missing price in response for {symbol}")
+        return price
+    except requests.Timeout:
+        print(f"[TIMEOUT] {symbol}")
     except requests.RequestException as e:
-        log(f"REQUEST ERROR {symbol}: {e}")
-        return None
-
-    data = parse_json_safely(resp)
-    if not data:
-        return None
-
-    # Try both shapes safely
-    trade = None
-    if isinstance(data, dict):
-        if "trade" in data and isinstance(data["trade"], dict):
-            trade = data["trade"]
-        elif "data" in data and isinstance(data["data"], dict):
-            inner = data["data"]
-            if "trade" in inner and isinstance(inner["trade"], dict):
-                trade = inner["trade"]
-
-    if not trade:
-        log(f"UNEXPECTED SHAPE {symbol}: {json.dumps(data)[:200]}")
-        return None
-
-    price = trade.get("p")
-    if isinstance(price, (int, float)):
-        return float(price)
-
-    log(f"MISSING PRICE {symbol}: {json.dumps(trade)[:200]}")
+        # Keep message ASCII-only
+        msg = str(e).encode("ascii", "ignore").decode("ascii")
+        print(f"[HTTP ERROR] {symbol}: {msg}")
+    except Exception as e:
+        msg = str(e).encode("ascii", "ignore").decode("ascii")
+        print(f"[ERROR] {symbol}: {msg}")
     return None
 
-
-def main() -> None:
-    if not API_KEY or not API_SECRET:
-        log("CONFIG ERROR: Missing APCA_API_KEY_ID or APCA_API_SECRET_KEY in environment.")
-        return
-
-    log("ORDERFLOW WATCHER STARTED")
-    last_prices: Dict[str, Optional[float]] = {s: None for s in SYMBOLS}
+# ----- main loop -----
+def main():
+    print("[START] Orderflow watcher started.")
+    last_prices = {s: None for s in SYMBOLS}
 
     while True:
-        for symbol in SYMBOLS:
-            price = get_latest_trade_price(symbol)
-            if price is None:
-                # Already logged detailed reason
-                continue
-
-            # Print current price
-            log(f"{symbol} last trade price: {price}")
-
-            # Simple change notification (only when it changes)
-            if last_prices[symbol] is None:
-                last_prices[symbol] = price
-            elif price != last_prices[symbol]:
-                log(f"{symbol} price changed: {last_prices[symbol]} -> {price}")
-                last_prices[symbol] = price
-
-            # Be gentle with API
-            time.sleep(0.5)
-
-        time.sleep(POLL_SECONDS)
-
+        for s in SYMBOLS:
+            price = get_last_price(s)
+            if price is not None:
+                # Basic change detection
+                if last_prices[s] is None:
+                    print(f"[INIT] {s} = {price}")
+                elif price != last_prices[s]:
+                    print(f"[MOVE] {s}: {last_prices[s]} -> {price}")
+                last_prices[s] = price
+        # Poll interval (seconds)
+        time.sleep(5)
 
 if __name__ == "__main__":
     main()
