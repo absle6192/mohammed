@@ -1,3 +1,4 @@
+# filename: alert_orderflow.py
 import os, time, threading, requests, logging
 from dataclasses import dataclass
 from typing import Dict, Optional
@@ -27,7 +28,6 @@ WATCH_REFRESH_SEC = float(os.getenv("WATCH_REFRESH_SEC","1.0"))
 MIN_MOVE_USD      = float(os.getenv("MIN_MOVE_USD","0.05"))
 MAX_SILENCE_SEC   = float(os.getenv("MAX_SILENCE_SEC","60"))
 
-# عدّل قائمتك (أسهمك الثمانية)
 WATCH = ["AAPL","NVDA","TSLA","MSFT","AMZN","META","GOOGL","AMD"]
 
 # ==== helpers ====
@@ -38,7 +38,8 @@ def tg(msg: str):
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=8
         )
-    except: pass
+    except Exception as e:
+        log.warning(f"TG send failed: {e}")
 
 api = REST(APCA_API_KEY_ID, APCA_API_SECRET_KEY, APCA_API_BASE_URL)
 
@@ -53,25 +54,21 @@ def latest_trade(symbol) -> Optional[float]:
 def latest_quote(symbol):
     try:
         q = api.get_latest_quote(symbol)
-        # يحتاج بيانات تكتيكية مفعّلة
         return float(q.bid_price), float(q.ask_price), float(q.bid_size or 0), float(q.ask_size or 0)
     except Exception as e:
         log.warning(f"latest_quote {symbol}: {e}")
         return None
 
-# ==== Early signals (order-flow) ====
+# ==== Early signals ====
 last_ok   : Dict[str, float] = {s: 0 for s in WATCH}
 last_sent : Dict[str, float] = {s: 0 for s in WATCH}
 last_px   : Dict[str, float] = {}
 
-def momentum_small(symbol, horizon_sec=2.0):
-    """زخم بسيط: فرق السعر النسبي خلال أفق قصير."""
-    now = time.time()
+def momentum_small(symbol):
     p_now = latest_trade(symbol)
     if p_now is None: return 0.0
     p_prev = last_px.get(symbol, p_now)
     last_px[symbol] = p_now
-    # لو ما مر وقت كفاية، استخدم فرق بسيط
     if p_prev == 0: return 0.0
     return (p_now / p_prev) - 1.0
 
@@ -92,23 +89,21 @@ def early_signals_loop():
             good_up = (imb >= IMB_UP) and (spread <= MAX_SPREAD_USD) and (mom >= MOMENTUM_TH)
             good_dn = (imb <= IMB_DN) and (spread <= MAX_SPREAD_USD) and (mom <= -MOMENTUM_TH)
 
-            # ثبات الشرط HOLD_SEC
             prev_ok = last_ok.get(s, 0)
             if good_up or good_dn:
                 if prev_ok == 0:
                     last_ok[s] = now
-                elif now - prev_ok >= HOLD_SEC:
-                    # Cooldown
-                    if now - last_sent.get(s, 0) >= COOLDOWN_SEC:
-                        p = latest_trade(s) or bid
-                        if good_up:
-                            tg(f"📈 إشارة مبكّرة — {s}\nالطلب أقوى ({imb:.2f}×) | السبريد ${spread:.02f}\nزخم إيجابي بسيط\nالسعر الآن: ${p:.2f}")
-                        else:
-                            tg(f"📉 إشارة مبكّرة — {s}\nالعرض أقوى ({(1/imb if imb>0 else 0):.2f}× تقريبًا) | السبريد ${spread:.02f}\nزخم سلبي بسيط\nالسعر الآن: ${p:.2f}")
-                        last_sent[s] = now
-                        last_ok[s]   = 0
+                elif now - prev_ok >= HOLD_SEC and now - last_sent.get(s,0) >= COOLDOWN_SEC:
+                    p = latest_trade(s) or bid
+                    if good_up:
+                        tg(f"📈 إشارة مبكّرة — {s}\nالطلب أقوى ({imb:.2f}×) | السبريد ${spread:.02f}\nزخم إيجابي بسيط\nالسعر الآن: ${p:.2f}")
+                    else:
+                        # نعرض قوة العرض تقريبيًا كمعكوس
+                        inv = (1/imb) if imb>0 else 0
+                        tg(f"📉 إشارة مبكّرة — {s}\nالعرض أقوى ({inv:.2f}× تقريبًا) | السبريد ${spread:.02f}\nزخم سلبي بسيط\nالسعر الآن: ${p:.2f}")
+                    last_sent[s] = now
+                    last_ok[s]   = 0
             else:
-                # لو كان فيه OK قبل قليل ثم اختفى بسرعة ممكن ترسل إلغاء (اختياري)
                 if prev_ok != 0 and (now - prev_ok) <= HOLD_SEC:
                     tg(f"⚠️ إلغاء الإشارة — {s}\nاختفى تفوق الطلب/العرض قبل التأكيد")
                 last_ok[s] = 0
@@ -166,10 +161,9 @@ def stop_track_if_closed(sym: str):
             tracks[sym].running = False
             tg(f"🛑 إيقاف متابعة {sym} (المركز أغلق).")
 
-# ==== Stream trade_updates ====
+# ==== Stream trade_updates (الإصلاح هنا) ====
 stream = Stream(APCA_API_KEY_ID, APCA_API_SECRET_KEY, base_url=APCA_API_BASE_URL)
 
-@stream.on("trade_updates")
 async def on_trade_update(data):
     try:
         ev     = data.event
@@ -188,6 +182,9 @@ async def on_trade_update(data):
                 stop_track_if_closed(sym)
     except Exception as e:
         log.warning(f"on_trade_update error: {e}")
+
+# استبدلنا الديكوريتر بهذه:
+stream.subscribe_trade_updates(on_trade_update)
 
 # ==== main ====
 if __name__ == "__main__":
