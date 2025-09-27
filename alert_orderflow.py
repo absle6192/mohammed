@@ -1,24 +1,18 @@
 # -*- coding: utf-8 -*-
 import os
+import sys
 import time
 import requests
 
-# API Keys from environment
+# Force UTF-8 output
+sys.stdout.reconfigure(encoding="utf-8")
+
 API_KEY = os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY")
 BASE_URL = "https://data.alpaca.markets/v2"
 
-# Symbols list (8 stocks)
-SYMBOLS = [
-    "TSLA",
-    "NVDA",
-    "AAPL",
-    "MSFT",
-    "AMZN",
-    "META",
-    "GOOGL",
-    "AMD"
-]
+# Stocks to monitor
+SYMBOLS = ["TSLA", "NVDA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "AMD"]
 
 def get_last_price(symbol):
     url = f"{BASE_URL}/stocks/{symbol}/trades/latest"
