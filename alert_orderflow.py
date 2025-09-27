@@ -1,16 +1,22 @@
-# alert_orderflow.py
-import os
-import time
-import json
-import requests
-import sys
+import os, sys, time, requests, io, unicodedata
 
-# Make stdout UTF-8 friendly (safe even if already UTF-8)
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
+# Force UTF-8 for stdout/stderr no matter what
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
+def log(msg: str):
+    """Print safe ASCII/UTF-8 logs without bidi/zero-width chars."""
+    if not isinstance(msg, str):
+        msg = str(msg)
+    # remove control/format chars (includes U+200F and friends)
+    msg = "".join(ch for ch in msg if ch.isprintable() and unicodedata.category(ch) != "Cf")
+    try:
+        sys.stdout.write(msg + "\n")
+    except UnicodeEncodeError:
+        sys.stdout.buffer.write((msg + "\n").encode("utf-8", errors="replace"))
+    sys.stdout.flush()
+
+# ===== Config from env =====
 BASE_URL   = os.getenv("APCA_API_BASE_URL", "https://data.alpaca.markets")
 API_KEY    = os.getenv("APCA_API_KEY_ID", "")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY", "")
@@ -25,56 +31,28 @@ HEADERS = {
 def get_last_price(symbol: str):
     url = f"{BASE_URL}/v2/stocks/{symbol}/trades/latest"
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
+        r = requests.get(url, headers=HEADERS, timeout=10)
         if r.status_code == 401:
-            print(f"AUTH ERROR {symbol}")
+            log(f"AUTH ERROR {symbol}")
             return None
         if r.status_code == 404:
-            print(f"NOT FOUND {symbol}")
+            log(f"NOT FOUND {symbol}")
             return None
         r.raise_for_status()
         data = r.json()
-        # Expect: {"trade": {"p": price, ...}}
-        trade = data.get("trade", {})
-        price = trade.get("p")
-        if price is None:
-            print(f"NO PRICE {symbol} payload={json.dumps(data)[:120]}")
-            return None
-        return float(price)
-    except requests.exceptions.RequestException as e:
-        print(f"HTTP ERROR {symbol}: {e}")
-    except (ValueError, TypeError) as e:
-        print(f"PARSE ERROR {symbol}: {e}")
-    return None
+        return data.get("trade", {}).get("p")
+    except Exception as e:
+        log(f"FETCH ERROR {symbol}: {e}")
+        return None
 
 def main():
-    if not API_KEY or not API_SECRET:
-        print("MISSING ALPACA KEYS")
-        return
-
-    last = {s: None for s in SYMBOLS}
-    print("ORDERFLOW WATCHER STARTED")
-
+    log("ORDERFLOW WATCHER STARTED")
     while True:
-        for sym in SYMBOLS:
-            px = get_last_price(sym)
-            if px is None:
-                continue
-
-            # Log simple ASCII line
-            print(f"{sym} last={px}")
-
-            # Simple change alert
-            if last[sym] is not None and px != last[sym]:
-                print(f"ALERT {sym} changed: {last[sym]} -> {px}")
-
-            last[sym] = px
-
-            # Be gentle with API
-            time.sleep(0.8)
-
-        # Small pause between full rounds
-        time.sleep(2)
+        for symbol in SYMBOLS:
+            price = get_last_price(symbol)
+            if price:
+                log(f"CURRENT PRICE {symbol}: {price}")
+        time.sleep(10)
 
 if __name__ == "__main__":
     main()
