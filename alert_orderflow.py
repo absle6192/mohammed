@@ -2,48 +2,50 @@ import os
 import time
 import requests
 
-# جلب مفتاح API من البيئة (Alpaca)
-API_KEY = os.getenv("APCA_API_KEY_ID")
-API_SECRET = os.getenv("APCA_API_SECRET_KEY")
+# =========================
+# إعدادات
+# =========================
+API_KEY = os.getenv("APCA_API_KEY_ID", "")
+API_SECRET = os.getenv("APCA_API_SECRET_KEY", "")
+BASE_URL = "https://data.alpaca.markets/v2"
 
-# رابط بيانات السوق من Alpaca
-BASE_URL = "https://data.alpaca.markets"
-
-# قائمة الأسهم (٨ أسهم)
+# أسهم البوت القديم
 SYMBOLS = ["TSLA", "NVDA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "AMD"]
 
-# دالة تجيب آخر سعر
+# =========================
+# جلب آخر سعر
+# =========================
 def get_last_price(symbol):
-    url = f"{BASE_URL}/v2/stocks/{symbol}/trades/latest"
+    url = f"{BASE_URL}/stocks/{symbol}/trades/latest"
     headers = {
         "APCA-API-KEY-ID": API_KEY,
-        "APCA-API-SECRET-KEY": API_SECRET
+        "APCA-API-SECRET-KEY": API_SECRET,
     }
     try:
         r = requests.get(url, headers=headers)
         data = r.json()
-        return data.get("trade", {}).get("p", None)  # p = price
+        return data.get("trade", {}).get("p", None)
     except Exception as e:
         print(f"⚠️ خطأ في {symbol}: {e}")
         return None
 
+# =========================
+# البرنامج الرئيسي
+# =========================
 def main():
     last_prices = {s: None for s in SYMBOLS}
-    print("🚀 بدأ تشغيل مراقبة الأسعار لأسهم البوت ...")
+    print("🚀 تشغيل مراقبة الأسعار لأسهم البوت")
 
     while True:
         for symbol in SYMBOLS:
             price = get_last_price(symbol)
             if price:
-                if last_prices[symbol] is None:
-                    last_prices[symbol] = price
-                else:
-                    diff = price - last_prices[symbol]
-                    if diff > 0:
-                        print(f"📈 {symbol} ارتفع: +{diff:.2f}$ (السعر الآن {price}$)")
-                    elif diff < 0:
-                        print(f"📉 {symbol} نزل: {diff:.2f}$ (السعر الآن {price}$)")
-                    last_prices[symbol] = price
+                print(f"{symbol} السعر الحالي: {price}")
+
+                if last_prices[symbol] is not None and price != last_prices[symbol]:
+                    print(f"🔔 {symbol}: تغير السعر من {last_prices[symbol]} → {price}")
+
+                last_prices[symbol] = price
         time.sleep(5)  # يحدث كل 5 ثواني
 
 if __name__ == "__main__":
