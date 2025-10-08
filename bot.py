@@ -52,9 +52,10 @@ INTERVAL_SECONDS   = int(os.getenv("INTERVAL_SECONDS", "30"))
 MAX_CYCLE_SECONDS  = int(os.getenv("MAX_CYCLE_SECONDS", "20"))
 
 # -------- Pre-Market limit padding (USD) --------
-PRE_SLIPPAGE_USD = float(os.getenv("PRE_SLIPPAGE_USD", "0.05"))  # small add to buy limit
+PRE_SLIPPAGE_USD = float(os.getenv("PRE_SLIPPAGE_USD", "0.05"))  # small add to BUY limit
+SELL_PAD_USD     = float(os.getenv("SELL_PAD_USD", "0.02"))      # how much below Bid for PRE sell
 
-# ===== NEW: allow/deny auto-sell in pre-market via ENV =====
+# ===== allow/deny auto-sell in pre-market via ENV =====
 ALLOW_PRE_AUTO_SELL = os.getenv("ALLOW_PRE_AUTO_SELL", "false").lower() == "true"
 
 if not API_KEY or not API_SECRET:
@@ -86,12 +87,11 @@ def sleep_until_next_interval(interval_seconds: int, started_at: float):
 def current_session_et(dt: datetime | None = None) -> str:
     """
     Returns: 'pre' | 'regular' | 'closed'
-    - pre:   04:00–09:30 ET
+    - pre:     04:00–09:30 ET
     - regular: 09:30–16:00 ET
     - else: closed (After-Hours and overnight both treated as closed for this bot)
     """
     now = (dt or datetime.now(ET)).astimezone(ET)
-    # weekend
     if now.weekday() >= 5:
         return "closed"
     t = now.time()
@@ -108,9 +108,9 @@ def current_session_et(dt: datetime | None = None) -> str:
 def can_trade_now() -> tuple[bool, bool]:
     """
     Returns (should_trade, extended_hours_flag)
-    - pre: trade allowed, extended_hours=True, limit-only
+    - pre: trade allowed, extended_hours=True, LIMIT-only
     - regular: trade allowed, extended_hours=False
-    - closed (after-hours/overnight): not allowed
+    - closed: not allowed
     """
     s = current_session_et()
     if s == "pre":
@@ -122,16 +122,14 @@ def can_trade_now() -> tuple[bool, bool]:
 # =========================
 # Re-entry Registry
 # =========================
-sold_registry: Dict[str, datetime] = {}  # last sell time (UTC) per symbol
+sold_registry: Dict[str, datetime] = {}
 
 def record_today_sells(api: REST, symbols: List[str]) -> None:
-    """Track today's sells per symbol for no-reentry and cooldown."""
     try:
         closed = api.list_orders(status="closed", limit=200, direction="desc")
     except Exception as e:
         log.warning(f"list_orders failed: {e}")
         return
-
     for o in closed:
         try:
             if o.side != "sell" or o.symbol not in symbols:
@@ -166,6 +164,13 @@ def last_trade_price(symbol: str) -> Optional[float]:
     except Exception as e:
         log.debug(f"last_trade_price error {symbol}: {e}")
         return None
+
+def latest_bid(symbol: str) -> float:
+    try:
+        q = api.get_latest_quote(symbol)
+        return float(getattr(q, "bidprice", 0) or 0)
+    except Exception:
+        return 0.0
 
 def has_open_position(symbol: str) -> bool:
     try:
@@ -213,7 +218,6 @@ def cancel_symbol_open_orders(symbol: str):
 def momentum_for_last_min(symbol: str) -> Optional[float]:
     """
     Momentum for last minute: (close - open) / open
-    Returns None if missing data.
     """
     try:
         bars = api.get_bars(symbol, TimeFrame(1, TimeFrameUnit.Minute), limit=2).df
@@ -255,8 +259,6 @@ def can_open_new_long(symbol: str, states: Dict[str, bool]) -> Tuple[bool, str]:
 # =========================
 # Pre-Market lock (your custom rule)
 # =========================
-# If we buy in pre-market, we block any automatic sells until regular session starts,
-# or until the position is manually closed.
 PREMARKET_LOCK: Dict[str, str] = {}
 
 def record_prebuy(symbol: str):
@@ -269,7 +271,7 @@ def clear_lock_if_no_position(symbol: str):
         if float(pos.qty) == 0:
             PREMARKET_LOCK.pop(sym, None)
     except Exception:
-        PREMARKET_LOCK.pop(sym, None)  # no position ⇒ remove lock
+        PREMARKET_LOCK.pop(sym, None)
 
 def should_allow_auto_sell(symbol: str) -> bool:
     """
@@ -279,13 +281,12 @@ def should_allow_auto_sell(symbol: str) -> bool:
     Allow sell if:
     - session is 'regular' OR
     - symbol not locked OR
-    - no position anymore (manual close)
-    - OR (NEW) ALLOW_PRE_AUTO_SELL is True (override)
+    - no position anymore
+    - OR ALLOW_PRE_AUTO_SELL=True (override)
     """
     sym = symbol.upper()
     clear_lock_if_no_position(sym)
     session = current_session_et()
-    # NEW: override via env
     if ALLOW_PRE_AUTO_SELL:
         return True
     if sym in PREMARKET_LOCK and session == "pre":
@@ -296,15 +297,10 @@ def should_allow_auto_sell(symbol: str) -> bool:
 # Orders
 # =========================
 def place_market_buy_qty_regular(symbol: str, qty: int) -> Optional[str]:
-    """Regular session: allow MARKET."""
     try:
         o = api.submit_order(
-            symbol=symbol,
-            side="buy",
-            type="market",
-            time_in_force="day",
-            qty=str(qty),
-            extended_hours=False
+            symbol=symbol, side="buy", type="market",
+            time_in_force="day", qty=str(qty), extended_hours=False
         )
         log.info(f"[BUY-REG/MKT] {symbol} qty={qty}")
         return o.id
@@ -313,17 +309,11 @@ def place_market_buy_qty_regular(symbol: str, qty: int) -> Optional[str]:
         return None
 
 def place_limit_buy_qty_premarket(symbol: str, qty: int, ref_price: float) -> Optional[str]:
-    """Pre-market: LIMIT only + extended_hours=True."""
     try:
-        limit_price = float(ref_price) + PRE_SLIPPAGE_USD  # small pad to improve fill odds
+        limit_price = float(ref_price) + PRE_SLIPPAGE_USD
         o = api.submit_order(
-            symbol=symbol,
-            side="buy",
-            type="limit",
-            time_in_force="day",
-            qty=str(qty),
-            limit_price=str(limit_price),
-            extended_hours=True
+            symbol=symbol, side="buy", type="limit", time_in_force="day",
+            qty=str(qty), limit_price=str(limit_price), extended_hours=True
         )
         log.info(f"[BUY-PRE/LMT] {symbol} qty={qty} limit={limit_price:.2f}")
         return o.id
@@ -331,26 +321,27 @@ def place_limit_buy_qty_premarket(symbol: str, qty: int, ref_price: float) -> Op
         log.error(f"BUY pre-market limit failed {symbol}: {e}")
         return None
 
-# NEW: direct market sell in pre/after-hours (for manual use or future automation)
-def place_market_sell_extended(symbol: str, qty: float) -> Optional[str]:
-    """Sell MARKET with extended_hours=True (works in pre/after-hours if liquidity)."""
+def place_limit_sell_extended(symbol: str, qty: float, ref_bid: Optional[float] = None, pad: Optional[float] = None) -> Optional[str]:
+    """Sell LIMIT in pre/after-hours at (Bid - pad) with extended_hours=True."""
     try:
+        bid = ref_bid if (ref_bid is not None and ref_bid > 0) else latest_bid(symbol)
+        if bid <= 0:
+            log.warning(f"[SELL-PRE] {symbol}: no bid available.")
+            return None
+        p = SELL_PAD_USD if pad is None else pad
+        limit_price = round(bid - p, 2)
         o = api.submit_order(
-            symbol=symbol,
-            side="sell",
-            type="market",
-            time_in_force="day",
-            qty=str(qty),
-            extended_hours=True
+            symbol=symbol, side="sell", type="limit",
+            time_in_force="day", qty=str(qty),
+            limit_price=str(limit_price), extended_hours=True
         )
-        log.info(f"[SELL-EXT/MKT] {symbol} qty={qty}")
+        log.info(f"[SELL-EXT/LMT] {symbol} qty={qty} limit={limit_price}")
         return o.id
     except Exception as e:
-        log.error(f"SELL extended market failed {symbol}: {e}")
+        log.error(f"SELL extended limit failed {symbol}: {e}")
         return None
 
 def place_trailing_stop_regular(symbol: str, qty: float) -> Optional[str]:
-    """Attach trailing stop in regular session only."""
     try:
         if TRAIL_PRICE > 0:
             o = api.submit_order(
@@ -371,11 +362,6 @@ def place_trailing_stop_regular(symbol: str, qty: float) -> Optional[str]:
         return None
 
 def try_attach_trailing_stop_if_allowed(symbol: str):
-    """
-    Attach trailing stop only if:
-    - we are in REGULAR session, and
-    - auto-sell is allowed by your pre-market rule
-    """
     if current_session_et() != "regular":
         log.info(f"[TRAIL SKIP] {symbol}: not regular session.")
         return
@@ -390,13 +376,48 @@ def try_attach_trailing_stop_if_allowed(symbol: str):
     except Exception as e:
         log.debug(f"attach trail skipped {symbol}: {e}")
 
+# --------- NEW: manual quick exit before open ----------
+def force_exit_pre(symbol: str, pad: float = None):
+    """Close long position in PRE by sending LIMIT at Bid - pad."""
+    try:
+        pos = api.get_position(symbol)
+        qty = float(pos.qty)
+        if qty <= 0:
+            log.info(f"[EXIT-PRE] {symbol}: no long qty.")
+            return None
+        bid = latest_bid(symbol)
+        if bid <= 0:
+            log.warning(f"[EXIT-PRE] {symbol}: no bid.")
+            return None
+        return place_limit_sell_extended(symbol, qty, ref_bid=bid, pad=pad)
+    except Exception as e:
+        log.error(f"[EXIT-PRE] {symbol} failed: {e}")
+        return None
+
+# --------- NEW: auto-fix market sells in PRE ----------
+def auto_fix_premarket_market_sells():
+    """If there are open SELL/MARKET orders during PRE, cancel and replace with LIMIT+extended."""
+    if current_session_et() != "pre":
+        return
+    try:
+        open_os = api.list_orders(status="open")
+        for o in open_os:
+            if o.side == "sell" and o.type == "market":
+                try:
+                    api.cancel_order(o.id)
+                    bid = latest_bid(o.symbol)
+                    qty = float(o.qty)
+                    place_limit_sell_extended(o.symbol, qty, ref_bid=bid)
+                    log.info(f"[AUTO-FIX] Replaced SELL/MARKET with SELL/LIMIT for {o.symbol}")
+                except Exception as e:
+                    log.warning(f"[AUTO-FIX] failed for {o.symbol}: {e}")
+    except Exception as e:
+        log.debug(f"[AUTO-FIX] list_orders failed: {e}")
+
 # =========================
 # Allocation helpers
 # =========================
 def get_buying_power_cash() -> float:
-    """
-    Prefer using cash; fallback to buying_power if needed.
-    """
     try:
         acct = api.get_account()
         cash = float(getattr(acct, "cash", "0") or 0)
@@ -431,21 +452,22 @@ def main_loop():
         f"trail_pct={TRAIL_PCT} trail_price={TRAIL_PRICE} "
         f"no_reentry_today={NO_REENTRY_TODAY} cooldown_min={COOLDOWN_MINUTES} "
         f"interval_s={INTERVAL_SECONDS} pre_slip_usd={PRE_SLIPPAGE_USD} "
-        f"allow_pre_auto_sell={ALLOW_PRE_AUTO_SELL}"
+        f"sell_pad_usd={SELL_PAD_USD} allow_pre_auto_sell={ALLOW_PRE_AUTO_SELL}"
     )
 
     log.info("Bot started.")
     while True:
         cycle_started = time.time()
         try:
-            # Only pre + regular; treat anything else as closed
             session = current_session_et()
             if session == "closed":
                 heartbeat("Out of allowed sessions (no trading) - sleeping")
             else:
                 heartbeat(f"Session={session} - cycle begin")
 
-                # Update sell logs + open orders snapshot
+                # NEW: fix any SELL/MARKET stuck during PRE
+                auto_fix_premarket_market_sells()
+
                 record_today_sells(api, SYMBOLS)
                 open_map = open_orders_map()
 
@@ -519,12 +541,9 @@ def main_loop():
                         if ext:
                             # PRE-MARKET: LIMIT only + lock sells (unless override)
                             buy_id = place_limit_buy_qty_premarket(sym, qty, ref_price=price)
-                            if buy_id:
-                                # Record lock so auto-sell is blocked until regular,
-                                # unless ALLOW_PRE_AUTO_SELL=True
-                                if not ALLOW_PRE_AUTO_SELL:
-                                    record_prebuy(sym)
-                                # DO NOT attach trailing in pre
+                            if buy_id and not ALLOW_PRE_AUTO_SELL:
+                                record_prebuy(sym)
+                            # no trailing during PRE
                         else:
                             # REGULAR: MARKET buy allowed, then attach trailing
                             buy_id = place_market_buy_qty_regular(sym, qty)
