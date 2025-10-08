@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo  # ET session detection
 from decimal import Decimal
+import uuid
 
 from alpaca_trade_api.rest import REST, TimeFrame, TimeFrameUnit
 
@@ -119,6 +120,14 @@ def can_trade_now() -> tuple[bool, bool]:
     if s == "regular":
         return True, False
     return False, False
+
+def near_regular_close_window() -> bool:
+    """نافذة حماية قبل الإغلاق: من 15:59:30 إلى 16:00:00 ET"""
+    now = datetime.now(ET)
+    from datetime import time as _t
+    start = _t(15, 59, 30)
+    end   = _t(16, 0, 0)
+    return start <= now.time() < end and now.weekday() < 5
 
 # =========================
 # Re-entry Registry
@@ -276,7 +285,9 @@ def can_open_new_long(symbol: str, states: Dict[str, bool]) -> Tuple[bool, str]:
 # =========================
 # Pre-Market lock (custom rule)
 # =========================
-PREMARKET_LOCK: Dict[str, str] = {}
+PREMARKET_LOCK: Dict[str, str] = {}           # symbol -> ISO date
+PRE_CLIENT_PREFIX = "PRE-"                    # لتعليم أوامر ما قبل الافتتاح
+PRE_EXT_ORDERS: Dict[str, bool] = {}          # order_id -> True (للغاء قبل after-hours)
 
 def record_prebuy(symbol: str):
     PREMARKET_LOCK[symbol.upper()] = datetime.now(ET).date().isoformat()
@@ -308,14 +319,48 @@ def should_allow_auto_sell(symbol: str) -> bool:
         return False
     return True
 
+def refresh_pre_ext_registry():
+    """أضف أي أوامر مفتوحة تبدأ بـ PRE- إلى السجل PRE_EXT_ORDERS"""
+    try:
+        for o in api.list_orders(status="open"):
+            cid = getattr(o, "client_order_id", "") or ""
+            if cid.startswith(PRE_CLIENT_PREFIX):
+                PRE_EXT_ORDERS[o.id] = True
+    except Exception:
+        pass
+
+def cancel_pre_ext_orders_before_afterhours():
+    """
+    قبل الإغلاق بثواني: الغِ أي أوامر PRE- (المعلّمة) لتجنب التنفيذ في After-Hours.
+    """
+    if not near_regular_close_window():
+        return
+    refresh_pre_ext_registry()
+    if not PRE_EXT_ORDERS:
+        return
+    try:
+        for oid in list(PRE_EXT_ORDERS.keys()):
+            try:
+                api.cancel_order(oid)
+                PRE_EXT_ORDERS.pop(oid, None)
+                log.info(f"[SAFETY] Canceled PRE order before after-hours: {oid}")
+            except Exception as e:
+                log.warning(f"[SAFETY] Cancel PRE order failed {oid}: {e}")
+    except Exception as e:
+        log.debug(f"[SAFETY] scan/cancel failed: {e}")
+
 # =========================
 # Orders
 # =========================
+def _make_client_id(prefix: str, symbol: str) -> str:
+    return f"{prefix}{symbol}-{uuid.uuid4().hex[:10]}"
+
 def place_market_buy_qty_regular(symbol: str, qty: int) -> Optional[str]:
     try:
         o = api.submit_order(
             symbol=symbol, side="buy", type="market",
-            time_in_force="day", qty=str(qty), extended_hours=False
+            time_in_force="day", qty=str(qty), extended_hours=False,
+            client_order_id=_make_client_id("REG-BUY-", symbol)
         )
         log.info(f"[BUY-REG/MKT] {symbol} qty={qty}")
         return o.id
@@ -328,8 +373,10 @@ def place_limit_buy_qty_premarket(symbol: str, qty: int, ref_price: float) -> Op
         limit_price = float(ref_price) + PRE_SLIPPAGE_USD
         o = api.submit_order(
             symbol=symbol, side="buy", type="limit", time_in_force="day",
-            qty=str(qty), limit_price=str(limit_price), extended_hours=True
+            qty=str(qty), limit_price=str(limit_price), extended_hours=True,
+            client_order_id=_make_client_id(PRE_CLIENT_PREFIX + "BUY-", symbol)
         )
+        PRE_EXT_ORDERS[o.id] = True
         log.info(f"[BUY-PRE/LMT] {symbol} qty={qty} limit={limit_price:.2f}")
         return o.id
     except Exception as e:
@@ -340,7 +387,7 @@ def place_limit_sell_extended(symbol: str, qty: float,
                               ref_bid: Optional[float] = None,
                               pad: Optional[float] = None) -> Optional[str]:
     """
-    Sell LIMIT in pre/after-hours at (reference - pad) with extended_hours=True.
+    Sell LIMIT in pre-market at (reference - pad) with extended_hours=True.
     Reference = Bid if available, otherwise fallback_price().
     """
     try:
@@ -354,8 +401,10 @@ def place_limit_sell_extended(symbol: str, qty: float,
         o = api.submit_order(
             symbol=symbol, side="sell", type="limit",
             time_in_force="day", qty=str(qty),
-            limit_price=str(limit_price), extended_hours=True
+            limit_price=str(limit_price), extended_hours=True,
+            client_order_id=_make_client_id(PRE_CLIENT_PREFIX + "SELL-", symbol)
         )
+        PRE_EXT_ORDERS[o.id] = True
         log.info(f"[SELL-EXT/LMT] {symbol} qty={qty} ref={ref} pad={p} limit={limit_price}")
         return o.id
     except Exception as e:
@@ -368,13 +417,13 @@ def place_trailing_stop_regular(symbol: str, qty: float) -> Optional[str]:
             o = api.submit_order(
                 symbol=symbol, side="sell", type="trailing_stop",
                 time_in_force="day", trail_price=str(TRAIL_PRICE), qty=str(qty),
-                extended_hours=False
+                extended_hours=False, client_order_id=_make_client_id("REG-TRAIL-", symbol)
             )
         else:
             o = api.submit_order(
                 symbol=symbol, side="sell", type="trailing_stop",
                 time_in_force="day", trail_percent=str(TRAIL_PCT), qty=str(qty),
-                extended_hours=False
+                extended_hours=False, client_order_id=_make_client_id("REG-TRAIL-", symbol)
             )
         log.info(f"[TRAIL-REG] {symbol} qty={qty}")
         return o.id
@@ -480,13 +529,16 @@ def main_loop():
             else:
                 heartbeat(f"Session={session} - cycle begin")
 
-                # Fix any SELL/MARKET stuck during PRE
+                # 0) حماية: الغاء أوامر PRE قبل after-hours
+                cancel_pre_ext_orders_before_afterhours()
+
+                # 1) إصلاح أي SELL/MARKET أثناء pre
                 auto_fix_premarket_market_sells()
 
                 record_today_sells(api, SYMBOLS)
                 open_map = open_orders_map()
 
-                # ==== 1) compute momentum and pick best K ====
+                # ==== 2) compute momentum and pick best K ====
                 candidates = []  # (symbol, momentum, price)
                 for symbol in SYMBOLS:
                     mom = momentum_for_last_min(symbol)
@@ -520,7 +572,7 @@ def main_loop():
                 candidates.sort(key=lambda x: x[1], reverse=True)
                 best = [c[0] for c in candidates[:TOP_K]]
 
-                # ==== 2) capacity ====
+                # ==== 3) capacity ====
                 currently_open_syms = set(list_open_positions_symbols())
                 open_count = len(currently_open_syms)
                 slots_left = max(0, min(MAX_OPEN_POSITIONS, TOP_K) - open_count)
@@ -528,7 +580,7 @@ def main_loop():
 
                 log.info(f"BEST={best} | open={list(currently_open_syms)} | to_open={symbols_to_open} | slots_left={slots_left}")
 
-                # ==== 3) per-position budget ====
+                # ==== 4) per-position budget ====
                 if symbols_to_open:
                     if ALLOCATE_FROM_CASH:
                         cash_or_bp = get_buying_power_cash()
@@ -538,7 +590,7 @@ def main_loop():
 
                     log.info(f"Per-position budget ≈ ${per_budget:.2f}")
 
-                    # ==== 4) execute buys + attach trailing ====
+                    # ==== 5) execute buys + attach trailing ====
                     for sym in symbols_to_open:
                         cancel_symbol_open_orders(sym)  # safety
                         qty = compute_qty_for_budget(sym, per_budget)
