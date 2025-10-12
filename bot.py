@@ -152,17 +152,40 @@ def record_today_sells(api: REST, symbols: List[str]) -> None:
         except Exception:
             continue
 
+# NEW: helper to check "was the sell premarket?"
+def _was_sell_premarket(ts: datetime) -> bool:
+    """Return True if the sell timestamp (any tz) occurred before REG open (09:30 ET)."""
+    from datetime import time as _t
+    ts_et = ts.astimezone(ET)
+    return ts_et.weekday() < 5 and ts_et.time() < _t(9, 30)
+
+# NEW: helper to know if we are already at/after regular open
+def _is_after_or_at_regular_open_now() -> bool:
+    from datetime import time as _t
+    now_et = datetime.now(ET)
+    return now_et.weekday() < 5 and now_et.time() >= _t(9, 30)
+
 def sold_today(symbol: str) -> bool:
     if not NO_REENTRY_TODAY:
         return False
     ts = sold_registry.get(symbol)
-    return bool(ts and ts.date() == utc_today())
+    if not ts or ts.date() != utc_today():
+        return False
+    # NEW: allow re-entry after market open if the SELL happened premarket
+    if _is_after_or_at_regular_open_now() and _was_sell_premarket(ts):
+        return False
+    return True
 
 def in_cooldown(symbol: str) -> bool:
     if COOLDOWN_MINUTES <= 0:
         return False
     ts = sold_registry.get(symbol)
-    return bool(ts and utc_now() < ts + timedelta(minutes=COOLDOWN_MINUTES))
+    if not ts:
+        return False
+    # NEW: bypass cooldown at/after regular open if the prior sell was premarket
+    if _is_after_or_at_regular_open_now() and _was_sell_premarket(ts):
+        return False
+    return bool(utc_now() < ts + timedelta(minutes=COOLDOWN_MINUTES))
 
 # =========================
 # Market / Orders helpers
@@ -461,22 +484,71 @@ def force_exit_pre(symbol: str, pad: float = None):
         return None
 
 # --------- Auto-fix market sells in PRE ----------
-def auto_fix_premarket_market_sells():
-    """If there are open SELL/MARKET orders during PRE, cancel and replace with LIMIT+extended."""
+# NEW: تسريع إصلاح البيع أثناء PRE + حماية من التكرار
+_LAST_FIXED_AT: Dict[str, float] = {}  # order_id -> epoch seconds
+
+def _should_fix_sell_in_pre(order) -> bool:
+    """Return True if SELL order needs conversion to LIMIT+extended during PRE."""
+    try:
+        if order.side != "sell":
+            return False
+        typ = (order.type or "").lower()
+        ext = bool(getattr(order, "extended_hours", False))
+        # نحتاج إصلاح إذا كان ماركت أو غير ممتد أثناء PRE
+        return (typ == "market") or (not ext)
+    except Exception:
+        return False
+
+def auto_fix_premarket_market_sells(pulses: int = 3, pulse_sleep: float = 0.35):
+    """
+    أثناء PRE: أي SELL ماركت أو SELL بدون extended_hours → إلغاء فوري + استبدال LIMIT+extended.
+    نعمل نبضات صغيرة في نفس الدورة لتقليل التأخير إلى أقل من ثانية مع Debounce بسيط.
+    """
     if current_session_et() != "pre":
         return
-    try:
-        for o in api.list_orders(status="open"):
-            if o.side == "sell" and o.type == "market":
+
+    for _ in range(max(1, pulses)):
+        try:
+            orders = api.list_orders(status="open")
+            now = time.time()
+
+            for o in orders:
+                if not _should_fix_sell_in_pre(o):
+                    continue
+
+                # Debounce: لا نحاول إصلاح نفس الـ order أكثر من مرة خلال 2 ثانية
+                last = _LAST_FIXED_AT.get(o.id, 0.0)
+                if now - last < 2.0:
+                    continue
+
+                # إلغاء ثم استبدال LIMIT+extended
                 try:
                     api.cancel_order(o.id)
-                    qty = float(Decimal(str(o.qty)))  # handle string qty
-                    place_limit_sell_extended(o.symbol, qty)
-                    log.info(f"[AUTO-FIX] Replaced SELL/MARKET with SELL/LIMIT for {o.symbol}")
                 except Exception as e:
-                    log.warning(f"[AUTO-FIX] failed for {o.symbol}: {e}")
-    except Exception as e:
-        log.debug(f"[AUTO-FIX] list_orders failed: {e}")
+                    log.warning(f"[AUTO-FIX] cancel failed {o.symbol}: {e}")
+                    _LAST_FIXED_AT[o.id] = now
+                    continue
+
+                try:
+                    qty = float(Decimal(str(o.qty)))
+                except Exception:
+                    log.warning(f"[AUTO-FIX] bad qty for {o.symbol}")
+                    _LAST_FIXED_AT[o.id] = now
+                    continue
+
+                try:
+                    place_limit_sell_extended(o.symbol, qty)
+                    log.info(f"[AUTO-FIX] SELL -> LIMIT+extended for {o.symbol}")
+                except Exception as e:
+                    log.warning(f"[AUTO-FIX] replace failed {o.symbol}: {e}")
+
+                _LAST_FIXED_AT[o.id] = now
+
+        except Exception as e:
+            log.debug(f"[AUTO-FIX] list_orders failed: {e}")
+
+        # نبضة الانتظار الصغيرة بين الفحوصات داخل نفس الدورة
+        time.sleep(max(0.0, pulse_sleep))
 
 # =========================
 # Allocation helpers
@@ -529,11 +601,14 @@ def main_loop():
             else:
                 heartbeat(f"Session={session} - cycle begin")
 
+                # NEW: نبضة إصلاح فورية في بداية الدورة
+                auto_fix_premarket_market_sells()  # CHG: call early
+
                 # 0) حماية: الغاء أوامر PRE قبل after-hours
                 cancel_pre_ext_orders_before_afterhours()
 
-                # 1) إصلاح أي SELL/MARKET أثناء pre
-                auto_fix_premarket_market_sells()
+                # 1) (الإصدار العادي كان هنا) — أبقيناه وناديْنا أيضًا بالأعلى
+                auto_fix_premarket_market_sells()  # CHG: keep another pulse mid-cycle
 
                 record_today_sells(api, SYMBOLS)
                 open_map = open_orders_map()
@@ -620,6 +695,9 @@ def main_loop():
 
                 # Re-scan sells registry after actions
                 record_today_sells(api, SYMBOLS)
+
+                # NEW: نبضة أخيرة قبل النوم تلتقط أي أمر بيع ظهر خلال الدورة
+                auto_fix_premarket_market_sells()  # CHG: final pulse
 
                 elapsed = time.time() - cycle_started
                 log.info(f"🫀 Cycle done in {elapsed:.2f}s")
