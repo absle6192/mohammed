@@ -3,7 +3,7 @@ import time
 import math
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo  # ET session detection
 from decimal import Decimal
@@ -34,8 +34,8 @@ SYMBOLS: List[str] = [s.strip().upper() for s in os.getenv(
 
 # -------- Entry & Protection --------
 MOMENTUM_THRESHOLD = float(os.getenv("MOMENTUM_THRESHOLD", "0.00005"))
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
-TOP_K = int(os.getenv("TOP_K", "2"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "2"))  # يُطبّق بعد الافتتاح فقط
+TOP_K = int(os.getenv("TOP_K", "2"))                             # أفضل سهمين بعد الافتتاح
 
 # Allocation
 ALLOCATE_FROM_CASH = os.getenv("ALLOCATE_FROM_CASH", "true").lower() == "true"
@@ -130,10 +130,27 @@ def near_regular_close_window() -> bool:
     return start <= now.time() < end and now.weekday() < 5
 
 # =========================
-# Re-entry Registry
+# Daily registries (NEW)
 # =========================
-sold_registry: Dict[str, datetime] = {}
+DAY_KEY: Optional[datetime.date] = None
+PRE_BUY_SYMS: Set[str] = set()          # رموز تم شراؤها مرة واحدة في الـpre اليوم
+sold_registry: Dict[str, datetime] = {} # موجود سابقًا لكن ننظفه يوميًا أيضًا
 
+def _reset_daily_if_needed():
+    """إعادة ضبط سجلات اليوم عند تغيّر التاريخ (ET)."""
+    global DAY_KEY, PRE_BUY_SYMS, sold_registry
+    today = datetime.now(ET).date()
+    if DAY_KEY != today:
+        DAY_KEY = today
+        PRE_BUY_SYMS.clear()
+        sold_registry.clear()
+        PREMARKET_LOCK.clear()
+        PRE_EXT_ORDERS.clear()
+        log.info("🔄 Daily registries reset.")
+
+# =========================
+# Re-entry Registry (existing helpers + minor keep)
+# =========================
 def record_today_sells(api: REST, symbols: List[str]) -> None:
     try:
         closed = api.list_orders(status="closed", limit=200, direction="desc")
@@ -152,14 +169,11 @@ def record_today_sells(api: REST, symbols: List[str]) -> None:
         except Exception:
             continue
 
-# NEW: helper to check "was the sell premarket?"
 def _was_sell_premarket(ts: datetime) -> bool:
-    """Return True if the sell timestamp (any tz) occurred before REG open (09:30 ET)."""
     from datetime import time as _t
     ts_et = ts.astimezone(ET)
     return ts_et.weekday() < 5 and ts_et.time() < _t(9, 30)
 
-# NEW: helper to know if we are already at/after regular open
 def _is_after_or_at_regular_open_now() -> bool:
     from datetime import time as _t
     now_et = datetime.now(ET)
@@ -171,7 +185,7 @@ def sold_today(symbol: str) -> bool:
     ts = sold_registry.get(symbol)
     if not ts or ts.date() != utc_today():
         return False
-    # NEW: allow re-entry after market open if the SELL happened premarket
+    # allow re-entry after market open if the SELL happened premarket
     if _is_after_or_at_regular_open_now() and _was_sell_premarket(ts):
         return False
     return True
@@ -182,7 +196,7 @@ def in_cooldown(symbol: str) -> bool:
     ts = sold_registry.get(symbol)
     if not ts:
         return False
-    # NEW: bypass cooldown at/after regular open if the prior sell was premarket
+    # bypass cooldown at/after regular open if the prior sell was premarket
     if _is_after_or_at_regular_open_now() and _was_sell_premarket(ts):
         return False
     return bool(utc_now() < ts + timedelta(minutes=COOLDOWN_MINUTES))
@@ -206,11 +220,6 @@ def latest_bid(symbol: str) -> float:
         return 0.0
 
 def fallback_price(symbol: str) -> float:
-    """
-    Fallback when Bid is missing in pre-market:
-    1) last trade
-    2) last 1m close
-    """
     p = last_trade_price(symbol)
     if p and p > 0:
         return p
@@ -289,6 +298,7 @@ def guard_states(symbol: str, open_orders: Dict[str, bool]) -> Dict[str, bool]:
         "has_open_order": open_orders.get(symbol, False),
         "sold_today": sold_today(symbol),
         "cooldown": in_cooldown(symbol),
+        # سنستخدم حدّ المراكز فقط بعد الافتتاح، لذلك الإخبار هنا معلوماتي
         "max_positions_reached": count_open_positions() >= MAX_OPEN_POSITIONS
     }
 
@@ -301,12 +311,10 @@ def can_open_new_long(symbol: str, states: Dict[str, bool]) -> Tuple[bool, str]:
         return False, "no-reentry-today"
     if states["cooldown"]:
         return False, "in cooldown"
-    if states["max_positions_reached"]:
-        return False, "max positions reached"
     return True, ""
 
 # =========================
-# Pre-Market lock (custom rule)
+# Pre-Market lock (existing)
 # =========================
 PREMARKET_LOCK: Dict[str, str] = {}           # symbol -> ISO date
 PRE_CLIENT_PREFIX = "PRE-"                    # لتعليم أوامر ما قبل الافتتاح
@@ -314,6 +322,7 @@ PRE_EXT_ORDERS: Dict[str, bool] = {}          # order_id -> True (للغاء ق�
 
 def record_prebuy(symbol: str):
     PREMARKET_LOCK[symbol.upper()] = datetime.now(ET).date().isoformat()
+    PRE_BUY_SYMS.add(symbol.upper())  # NEW: لا تشتريه مرة ثانية في الـpre اليوم
 
 def clear_lock_if_no_position(symbol: str):
     sym = symbol.upper()
@@ -325,14 +334,6 @@ def clear_lock_if_no_position(symbol: str):
         PREMARKET_LOCK.pop(sym, None)
 
 def should_allow_auto_sell(symbol: str) -> bool:
-    """
-    Deny auto-sell if:
-    - symbol is locked due to a pre-market buy
-    - and current session is still 'pre'
-    Allow sell if:
-    - session is 'regular' OR symbol not locked OR no position anymore
-    - OR ALLOW_PRE_AUTO_SELL=True (override)
-    """
     sym = symbol.upper()
     clear_lock_if_no_position(sym)
     session = current_session_et()
@@ -343,7 +344,6 @@ def should_allow_auto_sell(symbol: str) -> bool:
     return True
 
 def refresh_pre_ext_registry():
-    """أضف أي أوامر مفتوحة تبدأ بـ PRE- إلى السجل PRE_EXT_ORDERS"""
     try:
         for o in api.list_orders(status="open"):
             cid = getattr(o, "client_order_id", "") or ""
@@ -353,9 +353,6 @@ def refresh_pre_ext_registry():
         pass
 
 def cancel_pre_ext_orders_before_afterhours():
-    """
-    قبل الإغلاق بثواني: الغِ أي أوامر PRE- (المعلّمة) لتجنب التنفيذ في After-Hours.
-    """
     if not near_regular_close_window():
         return
     refresh_pre_ext_registry()
@@ -409,10 +406,6 @@ def place_limit_buy_qty_premarket(symbol: str, qty: int, ref_price: float) -> Op
 def place_limit_sell_extended(symbol: str, qty: float,
                               ref_bid: Optional[float] = None,
                               pad: Optional[float] = None) -> Optional[str]:
-    """
-    Sell LIMIT in pre-market at (reference - pad) with extended_hours=True.
-    Reference = Bid if available, otherwise fallback_price().
-    """
     try:
         bid = ref_bid if (ref_bid is not None and ref_bid > 0) else latest_bid(symbol)
         ref = bid if bid > 0 else fallback_price(symbol)
@@ -471,7 +464,6 @@ def try_attach_trailing_stop_if_allowed(symbol: str):
 
 # --------- Manual quick exit before open ----------
 def force_exit_pre(symbol: str, pad: float = None):
-    """Close long position in PRE by sending LIMIT at (Bid or fallback) - pad."""
     try:
         pos = api.get_position(symbol)
         qty = float(pos.qty)
@@ -484,70 +476,51 @@ def force_exit_pre(symbol: str, pad: float = None):
         return None
 
 # --------- Auto-fix market sells in PRE ----------
-# NEW: تسريع إصلاح البيع أثناء PRE + حماية من التكرار
 _LAST_FIXED_AT: Dict[str, float] = {}  # order_id -> epoch seconds
 
 def _should_fix_sell_in_pre(order) -> bool:
-    """Return True if SELL order needs conversion to LIMIT+extended during PRE."""
     try:
         if order.side != "sell":
             return False
         typ = (order.type or "").lower()
         ext = bool(getattr(order, "extended_hours", False))
-        # نحتاج إصلاح إذا كان ماركت أو غير ممتد أثناء PRE
         return (typ == "market") or (not ext)
     except Exception:
         return False
 
 def auto_fix_premarket_market_sells(pulses: int = 3, pulse_sleep: float = 0.35):
-    """
-    أثناء PRE: أي SELL ماركت أو SELL بدون extended_hours → إلغاء فوري + استبدال LIMIT+extended.
-    نعمل نبضات صغيرة في نفس الدورة لتقليل التأخير إلى أقل من ثانية مع Debounce بسيط.
-    """
     if current_session_et() != "pre":
         return
-
     for _ in range(max(1, pulses)):
         try:
             orders = api.list_orders(status="open")
             now = time.time()
-
             for o in orders:
                 if not _should_fix_sell_in_pre(o):
                     continue
-
-                # Debounce: لا نحاول إصلاح نفس الـ order أكثر من مرة خلال 2 ثانية
                 last = _LAST_FIXED_AT.get(o.id, 0.0)
                 if now - last < 2.0:
                     continue
-
-                # إلغاء ثم استبدال LIMIT+extended
                 try:
                     api.cancel_order(o.id)
                 except Exception as e:
                     log.warning(f"[AUTO-FIX] cancel failed {o.symbol}: {e}")
                     _LAST_FIXED_AT[o.id] = now
                     continue
-
                 try:
                     qty = float(Decimal(str(o.qty)))
                 except Exception:
                     log.warning(f"[AUTO-FIX] bad qty for {o.symbol}")
                     _LAST_FIXED_AT[o.id] = now
                     continue
-
                 try:
                     place_limit_sell_extended(o.symbol, qty)
                     log.info(f"[AUTO-FIX] SELL -> LIMIT+extended for {o.symbol}")
                 except Exception as e:
                     log.warning(f"[AUTO-FIX] replace failed {o.symbol}: {e}")
-
                 _LAST_FIXED_AT[o.id] = now
-
         except Exception as e:
             log.debug(f"[AUTO-FIX] list_orders failed: {e}")
-
-        # نبضة الانتظار الصغيرة بين الفحوصات داخل نفس الدورة
         time.sleep(max(0.0, pulse_sleep))
 
 # =========================
@@ -595,25 +568,27 @@ def main_loop():
     while True:
         cycle_started = time.time()
         try:
+            _reset_daily_if_needed()
+
             session = current_session_et()
             if session == "closed":
                 heartbeat("Out of allowed sessions (no trading) - sleeping")
             else:
                 heartbeat(f"Session={session} - cycle begin")
 
-                # NEW: نبضة إصلاح فورية في بداية الدورة
-                auto_fix_premarket_market_sells()  # CHG: call early
+                # إصلاح سريع لأوامر بيع الـpre
+                auto_fix_premarket_market_sells()
 
-                # 0) حماية: الغاء أوامر PRE قبل after-hours
+                # حماية: الغاء أوامر PRE قبل after-hours
                 cancel_pre_ext_orders_before_afterhours()
 
-                # 1) (الإصدار العادي كان هنا) — أبقيناه وناديْنا أيضًا بالأعلى
-                auto_fix_premarket_market_sells()  # CHG: keep another pulse mid-cycle
+                # نبضة ثانية للإصلاح
+                auto_fix_premarket_market_sells()
 
                 record_today_sells(api, SYMBOLS)
                 open_map = open_orders_map()
 
-                # ==== 2) compute momentum and pick best K ====
+                # ==== 2) compute momentum ====
                 candidates = []  # (symbol, momentum, price)
                 for symbol in SYMBOLS:
                     mom = momentum_for_last_min(symbol)
@@ -644,16 +619,30 @@ def main_loop():
 
                     candidates.append((symbol, mom, price))
 
+                # ترتيب حسب الزخم الأعلى
                 candidates.sort(key=lambda x: x[1], reverse=True)
-                best = [c[0] for c in candidates[:TOP_K]]
 
-                # ==== 3) capacity ====
+                # ==== 3) اختيار المرشحين وفق الجلسة ====
                 currently_open_syms = set(list_open_positions_symbols())
-                open_count = len(currently_open_syms)
-                slots_left = max(0, min(MAX_OPEN_POSITIONS, TOP_K) - open_count)
-                symbols_to_open = [s for s in best if s not in currently_open_syms][:slots_left]
 
-                log.info(f"BEST={best} | open={list(currently_open_syms)} | to_open={symbols_to_open} | slots_left={slots_left}")
+                if session == "pre":
+                    # قبل الافتتاح: اشترِ كل المرشحين (مرّة واحدة فقط لكل رمز في الـpre)
+                    best_list = [c[0] for c in candidates]  # بدون قطع TOP_K
+                    # استبعد ما تم شراؤه في الـpre مسبقًا اليوم، وما عليه مركز/أمر مفتوح
+                    symbols_to_open = [
+                        s for s in best_list
+                        if (s not in PRE_BUY_SYMS) and (s not in currently_open_syms) and (s not in open_map)
+                    ]
+                    # لا نطبق MAX_OPEN_POSITIONS في الـpre حسب طلبك
+                    slots_left = len(symbols_to_open)
+                else:
+                    # بعد الافتتاح: التزم بأفضل سهمين فقط، وبحد مراكز متزامنة
+                    best_list = [c[0] for c in candidates[:TOP_K]]
+                    open_count = len(currently_open_syms)
+                    slots_left = max(0, min(MAX_OPEN_POSITIONS, TOP_K) - open_count)
+                    symbols_to_open = [s for s in best_list if s not in currently_open_syms][:slots_left]
+
+                log.info(f"BEST={best_list} | open={list(currently_open_syms)} | to_open={symbols_to_open} | slots_left={slots_left}")
 
                 # ==== 4) per-position budget ====
                 if symbols_to_open:
@@ -681,23 +670,23 @@ def main_loop():
                             continue
 
                         if ext:
-                            # PRE-MARKET: LIMIT only + lock sells (unless override)
+                            # PRE-MARKET: LIMIT only + سجل أن هذا الرمز تم شراؤه في الـpre اليوم
                             buy_id = place_limit_buy_qty_premarket(sym, qty, ref_price=price)
-                            if buy_id and not ALLOW_PRE_AUTO_SELL:
-                                record_prebuy(sym)
-                            # no trailing during PRE
+                            if buy_id:
+                                record_prebuy(sym)   # يمنع إعادة شراء نفس الرمز في الـpre
+                            # لا نرفق trailing في الـpre
                         else:
-                            # REGULAR: MARKET buy allowed, then attach trailing
+                            # REGULAR: MARKET buy allowed, ثم trailing
                             buy_id = place_market_buy_qty_regular(sym, qty)
                             if buy_id:
                                 time.sleep(1.5)
                                 try_attach_trailing_stop_if_allowed(sym)
 
-                # Re-scan sells registry after actions
+                # تحديث سجلات البيع
                 record_today_sells(api, SYMBOLS)
 
-                # NEW: نبضة أخيرة قبل النوم تلتقط أي أمر بيع ظهر خلال الدورة
-                auto_fix_premarket_market_sells()  # CHG: final pulse
+                # نبضة أخيرة قبل النوم تلتقط أي أمر بيع ظهر خلال الدورة
+                auto_fix_premarket_market_sells()
 
                 elapsed = time.time() - cycle_started
                 log.info(f"🫀 Cycle done in {elapsed:.2f}s")
