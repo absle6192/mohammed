@@ -4,7 +4,7 @@ import logging
 from typing import Dict, List, Optional, Tuple, Set
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 import uuid
 
 from alpaca_trade_api.rest import REST, TimeFrame, TimeFrameUnit
@@ -63,6 +63,19 @@ if not API_KEY or not API_SECRET:
     raise SystemExit(1)
 
 api = REST(API_KEY, API_SECRET, BASE_URL)
+
+# =========================
+# Price tick normalization (fix sub-penny)
+# =========================
+def normalize_price(x: float) -> float:
+    """
+    Conform to US equity tick rules so Alpaca won't reject:
+    - price >= $1.00  -> 2 decimals (0.01)
+    - price <  $1.00  -> 4 decimals (0.0001)
+    """
+    d = Decimal(str(x))
+    tick = Decimal('0.0001') if d < Decimal('1') else Decimal('0.01')
+    return float(d.quantize(tick, rounding=ROUND_HALF_UP))
 
 # =========================
 # Time helpers & Sessions
@@ -400,14 +413,15 @@ def place_market_buy_qty_regular(symbol: str, qty: int) -> Optional[str]:
 
 def place_limit_buy_qty_premarket(symbol: str, qty: int, ref_price: float) -> Optional[str]:
     try:
-        limit_price = float(ref_price) + PRE_SLIPPAGE_USD
+        # normalize to avoid sub-penny rejection
+        limit_price = normalize_price(float(ref_price) + PRE_SLIPPAGE_USD)
         o = api.submit_order(
             symbol=symbol, side="buy", type="limit", time_in_force="day",
             qty=str(qty), limit_price=str(limit_price), extended_hours=True,
             client_order_id=_make_client_id(PRE_CLIENT_PREFIX + "BUY-", symbol)
         )
         PRE_EXT_ORDERS[o.id] = True
-        log.info(f"[BUY-PRE/LMT] {symbol} qty={qty} limit={limit_price:.2f}")
+        log.info(f"[BUY-PRE/LMT] {symbol} qty={qty} limit={limit_price}")
         return o.id
     except Exception as e:
         log.error(f"BUY pre-market limit failed {symbol}: {e}")
@@ -423,7 +437,7 @@ def place_limit_sell_extended(symbol: str, qty: float,
             log.warning(f"[SELL-PRE] {symbol}: no bid/trade price available.")
             return None
         p = SELL_PAD_USD if pad is None else pad
-        limit_price = round(max(ref - p, 0.01), 2)
+        limit_price = normalize_price(max(ref - p, 0.01))
         o = api.submit_order(
             symbol=symbol, side="sell", type="limit",
             time_in_force="day", qty=str(qty),
