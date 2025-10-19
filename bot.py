@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple, Set
 from datetime import datetime, timedelta, timezone, time as _t
 from zoneinfo import ZoneInfo
 from decimal import Decimal, ROUND_HALF_UP
+import re  # ← NEW: للبحث في العناوين
 
 from alpaca_trade_api.rest import REST, TimeFrame, TimeFrameUnit
 
@@ -65,6 +66,77 @@ if not API_KEY or not API_SECRET:
 
 api = REST(API_KEY, API_SECRET, BASE_URL)
 
+# ============ NEWS FILTER (Alpaca API) ============
+# إعدادات الأخبار (ثابتة داخل الكود)
+ENABLE_NEWS = True               # تشغيل الأخبار دائمًا
+NEWS_LOOKBACK_MIN = 120          # يبحث في آخر 120 دقيقة
+NEWS_BLOCK_NEG = True            # يمنع الشراء إذا في خبر سلبي قوي
+NEWS_POS_BOOST = 0.5             # يعطي دفعة إضافية للأسهم ذات الأخبار الإيجابية
+
+# كلمات البحث في العناوين/الملخص
+POS_WORDS = re.compile(r"(upgrade|beat|record|raise|strong|profit|growth|launch|partnership|contract|approval)", re.I)
+NEG_WORDS = re.compile(r"(downgrade|miss|cut|lawsuit|investigation|recall|halt|guidance\s*cut|probe|data breach)", re.I)
+
+ET = ZoneInfo("America/New_York")  # (أعلنا ET هنا مبكرًا ليستعمله قسم الأخبار)
+
+def _fmt_et(ts: Optional[datetime]) -> str:
+    try:
+        if ts is None:
+            return "-"
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts.astimezone(ET).strftime("%H:%M ET")
+    except Exception:
+        return "-"
+
+def get_news_sentiment(symbol: str) -> int:
+    """
+    ترجع درجة -1..+1 مع طباعة تفاصيل الأخبار:
+    - المصدر + الوقت (ET) + العنوان + الدرجة الجزئية
+    ويُعاد مجموع الدرجات محصورًا بين -1 و +1.
+    """
+    try:
+        end_utc = datetime.utcnow()
+        start_utc = end_utc - timedelta(minutes=NEWS_LOOKBACK_MIN)
+        news = api.get_news(
+            symbols=symbol,
+            start=start_utc.isoformat() + "Z",
+            end=end_utc.isoformat() + "Z",
+            limit=3
+        )
+
+        total = 0
+        items = []
+        for n in news:
+            headline = (getattr(n, "headline", "") or "").strip()
+            summary  = (getattr(n, "summary", "") or "").strip()
+            source   = (getattr(n, "source", "") or "").strip() or "-"
+            created  = getattr(n, "created_at", None)
+
+            text = f"{headline} {summary}"
+            local = 0
+            if POS_WORDS.search(text): local += 1
+            if NEG_WORDS.search(text): local -= 1
+            local = max(-1, min(1, local))
+            total += local
+
+            items.append((source, _fmt_et(created), headline[:120], local))
+
+        # طباعة اللوق
+        if items:
+            log.info(f"[NEWS] {symbol}: last {len(items)} items → total_score={total}")
+            for src, t_et, head, sc in items:
+                sign = "🟢" if sc > 0 else ("🔴" if sc < 0 else "⚪")
+                log.info(f"     {sign} [{src} | {t_et}] {head} (score={sc})")
+        else:
+            log.info(f"[NEWS] {symbol}: no recent news in last {NEWS_LOOKBACK_MIN}min")
+
+        return max(-1, min(1, total))
+
+    except Exception as e:
+        log.warning(f"[NEWS] {symbol}: news fetch failed ({e})")
+        return 0
+
 # =========================
 # Price tick normalization (fix sub-penny)
 # =========================
@@ -76,8 +148,6 @@ def normalize_price(x: float) -> float:
 # =========================
 # Time helpers & Sessions
 # =========================
-ET = ZoneInfo("America/New_York")
-
 def utc_now():
     return datetime.now(timezone.utc)
 
@@ -586,7 +656,9 @@ def main_loop():
         f"trail_pct={TRAIL_PCT} trail_price={TRAIL_PRICE} "
         f"no_reentry_today={NO_REENTRY_TODAY} cooldown_min={COOLDOWN_MINUTES} "
         f"interval_s={INTERVAL_SECONDS} pre_slip_usd={PRE_SLIPPAGE_USD} "
-        f"sell_pad_usd={SELL_PAD_USD} allow_pre_auto_sell={ALLOW_PRE_AUTO_SELL}"
+        f"sell_pad_usd={SELL_PAD_USD} allow_pre_auto_sell={ALLOW_PRE_AUTO_SELL} "
+        f"news_enabled={ENABLE_NEWS} news_block_neg={NEWS_BLOCK_NEG} news_boost={NEWS_POS_BOOST} "
+        f"news_lookback_min={NEWS_LOOKBACK_MIN}"
     )
 
     log.info("Bot started.")
@@ -613,33 +685,44 @@ def main_loop():
                 open_map = open_orders_map()
 
                 # ==== 1) حساب الزخم ====
-                candidates = []  # (symbol, momentum, price)
+                candidates = []  # (symbol, momentum_adj, last_price)
                 for symbol in SYMBOLS:
                     mom = momentum_for_last_min(symbol)
                     if mom is None:
                         log.info(f"{symbol}: ❌ no bar data / bad open; skip")
                         continue
 
+                    # ---- News Sentiment (adjust momentum) ----
+                    mom_adj = mom
+                    if ENABLE_NEWS:
+                        news_score = get_news_sentiment(symbol)
+                        if news_score < 0 and NEWS_BLOCK_NEG:
+                            log.info(f"{symbol}: ❌ Negative news detected, skip.")
+                            continue
+                        mom_adj = mom + news_score * NEWS_POS_BOOST
+                        log.info(f"{symbol}: mom={mom:.5f} → mom_adj={mom_adj:.5f} (thr={MOMENTUM_THRESHOLD})")
+                    else:
+                        log.info(f"{symbol}: mom={mom:.5f} thr={MOMENTUM_THRESHOLD}")
+
                     states = guard_states(symbol, open_map)
                     allowed, _ = can_open_new_long(symbol, states)
 
                     log.info(
-                        f"{symbol}: mom={mom:.5f} thr={MOMENTUM_THRESHOLD} | "
-                        f"guards: pos={states['has_pos']}, "
+                        f"{symbol}: guards: pos={states['has_pos']}, "
                         f"open_order={states['has_open_order']}, "
                         f"sold_pre_today={states['sold_pre_today']}, "
                         f"sold_regular_today={states['sold_regular_today']}, "
                         f"cooldown={states['cooldown']}"
                     )
 
-                    if mom < MOMENTUM_THRESHOLD or not allowed:
+                    if mom_adj < MOMENTUM_THRESHOLD or not allowed:
                         continue
 
                     price = last_trade_price(symbol)
                     if not price or price <= 0:
                         continue
 
-                    candidates.append((symbol, mom, price))
+                    candidates.append((symbol, mom_adj, price))
 
                 candidates.sort(key=lambda x: x[1], reverse=True)
 
