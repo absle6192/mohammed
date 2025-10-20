@@ -64,6 +64,17 @@ if not API_KEY or not API_SECRET:
 
 api = REST(API_KEY, API_SECRET, BASE_URL)
 
+# ===== DEBUG: فحص القيم والاتصال بالحساب =====
+def _mask(s: str):
+    return "(empty)" if not s else f"{s[:3]}***{s[-3:]}"
+log.info(f"🔧 BASE_URL={BASE_URL} | KEY={_mask(API_KEY)}")
+try:
+    acct = api.get_account()
+    log.info(f"🪪 account status ok, buying_power={getattr(acct, 'buying_power', None)}")
+except Exception as e:
+    log.error(f"account check failed: {e}")
+# ===== نهاية الفحص =====
+
 # =========================
 # Time helpers & Sessions
 # =========================
@@ -450,7 +461,7 @@ def main_loop():
         f"thr={MOMENTUM_THRESHOLD} max_pos={MAX_OPEN_POSITIONS} top_k={TOP_K} "
         f"allocate_from_cash={ALLOCATE_FROM_CASH} "
         f"trail_pct={TRAIL_PCT} trail_price={TRAIL_PRICE} "
-        f"no_reentry_today={NO_REENTRY_TODAY} cooldown_min={COOLDOWN_MINUTES} "
+        f"no_reentry_today={NO_REENTRY_TODAY} cooldown_minutes={COOLDOWN_MINUTES} "
         f"interval_s={INTERVAL_SECONDS} pre_slip_usd={PRE_SLIPPAGE_USD} "
         f"sell_pad_usd={SELL_PAD_USD} allow_pre_auto_sell={ALLOW_PRE_AUTO_SELL}"
     )
