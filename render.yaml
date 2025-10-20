@@ -1,7 +1,19 @@
 services:
+  - type: web
+    name: trading-web
+    env: python
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: "10000"
+
   - type: worker
     name: trading-bot
     env: python
-    plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python bot.py"
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u bot.py
+    autoDeploy: true
