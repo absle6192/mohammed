@@ -99,7 +99,7 @@ def get_news_sentiment(symbol: str) -> int:
         end_utc = datetime.utcnow()
         start_utc = end_utc - timedelta(minutes=NEWS_LOOKBACK_MIN)
 
-        # ✅ استخدام 'symbol' مع fallback إلى 'symbols' لتوافق الإصدارات
+        # ✅ نجرب 'symbol' أولاً؛ وإن فشل لأي سبب، نعمل fallback إلى 'symbols'
         try:
             news = api.get_news(
                 symbol=symbol,
@@ -107,14 +107,20 @@ def get_news_sentiment(symbol: str) -> int:
                 end=end_utc.isoformat() + "Z",
                 limit=3
             )
-        except TypeError:
-            # إصدارات قديمة قد تتطلب 'symbols'
-            news = api.get_news(
-                symbols=[symbol],
-                start=start_utc.isoformat() + "Z",
-                end=end_utc.isoformat() + "Z",
-                limit=3
-            )
+            used = "symbol"
+        except Exception as e1:
+            try:
+                news = api.get_news(
+                    symbols=[symbol],
+                    start=start_utc.isoformat() + "Z",
+                    end=end_utc.isoformat() + "Z",
+                    limit=3
+                )
+                used = "symbols"
+            except Exception as e2:
+                raise RuntimeError(f"get_news failed (symbol err={e1}; symbols err={e2})")
+
+        log.debug(f"[NEWS] using param='{used}' for {symbol}")
 
         total = 0
         items = []
