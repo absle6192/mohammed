@@ -1,11 +1,12 @@
 import os
 import time
+import math
 import logging
-from typing import Dict, List, Optional, Tuple, Set
-from datetime import datetime, timedelta, timezone, time as _t
-from zoneinfo import ZoneInfo
-from decimal import Decimal, ROUND_HALF_UP
-import re
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo  # for ET session detection
+import re  # ← NEW: للكلمات المفتاحية في الأخبار
 
 from alpaca_trade_api.rest import REST, TimeFrame, TimeFrameUnit
 
@@ -40,23 +41,39 @@ ALLOCATE_FROM_CASH = os.getenv("ALLOCATE_FROM_CASH", "true").lower() == "true"
 FALLBACK_NOTIONAL_PER_TRADE = float(os.getenv("NOTIONAL_PER_TRADE", "6250"))
 
 # -------- Trailing Stop --------
-TRAIL_PCT   = float(os.getenv("TRAIL_PCT", "0.7"))   # 0.7%
-TRAIL_PRICE = float(os.getenv("TRAIL_PRICE", "0.0")) # 0 => يستخدم النسبة
+TRAIL_PCT   = float(os.getenv("TRAIL_PCT", "0.7"))   # 0.7% trailing
+TRAIL_PRICE = float(os.getenv("TRAIL_PRICE", "0.0")) # 0 disables price-based trailing
 
 # -------- Re-entry --------
 NO_REENTRY_TODAY = os.getenv("NO_REENTRY_TODAY", "true").lower() == "true"
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "60"))
 
-# -------- Loop cadence --------
+# -------- Main loop cadence --------
 INTERVAL_SECONDS   = int(os.getenv("INTERVAL_SECONDS", "30"))
 MAX_CYCLE_SECONDS  = int(os.getenv("MAX_CYCLE_SECONDS", "20"))
 
-# -------- Pre-Market price pads (USD) --------
-PRE_SLIPPAGE_USD = float(os.getenv("PRE_SLIPPAGE_USD", "0.05"))
-SELL_PAD_USD     = float(os.getenv("SELL_PAD_USD", "0.02"))
+# -------- Pre-Market limit padding (USD) --------
+PRE_SLIPPAGE_USD = float(os.getenv("PRE_SLIPPAGE_USD", "0.05"))  # small add to BUY limit
+SELL_PAD_USD     = float(os.getenv("SELL_PAD_USD", "0.02"))      # how much below Bid for PRE sell
 
-# ----- allow/deny auto-sell in pre-market via ENV -----
+# ===== allow/deny auto-sell in pre-market via ENV =====
 ALLOW_PRE_AUTO_SELL = os.getenv("ALLOW_PRE_AUTO_SELL", "false").lower() == "true"
+
+# ============ NEWS FILTER (NEW) ============
+ENABLE_NEWS = os.getenv("ENABLE_NEWS", "true").lower() == "true"     # فعّال افتراضياً
+NEWS_LOOKBACK_MIN = int(os.getenv("NEWS_LOOKBACK_MIN", "120"))       # آخر 120 دقيقة
+NEWS_BLOCK_NEG = os.getenv("NEWS_BLOCK_NEG", "true").lower() == "true"  # امنع الشراء لو سلبية
+NEWS_POS_BOOST = float(os.getenv("NEWS_POS_BOOST", "0.5"))           # دفعة للموجب
+
+# كلمات مفتاحية بسيطة (تقدر تعدّلها من env لو بغيت)
+POS_WORDS = re.compile(os.getenv(
+    "NEWS_POS_REGEX",
+    r"(upgrade|beat|record|raise|strong|profit|growth|launch|partnership|contract|approval)"
+), re.I)
+NEG_WORDS = re.compile(os.getenv(
+    "NEWS_NEG_REGEX",
+    r"(downgrade|miss|cut|lawsuit|investigation|recall|halt|guidance\s*cut|probe|data breach)"
+), re.I)
 
 if not API_KEY or not API_SECRET:
     log.error("Missing API keys in environment.")
@@ -64,93 +81,10 @@ if not API_KEY or not API_SECRET:
 
 api = REST(API_KEY, API_SECRET, BASE_URL)
 
-# ============ NEWS FILTER ============
-ENABLE_NEWS = True
-NEWS_LOOKBACK_MIN = 120
-NEWS_BLOCK_NEG = True
-NEWS_POS_BOOST = 0.5
-POS_WORDS = re.compile(r"(upgrade|beat|record|raise|strong|profit|growth|launch|partnership|contract|approval)", re.I)
-NEG_WORDS = re.compile(r"(downgrade|miss|cut|lawsuit|investigation|recall|halt|guidance\s*cut|probe|data breach)", re.I)
-
+# =========================
+# Time helpers & Sessions
+# =========================
 ET = ZoneInfo("America/New_York")
-
-def _fmt_et(ts: Optional[datetime]) -> str:
-    try:
-        if ts is None:
-            return "-"
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        return ts.astimezone(ET).strftime("%H:%M ET")
-    except Exception:
-        return "-"
-
-def get_news_sentiment(symbol: str) -> int:
-    try:
-        end_utc = datetime.utcnow()
-        start_utc = end_utc - timedelta(minutes=NEWS_LOOKBACK_MIN)
-        try:
-            news = api.get_news(
-                symbol=symbol,
-                start=start_utc.isoformat() + "Z",
-                end=end_utc.isoformat() + "Z",
-                limit=3
-            )
-            used = "symbol"
-        except Exception as e1:
-            try:
-                news = api.get_news(
-                    symbols=[symbol],
-                    start=start_utc.isoformat() + "Z",
-                    end=end_utc.isoformat() + "Z",
-                    limit=3
-                )
-                used = "symbols"
-            except Exception as e2:
-                raise RuntimeError(f"get_news failed (symbol err={e1}; symbols err={e2})")
-
-        log.debug(f"[NEWS] using param='{used}' for {symbol}")
-
-        total = 0
-        items = []
-        for n in news:
-            headline = (getattr(n, "headline", "") or "").strip()
-            summary  = (getattr(n, "summary", "") or "").strip()
-            source   = (getattr(n, "source", "") or "").strip() or "-"
-            created  = getattr(n, "created_at", None)
-
-            text = f"{headline} {summary}"
-            local = 0
-            if POS_WORDS.search(text): local += 1
-            if NEG_WORDS.search(text): local -= 1
-            local = max(-1, min(1, local))
-            total += local
-
-            items.append((source, _fmt_et(created), headline[:120], local))
-
-        if items:
-            log.info(f"[NEWS] {symbol}: last {len(items)} items → total_score={total}")
-            for src, t_et, head, sc in items:
-                sign = "🟢" if sc > 0 else ("🔴" if sc < 0 else "⚪")
-                log.info(f"     {sign} [{src} | {t_et}] {head} (score={sc})")
-        else:
-            log.info(f"[NEWS] {symbol}: no recent news in last {NEWS_LOOKBACK_MIN}min")
-
-        return max(-1, min(1, total))
-    except Exception as e:
-        log.warning(f"[NEWS] {symbol}: news fetch failed ({e})")
-        return 0
-
-# =========================
-# Helpers
-# =========================
-def normalize_price(x: float) -> float:
-    d = Decimal(str(x))
-    tick = Decimal('0.0001') if d < Decimal('1') else Decimal('0.01')
-    return float(d.quantize(tick, rounding=ROUND_HALF_UP))
-
-def qty_str_int(q) -> str:
-    """يحوّل أي كمية إلى عدد صحيح كنص: 63.0 → '63'."""
-    return str(int(Decimal(str(q)).quantize(Decimal('1'), rounding=ROUND_HALF_UP)))
 
 def utc_now():
     return datetime.now(timezone.utc)
@@ -167,66 +101,45 @@ def sleep_until_next_interval(interval_seconds: int, started_at: float):
     sleep_left = max(0.0, interval_seconds - elapsed)
     time.sleep(sleep_left)
 
-def current_session_et(dt: Optional[datetime] = None) -> str:
+def current_session_et(dt: datetime | None = None) -> str:
+    """
+    Returns: 'pre' | 'regular' | 'closed'
+    - pre:     04:00–09:30 ET
+    - regular: 09:30–16:00 ET
+    - else: closed (After-Hours and overnight both treated as closed for this bot)
+    """
     now = (dt or datetime.now(ET)).astimezone(ET)
     if now.weekday() >= 5:
         return "closed"
     t = now.time()
-    if _t(4, 0) <= t < _t(9, 30):
+    from datetime import time as _t
+    PRE_START  = _t(4, 0)
+    REG_START  = _t(9, 30)
+    REG_END    = _t(16, 0)
+    if PRE_START <= t < REG_START:
         return "pre"
-    if _t(9, 30) <= t < _t(16, 0):
+    if REG_START <= t < REG_END:
         return "regular"
     return "closed"
 
-def session_tag(dt: Optional[datetime] = None) -> str:
-    now = (dt or datetime.now(ET)).astimezone(ET)
-    sess = current_session_et(now)
-    sess_up = "PRE" if sess == "pre" else ("REG" if sess == "regular" else "OFF")
-    return f"{now.date().isoformat()}-{sess_up}"
-
-def near_regular_close_window() -> bool:
-    now = datetime.now(ET)
-    return now.weekday() < 5 and _t(15, 59, 30) <= now.time() < _t(16, 0, 0)
-
-# =========================
-# One-minute throttle
-# =========================
-_last_min_key: Optional[str] = None
-def throttle_once_per_minute() -> bool:
-    global _last_min_key
-    key = datetime.now(ET).strftime("%Y-%m-%d %H:%M")
-    if _last_min_key == key:
-        return False
-    _last_min_key = key
-    return True
+def can_trade_now() -> tuple[bool, bool]:
+    """
+    Returns (should_trade, extended_hours_flag)
+    - pre: trade allowed, extended_hours=True, LIMIT-only
+    - regular: trade allowed, extended_hours=False
+    - closed: not allowed
+    """
+    s = current_session_et()
+    if s == "pre":
+        return True, True
+    if s == "regular":
+        return True, False
+    return False, False
 
 # =========================
-# Daily registries
+# Re-entry Registry
 # =========================
-DAY_KEY: Optional[datetime.date] = None
-PRE_BUY_SYMS: Set[str] = set()
 sold_registry: Dict[str, datetime] = {}
-SOLD_REGULAR_TODAY: Set[str] = set()
-
-def _reset_daily_if_needed():
-    global DAY_KEY, PRE_BUY_SYMS, sold_registry, SOLD_REGULAR_TODAY
-    today = datetime.now(ET).date()
-    if DAY_KEY != today:
-        DAY_KEY = today
-        PRE_BUY_SYMS.clear()
-        sold_registry.clear()
-        SOLD_REGULAR_TODAY.clear()
-        PREMARKET_LOCK.clear()
-        PRE_EXT_ORDERS.clear()
-        log.info("🔄 Daily registries reset.")
-
-def _is_regular_time(ts: datetime) -> bool:
-    ts_et = ts.astimezone(ET)
-    return ts_et.weekday() < 5 and _t(9,30) <= ts_et.time() < _t(16,0)
-
-def _was_sell_premarket(ts: datetime) -> bool:
-    ts_et = ts.astimezone(ET)
-    return ts_et.weekday() < 5 and ts_et.time() < _t(9,30)
 
 def record_today_sells(api: REST, symbols: List[str]) -> None:
     try:
@@ -238,26 +151,25 @@ def record_today_sells(api: REST, symbols: List[str]) -> None:
         try:
             if o.side != "sell" or o.symbol not in symbols:
                 continue
-            ts = getattr(o, "filled_at", None)
-            if not ts:
+            if not getattr(o, "filled_at", None):
                 continue
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            if ts.date() != utc_today():
-                continue
-            sym = o.symbol.upper()
-            sold_registry[sym] = ts
-            if _is_regular_time(ts):
-                SOLD_REGULAR_TODAY.add(sym)
+            filled_at = o.filled_at if o.filled_at.tzinfo else o.filled_at.replace(tzinfo=timezone.utc)
+            if filled_at.date() == utc_today():
+                sold_registry[o.symbol] = filled_at
         except Exception:
             continue
 
-def sold_pre_today(symbol: str) -> bool:
-    ts = sold_registry.get(symbol.upper())
-    return bool(ts and ts.date() == utc_today() and _was_sell_premarket(ts))
+def sold_today(symbol: str) -> bool:
+    if not NO_REENTRY_TODAY:
+        return False
+    ts = sold_registry.get(symbol)
+    return bool(ts and ts.date() == utc_today())
 
-def sold_regular_today(symbol: str) -> bool:
-    return symbol.upper() in SOLD_REGULAR_TODAY
+def in_cooldown(symbol: str) -> bool:
+    if COOLDOWN_MINUTES <= 0:
+        return False
+    ts = sold_registry.get(symbol)
+    return bool(ts and utc_now() < ts + timedelta(minutes=COOLDOWN_MINUTES))
 
 # =========================
 # Market / Orders helpers
@@ -276,20 +188,6 @@ def latest_bid(symbol: str) -> float:
         return float(getattr(q, "bidprice", 0) or 0)
     except Exception:
         return 0.0
-
-def fallback_price(symbol: str) -> float:
-    p = last_trade_price(symbol)
-    if p and p > 0:
-        return p
-    try:
-        bars = api.get_bars(symbol, TimeFrame(1, TimeFrameUnit.Minute), limit=1).df
-        if not bars.empty:
-            close = float(bars.iloc[-1]["close"])
-            if close > 0:
-                return close
-    except Exception:
-        pass
-    return 0.0
 
 def has_open_position(symbol: str) -> bool:
     try:
@@ -332,9 +230,12 @@ def cancel_symbol_open_orders(symbol: str):
         pass
 
 # =========================
-# Entry Signal
+# Entry Signal (1-min momentum)
 # =========================
 def momentum_for_last_min(symbol: str) -> Optional[float]:
+    """
+    Momentum for last minute: (close - open) / open
+    """
     try:
         bars = api.get_bars(symbol, TimeFrame(1, TimeFrameUnit.Minute), limit=2).df
         if bars.empty:
@@ -345,7 +246,7 @@ def momentum_for_last_min(symbol: str) -> Optional[float]:
         return float((last["close"] - last["open"]) / last["open"])
     except Exception as e:
         log.debug(f"momentum calc error {symbol}: {e}")
-        return None
+    return None
 
 # =========================
 # Guards
@@ -354,47 +255,31 @@ def guard_states(symbol: str, open_orders: Dict[str, bool]) -> Dict[str, bool]:
     return {
         "has_pos": has_open_position(symbol),
         "has_open_order": open_orders.get(symbol, False),
-        "sold_pre_today": sold_pre_today(symbol),
-        "sold_regular_today": sold_regular_today(symbol),
-        "cooldown": _in_cooldown(symbol),
+        "sold_today": sold_today(symbol),
+        "cooldown": in_cooldown(symbol),
+        "max_positions_reached": count_open_positions() >= MAX_OPEN_POSITIONS
     }
-
-def _in_cooldown(symbol: str) -> bool:
-    if COOLDOWN_MINUTES <= 0:
-        return False
-    ts = sold_registry.get(symbol.upper())
-    if not ts:
-        return False
-    return bool(utc_now() < ts + timedelta(minutes=COOLDOWN_MINUTES))
 
 def can_open_new_long(symbol: str, states: Dict[str, bool]) -> Tuple[bool, str]:
     if states["has_pos"]:
         return False, "already have position"
     if states["has_open_order"]:
         return False, "open order exists"
-
-    session = current_session_et()
-    if session == "pre":
-        if states["sold_pre_today"]:
-            return False, "blocked: sold in pre today"
-    if session == "regular":
-        if states["sold_regular_today"]:
-            return False, "blocked: sold in regular today"
-        if states["cooldown"]:
-            return False, "in cooldown"
-
+    if states["sold_today"]:
+        return False, "no-reentry-today"
+    if states["cooldown"]:
+        return False, "in cooldown"
+    if states["max_positions_reached"]:
+        return False, "max positions reached"
     return True, ""
 
 # =========================
-# Pre-Market lock
+# Pre-Market lock (your custom rule)
 # =========================
-PREMARKET_LOCK: Dict[str, str] = {}           # symbol -> ISO date
-PRE_CLIENT_PREFIX = "PRE-"
-PRE_EXT_ORDERS: Dict[str, bool] = {}          # order_id -> True
+PREMARKET_LOCK: Dict[str, str] = {}
 
 def record_prebuy(symbol: str):
     PREMARKET_LOCK[symbol.upper()] = datetime.now(ET).date().isoformat()
-    PRE_BUY_SYMS.add(symbol.upper())
 
 def clear_lock_if_no_position(symbol: str):
     sym = symbol.upper()
@@ -406,6 +291,16 @@ def clear_lock_if_no_position(symbol: str):
         PREMARKET_LOCK.pop(sym, None)
 
 def should_allow_auto_sell(symbol: str) -> bool:
+    """
+    Deny auto-sell if:
+    - symbol is locked due to a pre-market buy
+    - and current session is still 'pre'
+    Allow sell if:
+    - session is 'regular' OR
+    - symbol not locked OR
+    - no position anymore
+    - OR ALLOW_PRE_AUTO_SELL=True (override)
+    """
     sym = symbol.upper()
     clear_lock_if_no_position(sym)
     session = current_session_et()
@@ -415,82 +310,49 @@ def should_allow_auto_sell(symbol: str) -> bool:
         return False
     return True
 
-def refresh_pre_ext_registry():
-    try:
-        for o in api.list_orders(status="open"):
-            cid = getattr(o, "client_order_id", "") or ""
-            if cid.startswith(PRE_CLIENT_PREFIX):
-                PRE_EXT_ORDERS[o.id] = True
-    except Exception:
-        pass
-
-def cancel_pre_ext_orders_before_afterhours():
-    if not near_regular_close_window():
-        return
-    refresh_pre_ext_registry()
-    if not PRE_EXT_ORDERS:
-        return
-    try:
-        for oid in list(PRE_EXT_ORDERS.keys()):
-            try:
-                api.cancel_order(oid)
-                PRE_EXT_ORDERS.pop(oid, None)
-                log.info(f"[SAFETY] Canceled PRE order before after-hours: {oid}")
-            except Exception as e:
-                log.warning(f"[SAFETY] Cancel PRE order failed {oid}: {e}")
-    except Exception as e:
-        log.debug(f"[SAFETY] scan/cancel failed: {e}")
-
 # =========================
-# Orders
+# Orders (لا تغيير في المنطق الأصلي)
 # =========================
-def place_market_buy_qty_regular(symbol: str, qty: int, client_id: Optional[str] = None) -> Optional[str]:
+def place_market_buy_qty_regular(symbol: str, qty: int) -> Optional[str]:
     try:
         o = api.submit_order(
             symbol=symbol, side="buy", type="market",
-            time_in_force="day", qty=str(qty), extended_hours=False,
-            client_order_id=(client_id or f"REG-BUY-{symbol}-{datetime.now(ET).timestamp()}")
+            time_in_force="day", qty=str(qty), extended_hours=False
         )
-        log.info(f"[BUY-REG/MKT] {symbol} qty={qty} cid={client_id}")
+        log.info(f"[BUY-REG/MKT] {symbol} qty={qty}")
         return o.id
     except Exception as e:
         log.error(f"BUY regular market failed {symbol}: {e}")
         return None
 
-def place_limit_buy_qty_premarket(symbol: str, qty: int, ref_price: float, client_id: Optional[str] = None) -> Optional[str]:
+def place_limit_buy_qty_premarket(symbol: str, qty: int, ref_price: float) -> Optional[str]:
     try:
-        limit_price = normalize_price(float(ref_price) + PRE_SLIPPAGE_USD)
+        limit_price = float(ref_price) + PRE_SLIPPAGE_USD
         o = api.submit_order(
             symbol=symbol, side="buy", type="limit", time_in_force="day",
-            qty=str(qty), limit_price=str(limit_price), extended_hours=True,
-            client_order_id=(client_id or f"{PRE_CLIENT_PREFIX}BUY-{symbol}-{datetime.now(ET).timestamp()}")
+            qty=str(qty), limit_price=str(limit_price), extended_hours=True
         )
-        PRE_EXT_ORDERS[o.id] = True
-        log.info(f"[BUY-PRE/LMT] {symbol} qty={qty} limit={limit_price} cid={client_id}")
+        log.info(f"[BUY-PRE/LMT] {symbol} qty={qty} limit={limit_price:.2f}")
         return o.id
     except Exception as e:
         log.error(f"BUY pre-market limit failed {symbol}: {e}")
         return None
 
-def place_limit_sell_extended(symbol: str, qty: float,
-                              ref_bid: Optional[float] = None,
-                              pad: Optional[float] = None) -> Optional[str]:
+def place_limit_sell_extended(symbol: str, qty: float, ref_bid: Optional[float] = None, pad: Optional[float] = None) -> Optional[str]:
+    """Sell LIMIT in pre/after-hours at (Bid - pad) with extended_hours=True."""
     try:
         bid = ref_bid if (ref_bid is not None and ref_bid > 0) else latest_bid(symbol)
-        ref = bid if bid > 0 else fallback_price(symbol)
-        if ref <= 0:
-            log.warning(f"[SELL-PRE] {symbol}: no bid/trade price available.")
+        if bid <= 0:
+            log.warning(f"[SELL-PRE] {symbol}: no bid available.")
             return None
         p = SELL_PAD_USD if pad is None else pad
-        limit_price = normalize_price(max(ref - p, 0.01))
+        limit_price = round(bid - p, 2)
         o = api.submit_order(
             symbol=symbol, side="sell", type="limit",
-            time_in_force="day", qty=qty_str_int(qty),             # ← مهم
-            limit_price=str(limit_price), extended_hours=True,
-            client_order_id=f"{PRE_CLIENT_PREFIX}SELL-{symbol}-{datetime.now(ET).timestamp()}"
+            time_in_force="day", qty=str(qty),
+            limit_price=str(limit_price), extended_hours=True
         )
-        PRE_EXT_ORDERS[o.id] = True
-        log.info(f"[SELL-EXT/LMT] {symbol} qty={qty_str_int(qty)} ref={ref} pad={p} limit={limit_price}")
+        log.info(f"[SELL-EXT/LMT] {symbol} qty={qty} limit={limit_price}")
         return o.id
     except Exception as e:
         log.error(f"SELL extended limit failed {symbol}: {e}")
@@ -501,18 +363,16 @@ def place_trailing_stop_regular(symbol: str, qty: float) -> Optional[str]:
         if TRAIL_PRICE > 0:
             o = api.submit_order(
                 symbol=symbol, side="sell", type="trailing_stop",
-                time_in_force="day", trail_price=str(TRAIL_PRICE),
-                qty=qty_str_int(qty),                               # ← مهم
-                extended_hours=False, client_order_id=f"REG-TRAIL-{symbol}-{datetime.now(ET).timestamp()}"
+                time_in_force="day", trail_price=str(TRAIL_PRICE), qty=str(qty),
+                extended_hours=False
             )
         else:
             o = api.submit_order(
                 symbol=symbol, side="sell", type="trailing_stop",
-                time_in_force="day", trail_percent=str(TRAIL_PCT),
-                qty=qty_str_int(qty),                               # ← مهم
-                extended_hours=False, client_order_id=f"REG-TRAIL-{symbol}-{datetime.now(ET).timestamp()}"
+                time_in_force="day", trail_percent=str(TRAIL_PCT), qty=str(qty),
+                extended_hours=False
             )
-        log.info(f"[TRAIL-REG] {symbol} qty={qty_str_int(qty)}")
+        log.info(f"[TRAIL-REG] {symbol} qty={qty}")
         return o.id
     except Exception as e:
         log.error(f"TRAIL failed {symbol}: {e}")
@@ -533,66 +393,43 @@ def try_attach_trailing_stop_if_allowed(symbol: str):
     except Exception as e:
         log.debug(f"attach trail skipped {symbol}: {e}")
 
+# --------- manual quick exit before open ----------
 def force_exit_pre(symbol: str, pad: float = None):
+    """Close long position in PRE by sending LIMIT at Bid - pad."""
     try:
         pos = api.get_position(symbol)
         qty = float(pos.qty)
         if qty <= 0:
             log.info(f"[EXIT-PRE] {symbol}: no long qty.")
             return None
-        return place_limit_sell_extended(symbol, qty, pad=pad)
+        bid = latest_bid(symbol)
+        if bid <= 0:
+            log.warning(f"[EXIT-PRE] {symbol}: no bid.")
+            return None
+        return place_limit_sell_extended(symbol, qty, ref_bid=bid, pad=pad)
     except Exception as e:
         log.error(f"[EXIT-PRE] {symbol} failed: {e}")
         return None
 
-# --------- Auto-fix market sells in PRE ----------
-_LAST_FIXED_AT: Dict[str, float] = {}
-
-def _should_fix_sell_in_pre(order) -> bool:
-    try:
-        if order.side != "sell":
-            return False
-        typ = (order.type or "").lower()
-        ext = bool(getattr(order, "extended_hours", False))
-        return (typ == "market") or (not ext)
-    except Exception:
-        return False
-
-def auto_fix_premarket_market_sells(pulses: int = 3, pulse_sleep: float = 0.35):
+# --------- auto-fix market sells in PRE (السلوك القديم كما هو) ----------
+def auto_fix_premarket_market_sells():
+    """If there are open SELL/MARKET orders during PRE, cancel and replace with LIMIT+extended."""
     if current_session_et() != "pre":
         return
-    for _ in range(max(1, pulses)):
-        try:
-            orders = api.list_orders(status="open")
-            now = time.time()
-            for o in orders:
-                if not _should_fix_sell_in_pre(o):
-                    continue
-                last = _LAST_FIXED_AT.get(o.id, 0.0)
-                if now - last < 2.0:
-                    continue
+    try:
+        open_os = api.list_orders(status="open")
+        for o in open_os:
+            if o.side == "sell" and o.type == "market":
                 try:
                     api.cancel_order(o.id)
+                    bid = latest_bid(o.symbol)
+                    qty = float(o.qty)
+                    place_limit_sell_extended(o.symbol, qty, ref_bid=bid)
+                    log.info(f"[AUTO-FIX] Replaced SELL/MARKET with SELL/LIMIT for {o.symbol}")
                 except Exception as e:
-                    log.warning(f"[AUTO-FIX] cancel failed {o.symbol}: {e}")
-                    _LAST_FIXED_AT[o.id] = now
-                    continue
-                # qty كسلسلة صحيحة
-                try:
-                    qty_s = qty_str_int(o.qty)
-                except Exception:
-                    log.warning(f"[AUTO-FIX] bad qty for {o.symbol}: {o.qty}")
-                    _LAST_FIXED_AT[o.id] = now
-                    continue
-                try:
-                    place_limit_sell_extended(o.symbol, int(qty_s))
-                    log.info(f"[AUTO-FIX] SELL -> LIMIT+extended for {o.symbol} qty={qty_s}")
-                except Exception as e:
-                    log.warning(f"[AUTO-FIX] replace failed {o.symbol}: {e}")
-                _LAST_FIXED_AT[o.id] = now
-        except Exception as e:
-            log.debug(f"[AUTO-FIX] list_orders failed: {e}")
-        time.sleep(max(0.0, pulse_sleep))
+                    log.warning(f"[AUTO-FIX] failed for {o.symbol}: {e}")
+    except Exception as e:
+        log.debug(f"[AUTO-FIX] list_orders failed: {e}")
 
 # =========================
 # Allocation helpers
@@ -621,27 +458,49 @@ def compute_qty_for_budget(symbol: str, budget: float) -> int:
     return qty
 
 # =========================
-# Session idempotency helpers
+# (NEW) News helper — لا يغيّر الأوامر؛ فقط يرجّع درجة -1..+1
 # =========================
-def list_orders_by_tag(tag_prefix: str) -> List:
+def get_news_sentiment(symbol: str) -> int:
+    """
+    يرجّع درجة -1..+1 اعتماداً على كلمات مفتاحية في headline/summary لآخر NEWS_LOOKBACK_MIN دقيقة.
+    - لا يغيّر أي أوامر أو منطق بيع/شراء.
+    - تُستخدم النتيجة لضبط الزخم أو منع الدخول عند سلبية قوية.
+    """
     try:
-        return [o for o in api.list_orders(status="all", limit=500, nested=True)
-                if (getattr(o, "client_order_id", "") or "").startswith(tag_prefix)]
-    except Exception:
-        return []
+        end_utc = datetime.utcnow()
+        start_utc = end_utc - timedelta(minutes=NEWS_LOOKBACK_MIN)
 
-def session_buy_count(tag_prefix: str) -> int:
-    try:
-        return sum(1 for o in list_orders_by_tag(tag_prefix) if o.side == "buy")
-    except Exception:
+        # بعض إصدارات SDK تستخدم symbol، وبعضها symbols
+        try:
+            news = api.get_news(
+                symbol=symbol,
+                start=start_utc.isoformat() + "Z",
+                end=end_utc.isoformat() + "Z",
+                limit=3
+            )
+        except Exception:
+            news = api.get_news(
+                symbols=[symbol],
+                start=start_utc.isoformat() + "Z",
+                end=end_utc.isoformat() + "Z",
+                limit=3
+            )
+
+        total = 0
+        for n in news:
+            headline = (getattr(n, "headline", "") or "").lower()
+            summary  = (getattr(n, "summary", "") or "").lower()
+            text = f"{headline} {summary}"
+            if POS_WORDS.search(text): total += 1
+            if NEG_WORDS.search(text): total -= 1
+
+        score = max(-1, min(1, total))
+        if total != 0:
+            log.info(f"[NEWS] {symbol}: score={score} (lookback={NEWS_LOOKBACK_MIN}m)")
+        return score
+    except Exception as e:
+        log.debug(f"[NEWS] {symbol}: fetch failed ({e})")
         return 0
-
-def session_symbol_bought(tag_prefix: str, symbol: str) -> bool:
-    try:
-        return any((getattr(o, "client_order_id", "") or "") == f"{tag_prefix}-{symbol}" 
-                   for o in list_orders_by_tag(tag_prefix))
-    except Exception:
-        return False
 
 # =========================
 # Main loop
@@ -655,7 +514,7 @@ def main_loop():
         f"trail_pct={TRAIL_PCT} trail_price={TRAIL_PRICE} "
         f"no_reentry_today={NO_REENTRY_TODAY} cooldown_min={COOLDOWN_MINUTES} "
         f"interval_s={INTERVAL_SECONDS} pre_slip_usd={PRE_SLIPPAGE_USD} "
-        f"sell_pad_usd={SELL_PAD_USD} allow_pre_auto_sell={ALLOW_PRE_AUTO_SELL} "
+        f"sell_pad_usd={SELL_PAD_USD} allow_pre_auto_sell={ALLOW_PRE_AUTO_SELL} | "
         f"news_enabled={ENABLE_NEWS} news_block_neg={NEWS_BLOCK_NEG} news_boost={NEWS_POS_BOOST} "
         f"news_lookback_min={NEWS_LOOKBACK_MIN}"
     )
@@ -664,33 +523,27 @@ def main_loop():
     while True:
         cycle_started = time.time()
         try:
-            if not throttle_once_per_minute():
-                time.sleep(0.3)
-            _reset_daily_if_needed()
-
             session = current_session_et()
-            tag = session_tag()
-
             if session == "closed":
                 heartbeat("Out of allowed sessions (no trading) - sleeping")
             else:
                 heartbeat(f"Session={session} - cycle begin")
 
-                auto_fix_premarket_market_sells()
-                cancel_pre_ext_orders_before_afterhours()
+                # السلوك القديم: إصلاح SELL/MARKET قبل الافتتاح فقط
                 auto_fix_premarket_market_sells()
 
                 record_today_sells(api, SYMBOLS)
                 open_map = open_orders_map()
 
-                # ==== 1) momentum + news ====
-                candidates = []  # (symbol, momentum_adj, last_price)
+                # ==== 1) compute momentum (+news) and pick best K ====
+                candidates = []  # (symbol, momentum_adj, price)
                 for symbol in SYMBOLS:
                     mom = momentum_for_last_min(symbol)
                     if mom is None:
                         log.info(f"{symbol}: ❌ no bar data / bad open; skip")
                         continue
 
+                    # -------- NEW: دمج الأخبار (بدون تغيير أي أوامر) --------
                     mom_adj = mom
                     if ENABLE_NEWS:
                         news_score = get_news_sentiment(symbol)
@@ -703,17 +556,19 @@ def main_loop():
                         log.info(f"{symbol}: mom={mom:.5f} thr={MOMENTUM_THRESHOLD}")
 
                     states = guard_states(symbol, open_map)
-                    allowed, _ = can_open_new_long(symbol, states)
+                    allowed, reason = can_open_new_long(symbol, states)
 
                     log.info(
                         f"{symbol}: guards: pos={states['has_pos']}, "
                         f"open_order={states['has_open_order']}, "
-                        f"sold_pre_today={states['sold_pre_today']}, "
-                        f"sold_regular_today={states['sold_regular_today']}, "
-                        f"cooldown={states['cooldown']}"
+                        f"sold_today={states['sold_today']}, "
+                        f"cooldown={states['cooldown']}, "
+                        f"maxpos={states['max_positions_reached']}"
                     )
 
-                    if mom_adj < MOMENTUM_THRESHOLD or not allowed:
+                    if mom_adj < MOMENTUM_THRESHOLD:
+                        continue
+                    if not allowed:
                         continue
 
                     price = last_trade_price(symbol)
@@ -723,39 +578,18 @@ def main_loop():
                     candidates.append((symbol, mom_adj, price))
 
                 candidates.sort(key=lambda x: x[1], reverse=True)
+                best = [c[0] for c in candidates[:TOP_K]]
 
-                # ==== 2) choose per session ====
+                # ==== 2) capacity ====
                 currently_open_syms = set(list_open_positions_symbols())
+                open_count = len(currently_open_syms)
+                slots_left = max(0, min(MAX_OPEN_POSITIONS, TOP_K) - open_count)
+                symbols_to_open = [s for s in best if s not in currently_open_syms][:slots_left]
 
-                if session == "pre":
-                    best_list = [c[0] for c in candidates]
-                    symbols_to_open = [
-                        s for s in best_list
-                        if (s not in PRE_BUY_SYMS)
-                        and (s not in currently_open_syms)
-                        and (s not in open_map)
-                    ]
-                    slots_left = len(symbols_to_open)
-                else:
-                    best_list = [c[0] for c in candidates[:TOP_K]]
-                    already_buys = session_buy_count(tag)
-                    room = max(0, min(MAX_OPEN_POSITIONS, TOP_K) - already_buys)
+                log.info(f"BEST={best} | open={list(currently_open_syms)} | to_open={symbols_to_open} | slots_left={slots_left}")
 
-                    filtered = []
-                    for s in best_list:
-                        if s in currently_open_syms:
-                            continue
-                        if session_symbol_bought(tag, s):
-                            continue
-                        filtered.append(s)
-
-                    symbols_to_open = filtered[:room]
-                    slots_left = room
-
-                log.info(f"BEST={best_list} | open={list(currently_open_syms)} | to_open={symbols_to_open} | slots_left={slots_left}")
-
-                # ==== 3) budget ====
-                if symbols_to_open and slots_left > 0:
+                # ==== 3) per-position budget ====
+                if symbols_to_open:
                     if ALLOCATE_FROM_CASH:
                         cash_or_bp = get_buying_power_cash()
                         per_budget = (cash_or_bp / len(symbols_to_open)) if cash_or_bp > 0 else FALLBACK_NOTIONAL_PER_TRADE
@@ -764,9 +598,9 @@ def main_loop():
 
                     log.info(f"Per-position budget ≈ ${per_budget:.2f}")
 
-                    # ==== 4) place buys + trailing ====
+                    # ==== 4) execute buys + attach trailing (نفس السلوك القديم) ====
                     for sym in symbols_to_open:
-                        cancel_symbol_open_orders(sym)
+                        cancel_symbol_open_orders(sym)  # safety
                         qty = compute_qty_for_budget(sym, per_budget)
                         if qty < 1:
                             continue
@@ -775,24 +609,25 @@ def main_loop():
                         if price is None:
                             continue
 
-                        trade_ok, ext = (True, session == "pre") if session in ("pre", "regular") else (False, False)
+                        trade_ok, ext = can_trade_now()
                         if not trade_ok:
                             continue
 
-                        cid = f"{tag}-{sym}"
-
                         if ext:
-                            buy_id = place_limit_buy_qty_premarket(sym, qty, ref_price=price, client_id=cid)
-                            if buy_id:
+                            # PRE-MARKET: LIMIT only + lock sells (unless override)
+                            buy_id = place_limit_buy_qty_premarket(sym, qty, ref_price=price)
+                            if buy_id and not ALLOW_PRE_AUTO_SELL:
                                 record_prebuy(sym)
+                            # no trailing during PRE
                         else:
-                            buy_id = place_market_buy_qty_regular(sym, qty, client_id=cid)
+                            # REGULAR: MARKET buy allowed, then attach trailing
+                            buy_id = place_market_buy_qty_regular(sym, qty)
                             if buy_id:
-                                time.sleep(1.2)
+                                time.sleep(1.5)
                                 try_attach_trailing_stop_if_allowed(sym)
 
+                # Re-scan sells registry after actions
                 record_today_sells(api, SYMBOLS)
-                auto_fix_premarket_market_sells()
 
                 elapsed = time.time() - cycle_started
                 log.info(f"🫀 Cycle done in {elapsed:.2f}s")
