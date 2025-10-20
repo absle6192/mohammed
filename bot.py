@@ -568,23 +568,42 @@ def force_exit_pre(symbol: str, pad: float = None):
 _LAST_FIXED_AT: Dict[str, float] = {}  # order_id -> epoch seconds
 
 def _should_fix_sell_in_pre(order) -> bool:
+    """اعتبر كل SELL ماركت أو SELL بدون extended في pre يحتاج تصحيح."""
     try:
-        if order.side != "sell":
+        if (getattr(order, "side", "") or "").lower() != "sell":
             return False
-        typ = (order.type or "").lower()
+        typ = (getattr(order, "type", "") or "").lower()
         ext = bool(getattr(order, "extended_hours", False))
         return (typ == "market") or (not ext)
     except Exception:
         return False
 
-def auto_fix_premarket_market_sells(pulses: int = 3, pulse_sleep: float = 0.35):
+def _has_open_sell(symbol: str) -> bool:
+    """هل يوجد أمر SELL مفتوح لنفس الرمز؟"""
+    try:
+        for o in api.list_orders(status="open"):
+            if o.symbol == symbol and (o.side or "").lower() == "sell":
+                return True
+    except Exception:
+        pass
+    return False
+
+def auto_fix_premarket_market_sells(pulses: int = 6, pulse_sleep: float = 0.25):
+    """
+    يحوّل أي SELL/Market (أو SELL بدون extended) في pre إلى SELL/Limit+extended
+    حتى لو انرفض فورًا. يفحص الأوامر المفتوحة ثم الأحدث ضمن نافذة قصيرة.
+    """
     if current_session_et() != "pre":
         return
     for _ in range(max(1, pulses)):
+        now = time.time()
         try:
-            orders = api.list_orders(status="open")
-            now = time.time()
-            for o in orders:
+            # 1) الأوامر المفتوحة أولًا
+            try:
+                open_orders = api.list_orders(status="open")
+            except Exception:
+                open_orders = []
+            for o in open_orders:
                 if not _should_fix_sell_in_pre(o):
                     continue
                 last = _LAST_FIXED_AT.get(o.id, 0.0)
@@ -599,17 +618,43 @@ def auto_fix_premarket_market_sells(pulses: int = 3, pulse_sleep: float = 0.35):
                 try:
                     qty = float(Decimal(str(o.qty)))
                 except Exception:
-                    log.warning(f"[AUTO-FIX] bad qty for {o.symbol}")
                     _LAST_FIXED_AT[o.id] = now
                     continue
-                try:
-                    place_limit_sell_extended(o.symbol, qty)
-                    log.info(f"[AUTO-FIX] SELL -> LIMIT+extended for {o.symbol}")
-                except Exception as e:
-                    log.warning(f"[AUTO-FIX] replace failed {o.symbol}: {e}")
+                place_limit_sell_extended(o.symbol, qty)
+                log.info(f"[AUTO-FIX] SELL -> LIMIT+extended for {o.symbol}")
                 _LAST_FIXED_AT[o.id] = now
+
+            # 2) الأوامر الحديثة جداً (قد تكون رُفضت مباشرة)
+            try:
+                recent = api.list_orders(status="all", limit=50, nested=True)
+            except Exception:
+                recent = []
+            for o in recent:
+                try:
+                    if not _should_fix_sell_in_pre(o):
+                        continue
+                    last = _LAST_FIXED_AT.get(o.id, 0.0)
+                    if now - last < 2.0:
+                        continue
+                    created = getattr(o, "created_at", None)
+                    if created and created.tzinfo is None:
+                        created = created.replace(tzinfo=timezone.utc)
+                    age = (utc_now() - (created or utc_now())).total_seconds()
+                    if age > 20:  # نافذة قصيرة لالتقاط الطلبات المرفوضة فورًا
+                        continue
+                    if not _has_open_sell(o.symbol):
+                        try:
+                            qty = float(Decimal(str(o.qty)))
+                        except Exception:
+                            continue
+                        place_limit_sell_extended(o.symbol, qty)
+                        log.info(f"[AUTO-FIX] REPLACE recent {o.symbol} SELL market → LIMIT+extended")
+                        _LAST_FIXED_AT[o.id] = now
+                except Exception:
+                    continue
+
         except Exception as e:
-            log.debug(f"[AUTO-FIX] list_orders failed: {e}")
+            log.debug(f"[AUTO-FIX] scan failed: {e}")
         time.sleep(max(0.0, pulse_sleep))
 
 # =========================
