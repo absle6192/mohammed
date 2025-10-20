@@ -5,9 +5,7 @@ import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo  # for ET session detection
-import re  # للكلمات المفتاحية في الأخبار
-from decimal import Decimal, ROUND_HALF_UP  # NEW
+from zoneinfo import ZoneInfo  # NEW: for ET session detection
 
 from alpaca_trade_api.rest import REST, TimeFrame, TimeFrameUnit
 
@@ -59,22 +57,6 @@ SELL_PAD_USD     = float(os.getenv("SELL_PAD_USD", "0.02"))      # how much belo
 
 # ===== allow/deny auto-sell in pre-market via ENV =====
 ALLOW_PRE_AUTO_SELL = os.getenv("ALLOW_PRE_AUTO_SELL", "false").lower() == "true"
-
-# ============ NEWS FILTER ============
-ENABLE_NEWS = os.getenv("ENABLE_NEWS", "true").lower() == "true"     # فعّال افتراضياً
-NEWS_LOOKBACK_MIN = int(os.getenv("NEWS_LOOKBACK_MIN", "120"))       # آخر 120 دقيقة
-NEWS_BLOCK_NEG = os.getenv("NEWS_BLOCK_NEG", "true").lower() == "true"  # امنع الشراء لو سلبية
-NEWS_POS_BOOST = float(os.getenv("NEWS_POS_BOOST", "0.5"))           # دفعة للموجب
-
-# كلمات مفتاحية بسيطة (تقدر تعدّلها من env لو بغيت)
-POS_WORDS = re.compile(os.getenv(
-    "NEWS_POS_REGEX",
-    r"(upgrade|beat|record|raise|strong|profit|growth|launch|partnership|contract|approval)"
-), re.I)
-NEG_WORDS = re.compile(os.getenv(
-    "NEWS_NEG_REGEX",
-    r"(downgrade|miss|cut|lawsuit|investigation|recall|halt|guidance\s*cut|probe|data breach)"
-), re.I)
 
 if not API_KEY or not API_SECRET:
     log.error("Missing API keys in environment.")
@@ -247,7 +229,7 @@ def momentum_for_last_min(symbol: str) -> Optional[float]:
         return float((last["close"] - last["open"]) / last["open"])
     except Exception as e:
         log.debug(f"momentum calc error {symbol}: {e}")
-    return None
+        return None
 
 # =========================
 # Guards
@@ -314,9 +296,6 @@ def should_allow_auto_sell(symbol: str) -> bool:
 # =========================
 # Orders
 # =========================
-def qty_str_int(q) -> str:  # NEW
-    return str(int(Decimal(str(q)).quantize(Decimal('1'), rounding=ROUND_HALF_UP)))
-
 def place_market_buy_qty_regular(symbol: str, qty: int) -> Optional[str]:
     try:
         o = api.submit_order(
@@ -353,10 +332,10 @@ def place_limit_sell_extended(symbol: str, qty: float, ref_bid: Optional[float] 
         limit_price = round(bid - p, 2)
         o = api.submit_order(
             symbol=symbol, side="sell", type="limit",
-            time_in_force="day", qty=qty_str_int(qty),   # NEW: صيغة كمية صحيحة
+            time_in_force="day", qty=str(qty),
             limit_price=str(limit_price), extended_hours=True
         )
-        log.info(f"[SELL-EXT/LMT] {symbol} qty={qty_str_int(qty)} limit={limit_price}")
+        log.info(f"[SELL-EXT/LMT] {symbol} qty={qty} limit={limit_price}")
         return o.id
     except Exception as e:
         log.error(f"SELL extended limit failed {symbol}: {e}")
@@ -397,7 +376,7 @@ def try_attach_trailing_stop_if_allowed(symbol: str):
     except Exception as e:
         log.debug(f"attach trail skipped {symbol}: {e}")
 
-# --------- manual quick exit before open ----------
+# --------- NEW: manual quick exit before open ----------
 def force_exit_pre(symbol: str, pad: float = None):
     """Close long position in PRE by sending LIMIT at Bid - pad."""
     try:
@@ -415,106 +394,51 @@ def force_exit_pre(symbol: str, pad: float = None):
         log.error(f"[EXIT-PRE] {symbol} failed: {e}")
         return None
 
-# --------- Auto-fix market sells in PRE (قوي مثل القديم) ----------
-_LAST_FIXED_AT: Dict[str, float] = {}  # order_id -> epoch seconds  # NEW
-
-def _should_fix_sell_in_pre(order) -> bool:  # NEW
-    try:
-        if order.side != "sell":
-            return False
-        typ = (order.type or "").lower()
-        ext = bool(getattr(order, "extended_hours", False))
-        # أصل السلوك القديم: صحّح إذا كان ماركت أو غير مفعّل extended_hours
-        return (typ == "market") or (not ext)
-    except Exception:
-        return False
-
-def auto_fix_premarket_market_sells(pulses: int = 3, pulse_sleep: float = 0.35):  # NEW
-    """
-    فقط قبل الافتتاح (04:00–09:30 ET):
-    - يلغي أي SELL/Market
-    - أو أي SELL غير مفعّل extended_hours
-    - ثم يعيده SELL/LIMIT + extended_hours=True بسعر (Bid - pad)
-    """
+# --------- NEW: auto-fix market sells in PRE ----------
+def auto_fix_premarket_market_sells():
+    """If there are open SELL/MARKET orders during PRE, cancel and replace with LIMIT+extended."""
     if current_session_et() != "pre":
         return
-    for _ in range(max(1, pulses)):
-        try:
-            orders = api.list_orders(status="open")
-            now = time.time()
-            for o in orders:
-                if not _should_fix_sell_in_pre(o):
-                    continue
-                last = _LAST_FIXED_AT.get(o.id, 0.0)
-                if now - last < 2.0:
-                    continue
+    try:
+        open_os = api.list_orders(status="open")
+        for o in open_os:
+            if o.side == "sell" and o.type == "market":
                 try:
                     api.cancel_order(o.id)
-                except Exception as e:
-                    log.warning(f"[AUTO-FIX] cancel failed {o.symbol}: {e}")
-                    _LAST_FIXED_AT[o.id] = now
-                    continue
-                try:
-                    qty = float(Decimal(str(o.qty)))
-                except Exception:
-                    log.warning(f"[AUTO-FIX] bad qty for {o.symbol}")
-                    _LAST_FIXED_AT[o.id] = now
-                    continue
-                try:
                     bid = latest_bid(o.symbol)
+                    qty = float(o.qty)
                     place_limit_sell_extended(o.symbol, qty, ref_bid=bid)
-                    log.info(f"[AUTO-FIX] SELL -> LIMIT+extended for {o.symbol}")
+                    log.info(f"[AUTO-FIX] Replaced SELL/MARKET with SELL/LIMIT for {o.symbol}")
                 except Exception as e:
-                    log.warning(f"[AUTO-FIX] replace failed {o.symbol}: {e}")
-                _LAST_FIXED_AT[o.id] = now
-        except Exception as e:
-            log.debug(f"[AUTO-FIX] list_orders failed: {e}")
-        time.sleep(max(0.0, pulse_sleep))
-
-# =========================
-# (NEW) News helper — لا يغيّر الأوامر؛ فقط يرجّع درجة -1..+1
-# =========================
-def get_news_sentiment(symbol: str) -> int:
-    """
-    يرجّع درجة -1..+1 اعتماداً على كلمات مفتاحية في headline/summary لآخر NEWS_LOOKBACK_MIN دقيقة.
-    - لا يغيّر أي أوامر أو منطق بيع/شراء.
-    - تُستخدم النتيجة لضبط الزخم أو منع الدخول عند سلبية قوية.
-    """
-    try:
-        end_utc = datetime.utcnow()
-        start_utc = end_utc - timedelta(minutes=NEWS_LOOKBACK_MIN)
-
-        # بعض إصدارات SDK تستخدم symbol، وبعضها symbols
-        try:
-            news = api.get_news(
-                symbol=symbol,
-                start=start_utc.isoformat() + "Z",
-                end=end_utc.isoformat() + "Z",
-                limit=3
-            )
-        except Exception:
-            news = api.get_news(
-                symbols=[symbol],
-                start=start_utc.isoformat() + "Z",
-                end=end_utc.isoformat() + "Z",
-                limit=3
-            )
-
-        total = 0
-        for n in news:
-            headline = (getattr(n, "headline", "") or "").lower()
-            summary  = (getattr(n, "summary", "") or "").lower()
-            text = f"{headline} {summary}"
-            if POS_WORDS.search(text): total += 1
-            if NEG_WORDS.search(text): total -= 1
-
-        score = max(-1, min(1, total))
-        if total != 0:
-            log.info(f"[NEWS] {symbol}: score={score} (lookback={NEWS_LOOKBACK_MIN}m)")
-        return score
+                    log.warning(f"[AUTO-FIX] failed for {o.symbol}: {e}")
     except Exception as e:
-        log.debug(f"[NEWS] {symbol}: fetch failed ({e})")
+        log.debug(f"[AUTO-FIX] list_orders failed: {e}")
+
+# =========================
+# Allocation helpers
+# =========================
+def get_buying_power_cash() -> float:
+    try:
+        acct = api.get_account()
+        cash = float(getattr(acct, "cash", "0") or 0)
+        if cash and cash > 0:
+            return cash
+        bp = float(getattr(acct, "buying_power", "0") or 0)
+        return bp
+    except Exception as e:
+        log.warning(f"account read failed: {e}")
+        return 0.0
+
+def compute_qty_for_budget(symbol: str, budget: float) -> int:
+    price = last_trade_price(symbol)
+    if not price or price <= 0:
+        log.warning(f"[SKIP] {symbol} no price available.")
         return 0
+    qty = int(budget // price)
+    if qty < 1:
+        log.warning(f"[SKIP] {symbol} budget too small: ${budget:.2f}, price={price:.2f}")
+        return 0
+    return qty
 
 # =========================
 # Main loop
@@ -528,9 +452,7 @@ def main_loop():
         f"trail_pct={TRAIL_PCT} trail_price={TRAIL_PRICE} "
         f"no_reentry_today={NO_REENTRY_TODAY} cooldown_min={COOLDOWN_MINUTES} "
         f"interval_s={INTERVAL_SECONDS} pre_slip_usd={PRE_SLIPPAGE_USD} "
-        f"sell_pad_usd={SELL_PAD_USD} allow_pre_auto_sell={ALLOW_PRE_AUTO_SELL} | "
-        f"news_enabled={ENABLE_NEWS} news_block_neg={NEWS_BLOCK_NEG} news_boost={NEWS_POS_BOOST} "
-        f"news_lookback_min={NEWS_LOOKBACK_MIN}"
+        f"sell_pad_usd={SELL_PAD_USD} allow_pre_auto_sell={ALLOW_PRE_AUTO_SELL}"
     )
 
     log.info("Bot started.")
@@ -543,44 +465,33 @@ def main_loop():
             else:
                 heartbeat(f"Session={session} - cycle begin")
 
-                # السلوك القديم (والآن أقوى): إصلاح SELL قبل الافتتاح فقط
+                # NEW: fix any SELL/MARKET stuck during PRE
                 auto_fix_premarket_market_sells()
 
                 record_today_sells(api, SYMBOLS)
                 open_map = open_orders_map()
 
-                # ==== 1) compute momentum (+news) and pick best K ====
-                candidates = []  # (symbol, momentum_adj, price)
+                # ==== 1) compute momentum and pick best K ====
+                candidates = []  # (symbol, momentum, price)
                 for symbol in SYMBOLS:
                     mom = momentum_for_last_min(symbol)
                     if mom is None:
                         log.info(f"{symbol}: ❌ no bar data / bad open; skip")
                         continue
 
-                    # -------- دمج الأخبار (لا تغيير على الأوامر) --------
-                    mom_adj = mom
-                    if ENABLE_NEWS:
-                        news_score = get_news_sentiment(symbol)
-                        if news_score < 0 and NEWS_BLOCK_NEG:
-                            log.info(f"{symbol}: ❌ Negative news detected, skip.")
-                            continue
-                        mom_adj = mom + news_score * NEWS_POS_BOOST
-                        log.info(f"{symbol}: mom={mom:.5f} → mom_adj={mom_adj:.5f} (thr={MOMENTUM_THRESHOLD})")
-                    else:
-                        log.info(f"{symbol}: mom={mom:.5f} thr={MOMENTUM_THRESHOLD}")
-
                     states = guard_states(symbol, open_map)
                     allowed, reason = can_open_new_long(symbol, states)
 
                     log.info(
-                        f"{symbol}: guards: pos={states['has_pos']}, "
+                        f"{symbol}: mom={mom:.5f} thr={MOMENTUM_THRESHOLD} | "
+                        f"guards: pos={states['has_pos']}, "
                         f"open_order={states['has_open_order']}, "
                         f"sold_today={states['sold_today']}, "
                         f"cooldown={states['cooldown']}, "
                         f"maxpos={states['max_positions_reached']}"
                     )
 
-                    if mom_adj < MOMENTUM_THRESHOLD:
+                    if mom < MOMENTUM_THRESHOLD:
                         continue
                     if not allowed:
                         continue
@@ -589,7 +500,7 @@ def main_loop():
                     if not price or price <= 0:
                         continue
 
-                    candidates.append((symbol, mom_adj, price))
+                    candidates.append((symbol, mom, price))
 
                 candidates.sort(key=lambda x: x[1], reverse=True)
                 best = [c[0] for c in candidates[:TOP_K]]
@@ -612,7 +523,7 @@ def main_loop():
 
                     log.info(f"Per-position budget ≈ ${per_budget:.2f}")
 
-                    # ==== 4) execute buys + attach trailing (نفس السلوك القديم) ====
+                    # ==== 4) execute buys + attach trailing ====
                     for sym in symbols_to_open:
                         cancel_symbol_open_orders(sym)  # safety
                         qty = compute_qty_for_budget(sym, per_budget)
