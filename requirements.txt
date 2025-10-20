@@ -1,3 +1,5 @@
 alpaca-trade-api
 pandas
 numpy
+fastapi
+uvicorn
