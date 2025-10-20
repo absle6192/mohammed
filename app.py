@@ -1,11 +1,12 @@
-from from
-fastapi import FastAPI
-fastapi.responses import JSONResponse, F
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse, HTMLResponse
+
 app = FastAPI()
+
 @app.get("/")
 def home():
-return HTMLResponse("<h3>Trading bot serv
-@app.get ("/health")
+    return HTMLResponse("<h3>Trading bot server is running...</h3>")
+
+@app.get("/health")
 def health():
-return
-JSONResponse ({"status": "ok"})
+    return JSONResponse({"status": "ok"})
