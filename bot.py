@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo  # for ET session detection
-import re  # ← NEW: للكلمات المفتاحية في الأخبار
+import re  # للكلمات المفتاحية في الأخبار
+from decimal import Decimal, ROUND_HALF_UP  # NEW
 
 from alpaca_trade_api.rest import REST, TimeFrame, TimeFrameUnit
 
@@ -59,7 +60,7 @@ SELL_PAD_USD     = float(os.getenv("SELL_PAD_USD", "0.02"))      # how much belo
 # ===== allow/deny auto-sell in pre-market via ENV =====
 ALLOW_PRE_AUTO_SELL = os.getenv("ALLOW_PRE_AUTO_SELL", "false").lower() == "true"
 
-# ============ NEWS FILTER (NEW) ============
+# ============ NEWS FILTER ============
 ENABLE_NEWS = os.getenv("ENABLE_NEWS", "true").lower() == "true"     # فعّال افتراضياً
 NEWS_LOOKBACK_MIN = int(os.getenv("NEWS_LOOKBACK_MIN", "120"))       # آخر 120 دقيقة
 NEWS_BLOCK_NEG = os.getenv("NEWS_BLOCK_NEG", "true").lower() == "true"  # امنع الشراء لو سلبية
@@ -311,8 +312,11 @@ def should_allow_auto_sell(symbol: str) -> bool:
     return True
 
 # =========================
-# Orders (لا تغيير في المنطق الأصلي)
+# Orders
 # =========================
+def qty_str_int(q) -> str:  # NEW
+    return str(int(Decimal(str(q)).quantize(Decimal('1'), rounding=ROUND_HALF_UP)))
+
 def place_market_buy_qty_regular(symbol: str, qty: int) -> Optional[str]:
     try:
         o = api.submit_order(
@@ -349,10 +353,10 @@ def place_limit_sell_extended(symbol: str, qty: float, ref_bid: Optional[float] 
         limit_price = round(bid - p, 2)
         o = api.submit_order(
             symbol=symbol, side="sell", type="limit",
-            time_in_force="day", qty=str(qty),
+            time_in_force="day", qty=qty_str_int(qty),   # NEW: صيغة كمية صحيحة
             limit_price=str(limit_price), extended_hours=True
         )
-        log.info(f"[SELL-EXT/LMT] {symbol} qty={qty} limit={limit_price}")
+        log.info(f"[SELL-EXT/LMT] {symbol} qty={qty_str_int(qty)} limit={limit_price}")
         return o.id
     except Exception as e:
         log.error(f"SELL extended limit failed {symbol}: {e}")
@@ -411,51 +415,61 @@ def force_exit_pre(symbol: str, pad: float = None):
         log.error(f"[EXIT-PRE] {symbol} failed: {e}")
         return None
 
-# --------- auto-fix market sells in PRE (السلوك القديم كما هو) ----------
-def auto_fix_premarket_market_sells():
-    """If there are open SELL/MARKET orders during PRE, cancel and replace with LIMIT+extended."""
+# --------- Auto-fix market sells in PRE (قوي مثل القديم) ----------
+_LAST_FIXED_AT: Dict[str, float] = {}  # order_id -> epoch seconds  # NEW
+
+def _should_fix_sell_in_pre(order) -> bool:  # NEW
+    try:
+        if order.side != "sell":
+            return False
+        typ = (order.type or "").lower()
+        ext = bool(getattr(order, "extended_hours", False))
+        # أصل السلوك القديم: صحّح إذا كان ماركت أو غير مفعّل extended_hours
+        return (typ == "market") or (not ext)
+    except Exception:
+        return False
+
+def auto_fix_premarket_market_sells(pulses: int = 3, pulse_sleep: float = 0.35):  # NEW
+    """
+    فقط قبل الافتتاح (04:00–09:30 ET):
+    - يلغي أي SELL/Market
+    - أو أي SELL غير مفعّل extended_hours
+    - ثم يعيده SELL/LIMIT + extended_hours=True بسعر (Bid - pad)
+    """
     if current_session_et() != "pre":
         return
-    try:
-        open_os = api.list_orders(status="open")
-        for o in open_os:
-            if o.side == "sell" and o.type == "market":
+    for _ in range(max(1, pulses)):
+        try:
+            orders = api.list_orders(status="open")
+            now = time.time()
+            for o in orders:
+                if not _should_fix_sell_in_pre(o):
+                    continue
+                last = _LAST_FIXED_AT.get(o.id, 0.0)
+                if now - last < 2.0:
+                    continue
                 try:
                     api.cancel_order(o.id)
-                    bid = latest_bid(o.symbol)
-                    qty = float(o.qty)
-                    place_limit_sell_extended(o.symbol, qty, ref_bid=bid)
-                    log.info(f"[AUTO-FIX] Replaced SELL/MARKET with SELL/LIMIT for {o.symbol}")
                 except Exception as e:
-                    log.warning(f"[AUTO-FIX] failed for {o.symbol}: {e}")
-    except Exception as e:
-        log.debug(f"[AUTO-FIX] list_orders failed: {e}")
-
-# =========================
-# Allocation helpers
-# =========================
-def get_buying_power_cash() -> float:
-    try:
-        acct = api.get_account()
-        cash = float(getattr(acct, "cash", "0") or 0)
-        if cash and cash > 0:
-            return cash
-        bp = float(getattr(acct, "buying_power", "0") or 0)
-        return bp
-    except Exception as e:
-        log.warning(f"account read failed: {e}")
-        return 0.0
-
-def compute_qty_for_budget(symbol: str, budget: float) -> int:
-    price = last_trade_price(symbol)
-    if not price or price <= 0:
-        log.warning(f"[SKIP] {symbol} no price available.")
-        return 0
-    qty = int(budget // price)
-    if qty < 1:
-        log.warning(f"[SKIP] {symbol} budget too small: ${budget:.2f}, price={price:.2f}")
-        return 0
-    return qty
+                    log.warning(f"[AUTO-FIX] cancel failed {o.symbol}: {e}")
+                    _LAST_FIXED_AT[o.id] = now
+                    continue
+                try:
+                    qty = float(Decimal(str(o.qty)))
+                except Exception:
+                    log.warning(f"[AUTO-FIX] bad qty for {o.symbol}")
+                    _LAST_FIXED_AT[o.id] = now
+                    continue
+                try:
+                    bid = latest_bid(o.symbol)
+                    place_limit_sell_extended(o.symbol, qty, ref_bid=bid)
+                    log.info(f"[AUTO-FIX] SELL -> LIMIT+extended for {o.symbol}")
+                except Exception as e:
+                    log.warning(f"[AUTO-FIX] replace failed {o.symbol}: {e}")
+                _LAST_FIXED_AT[o.id] = now
+        except Exception as e:
+            log.debug(f"[AUTO-FIX] list_orders failed: {e}")
+        time.sleep(max(0.0, pulse_sleep))
 
 # =========================
 # (NEW) News helper — لا يغيّر الأوامر؛ فقط يرجّع درجة -1..+1
@@ -529,7 +543,7 @@ def main_loop():
             else:
                 heartbeat(f"Session={session} - cycle begin")
 
-                # السلوك القديم: إصلاح SELL/MARKET قبل الافتتاح فقط
+                # السلوك القديم (والآن أقوى): إصلاح SELL قبل الافتتاح فقط
                 auto_fix_premarket_market_sells()
 
                 record_today_sells(api, SYMBOLS)
@@ -543,7 +557,7 @@ def main_loop():
                         log.info(f"{symbol}: ❌ no bar data / bad open; skip")
                         continue
 
-                    # -------- NEW: دمج الأخبار (بدون تغيير أي أوامر) --------
+                    # -------- دمج الأخبار (لا تغيير على الأوامر) --------
                     mom_adj = mom
                     if ENABLE_NEWS:
                         news_score = get_news_sentiment(symbol)
