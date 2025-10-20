@@ -98,12 +98,23 @@ def get_news_sentiment(symbol: str) -> int:
     try:
         end_utc = datetime.utcnow()
         start_utc = end_utc - timedelta(minutes=NEWS_LOOKBACK_MIN)
-        news = api.get_news(
-            symbols=symbol,
-            start=start_utc.isoformat() + "Z",
-            end=end_utc.isoformat() + "Z",
-            limit=3
-        )
+
+        # ✅ استخدام 'symbol' مع fallback إلى 'symbols' لتوافق الإصدارات
+        try:
+            news = api.get_news(
+                symbol=symbol,
+                start=start_utc.isoformat() + "Z",
+                end=end_utc.isoformat() + "Z",
+                limit=3
+            )
+        except TypeError:
+            # إصدارات قديمة قد تتطلب 'symbols'
+            news = api.get_news(
+                symbols=[symbol],
+                start=start_utc.isoformat() + "Z",
+                end=end_utc.isoformat() + "Z",
+                limit=3
+            )
 
         total = 0
         items = []
