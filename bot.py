@@ -129,6 +129,31 @@ def record_today_sells(api: REST, symbols: List[str]) -> None:
         except Exception:
             continue
 
+def recent_regular_sell_symbols(window_sec: int = 20) -> set:
+    """Symbols sold in the last `window_sec` seconds during regular session."""
+    syms = set()
+    try:
+        closed = api.list_orders(status="closed", limit=100, direction="desc")
+        cutoff = utc_now() - timedelta(seconds=window_sec)
+        from datetime import time as _t
+        REG_START_T = _t(9, 30)
+        REG_END_T   = _t(16, 0)
+        for o in closed:
+            if o.side != "sell":
+                continue
+            t = getattr(o, "filled_at", None)
+            if not t:
+                continue
+            t = t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+            if t < cutoff or t.date() != utc_today():
+                continue
+            tt = t.astimezone(ET).time()
+            if REG_START_T <= tt < REG_END_T:
+                syms.add(o.symbol)
+    except Exception as e:
+        log.debug(f"recent sells scan failed: {e}")
+    return syms
+
 def sold_today(symbol: str) -> bool:
     if not NO_REENTRY_TODAY:
         return False
@@ -240,11 +265,9 @@ def can_open_new_long(symbol: str, states: Dict[str, bool], session: str) -> Tup
     if states["max_positions_reached"]:
         return False, "max positions reached"
 
-    # allow re-entry in regular only if the sell was pre-market
     if states["sold_today"] and session == "regular" and symbol in sold_pre_market:
         return True, "re-entry after pre-market sell"
 
-    # block re-entry during same regular session
     if session == "regular" and sold_regular_today(symbol):
         return False, "sold earlier in regular session"
 
@@ -445,7 +468,7 @@ def main_loop():
             else:
                 heartbeat(f"Session={session} - cycle begin")
 
-                # Instant sell detection at START
+                # (A) قفل فوري من تغيّر الكميات
                 pos_now = positions_qty_map()
                 if session == "regular":
                     try:
@@ -461,6 +484,11 @@ def main_loop():
                         pass
                 _last_qty.clear()
                 _last_qty.update(pos_now)
+
+                # (B) قفل سريع لأي بيع مغلق قبل ثوانٍ
+                just_sold = recent_regular_sell_symbols(window_sec=20)
+                for s in just_sold:
+                    sold_regular_lock[s] = utc_now()
 
                 auto_fix_premarket_market_sells()
                 record_today_sells(api, SYMBOLS)
@@ -517,8 +545,9 @@ def main_loop():
                     log.info(f"Per-position budget ≈ ${per_budget:.2f}")
 
                     for sym in symbols_to_open:
-                        # Final gate: block if sold earlier in regular (redundant safety)
-                        if session == "regular" and sold_regular_today(sym):
+                        # فحص أخير للتثبيت قبل الشراء
+                        record_today_sells(api, SYMBOLS)
+                        if session == "regular" and (sold_regular_today(sym) or sym in recent_regular_sell_symbols(10)):
                             log.info(f"[SKIP BUY] {sym}: locked for rest of regular session")
                             continue
 
