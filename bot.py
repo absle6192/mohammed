@@ -449,7 +449,23 @@ def main_loop():
             else:
                 heartbeat(f"Session={session} - cycle begin")
 
+                # --- Instant sell detection at START of cycle ---
                 pos_now = positions_qty_map()
+                if session == "regular":
+                    try:
+                        syms = set(list(_last_qty.keys()) + list(pos_now.keys()))
+                        for s in syms:
+                            prev_q = _last_qty.get(s, 0.0)
+                            curr_q = pos_now.get(s, 0.0)
+                            if prev_q > 0 and curr_q <= 0:
+                                now = utc_now()
+                                sold_registry[s] = now
+                                sold_regular_lock[s] = now
+                    except Exception:
+                        pass
+                # keep snapshot for end-of-cycle refresh
+                _last_qty.clear()
+                _last_qty.update(pos_now)
 
                 auto_fix_premarket_market_sells()
                 record_today_sells(api, SYMBOLS)
@@ -528,26 +544,7 @@ def main_loop():
                                 time.sleep(1.5)
                                 try_attach_trailing_stop_if_allowed(sym)
 
-                # instant local sell detection -> also lock symbol for rest of regular session
-                if session == "regular":
-                    try:
-                        pos_new = positions_qty_map()
-                        syms = set(list(_last_qty.keys()) + list(pos_new.keys()))
-                        for s in syms:
-                            prev_q = _last_qty.get(s, 0.0)
-                            curr_q = pos_new.get(s, 0.0)
-                            if prev_q > 0 and curr_q <= 0:
-                                now = utc_now()
-                                sold_registry[s] = now
-                                sold_regular_lock[s] = now
-                        _last_qty.clear()
-                        _last_qty.update(pos_new)
-                    except Exception:
-                        pass
-                else:
-                    _last_qty.clear()
-                    _last_qty.update(pos_now)
-
+                # optional: refresh from API at end
                 record_today_sells(api, SYMBOLS)
 
                 elapsed = time.time() - cycle_started
