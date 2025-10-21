@@ -329,6 +329,9 @@ def place_market_buy_qty_regular(symbol: str, qty: int) -> Optional[str]:
         return None
 
 def place_limit_buy_qty_premarket(symbol: str, qty: int, ref_price: float) -> Optional[str]:
+    """
+    PRE-market buy as LIMIT with extended_hours=True.
+    """
     try:
         limit_price = round(float(ref_price) + PRE_SLIPPAGE_USD, 2)
         o = api.submit_order(
@@ -464,6 +467,17 @@ def compute_qty_for_budget(symbol: str, budget: float) -> int:
     return qty
 
 # =========================
+# Position helpers for instant sell detection
+# =========================
+def positions_qty_map() -> Dict[str, float]:
+    try:
+        return {p.symbol: float(p.qty) for p in api.list_positions()}
+    except Exception:
+        return {}
+
+_last_qty: Dict[str, float] = {}
+
+# =========================
 # Main loop
 # =========================
 def main_loop():
@@ -488,11 +502,15 @@ def main_loop():
             else:
                 heartbeat(f"Session={session} - cycle begin")
 
+                # snapshot positions for instant sell detection
+                pos_now = positions_qty_map()
+
                 auto_fix_premarket_market_sells()
                 record_today_sells(api, SYMBOLS)
                 open_map = open_orders_map()
 
-                candidates = []
+                # ==== compute momentum and pick best K ====
+                candidates = []  # (symbol, momentum, price)
                 for symbol in SYMBOLS:
                     mom = momentum_for_last_min(symbol)
                     if mom is None:
@@ -525,6 +543,7 @@ def main_loop():
                 candidates.sort(key=lambda x: x[1], reverse=True)
                 best = [c[0] for c in candidates[:TOP_K]]
 
+                # ==== capacity ====
                 currently_open_syms = set(list_open_positions_symbols())
                 open_count = len(currently_open_syms)
                 slots_left = max(0, min(MAX_OPEN_POSITIONS, TOP_K) - open_count)
@@ -532,6 +551,7 @@ def main_loop():
 
                 log.info(f"BEST={best} | open={list(currently_open_syms)} | to_open={symbols_to_open} | slots_left={slots_left}")
 
+                # ==== budget ====
                 if symbols_to_open:
                     if ALLOCATE_FROM_CASH:
                         cash_or_bp = get_buying_power_cash()
@@ -541,6 +561,7 @@ def main_loop():
 
                     log.info(f"Per-position budget ≈ ${per_budget:.2f}")
 
+                    # ==== execute buys + trailing ====
                     for sym in symbols_to_open:
                         cancel_symbol_open_orders(sym)
                         qty = compute_qty_for_budget(sym, per_budget)
@@ -565,6 +586,25 @@ def main_loop():
                                 time.sleep(1.5)
                                 try_attach_trailing_stop_if_allowed(sym)
 
+                # instant local sell detection (prevents re-buy after a regular-session sell if API lags)
+                if session == "regular":
+                    try:
+                        pos_new = positions_qty_map()
+                        syms = set(list(_last_qty.keys()) + list(pos_new.keys()))
+                        for s in syms:
+                            prev_q = _last_qty.get(s, 0.0)
+                            curr_q = pos_new.get(s, 0.0)
+                            if prev_q > 0 and curr_q <= 0:
+                                sold_registry[s] = utc_now()
+                        _last_qty.clear()
+                        _last_qty.update(pos_new)
+                    except Exception:
+                        pass
+                else:
+                    _last_qty.clear()
+                    _last_qty.update(pos_now)
+
+                # refresh sells from API
                 record_today_sells(api, SYMBOLS)
 
                 elapsed = time.time() - cycle_started
