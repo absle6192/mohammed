@@ -177,9 +177,16 @@ def last_trade_price(symbol: str) -> Optional[float]:
         return None
 
 def latest_bid(symbol: str) -> float:
+    """More robust bid reader across SDK versions."""
     try:
         q = api.get_latest_quote(symbol)
-        return float(getattr(q, "bidprice", 0) or 0)
+        b = (
+            getattr(q, "bidprice", None) or
+            getattr(q, "bid_price", None) or
+            getattr(q, "bid", None) or
+            0
+        )
+        return float(b or 0.0)
     except Exception:
         return 0.0
 
@@ -320,8 +327,12 @@ def place_market_buy_qty_regular(symbol: str, qty: int) -> Optional[str]:
         return None
 
 def place_limit_buy_qty_premarket(symbol: str, qty: int, ref_price: float) -> Optional[str]:
+    """
+    PRE-market buy as LIMIT with extended_hours=True.
+    ➜ rounding to 2 decimals to avoid sub-penny rejection.
+    """
     try:
-        limit_price = float(ref_price) + PRE_SLIPPAGE_USD
+        limit_price = round(float(ref_price) + PRE_SLIPPAGE_USD, 2)
         o = api.submit_order(
             symbol=symbol, side="buy", type="limit", time_in_force="day",
             qty=str(qty), limit_price=str(limit_price), extended_hours=True
@@ -405,23 +416,35 @@ def force_exit_pre(symbol: str, pad: float = None):
         log.error(f"[EXIT-PRE] {symbol} failed: {e}")
         return None
 
-# --------- NEW: auto-fix market sells in PRE ----------
+# --------- UPDATED: auto-fix manual market orders in PRE ----------
 def auto_fix_premarket_market_sells():
-    """If there are open SELL/MARKET orders during PRE, cancel and replace with LIMIT+extended."""
+    """
+    During PRE only:
+    - If there's any SELL/MARKET order still open -> cancel & replace with SELL/LIMIT (extended)
+    - (Optional) also convert BUY/MARKET to BUY/LIMIT to avoid rejections.
+    """
     if current_session_et() != "pre":
         return
     try:
         open_os = api.list_orders(status="open")
         for o in open_os:
-            if o.side == "sell" and o.type == "market":
-                try:
+            try:
+                if o.side == "sell" and o.type == "market":
                     api.cancel_order(o.id)
                     bid = latest_bid(o.symbol)
                     qty = float(o.qty)
                     place_limit_sell_extended(o.symbol, qty, ref_bid=bid)
-                    log.info(f"[AUTO-FIX] Replaced SELL/MARKET with SELL/LIMIT for {o.symbol}")
-                except Exception as e:
-                    log.warning(f"[AUTO-FIX] failed for {o.symbol}: {e}")
+                    log.info(f"[AUTO-FIX] Replaced SELL/MARKET with SELL/LIMIT (extended) for {o.symbol}")
+                    continue
+                if o.side == "buy" and o.type == "market":
+                    api.cancel_order(o.id)
+                    last = last_trade_price(o.symbol) or latest_bid(o.symbol)
+                    qty = int(float(o.qty))
+                    if last and qty > 0:
+                        place_limit_buy_qty_premarket(o.symbol, qty, ref_price=last)
+                        log.info(f"[AUTO-FIX] Replaced BUY/MARKET with BUY/LIMIT (extended) for {o.symbol}")
+            except Exception as e:
+                log.warning(f"[AUTO-FIX] failed for {getattr(o, 'symbol', '?')}: {e}")
     except Exception as e:
         log.debug(f"[AUTO-FIX] list_orders failed: {e}")
 
@@ -476,7 +499,7 @@ def main_loop():
             else:
                 heartbeat(f"Session={session} - cycle begin")
 
-                # NEW: fix any SELL/MARKET stuck during PRE
+                # Fix any Market orders during PRE (manual sells/buys)
                 auto_fix_premarket_market_sells()
 
                 record_today_sells(api, SYMBOLS)
@@ -575,7 +598,10 @@ def main_loop():
         if total_elapsed > MAX_CYCLE_SECONDS:
             log.warning(f"⚠️ Slow cycle: {total_elapsed:.1f}s (limit {MAX_CYCLE_SECONDS}s)")
 
-        sleep_until_next_interval(INTERVAL_SECONDS, cycle_started)
+        # ⏱️ جعل الفاصل أسرع أثناء الـ PRE (يمسك الأوامر اليدوية بسرعة)
+        session = current_session_et()
+        dynamic_interval = 3 if session == "pre" else INTERVAL_SECONDS
+        sleep_until_next_interval(dynamic_interval, cycle_started)
 
 # =========================
 # Entry
