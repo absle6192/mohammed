@@ -96,11 +96,12 @@ def can_trade_now() -> tuple[bool, bool]:
         return True, False
     return False, False
 
-# ---- Registries ----
+# ---------------- Registries ----------------
 sold_registry: Dict[str, datetime] = {}
 sold_pre_market: Dict[str, datetime] = {}
-sold_regular_lock: Dict[str, datetime] = {}  # block re-entry in same regular session
+sold_regular_lock: Dict[str, datetime] = {}  # lock in regular session
 
+# ---------------- Helpers ----------------
 def record_today_sells(api: REST, symbols: List[str]) -> None:
     try:
         closed = api.list_orders(status="closed", limit=200, direction="desc")
@@ -110,7 +111,6 @@ def record_today_sells(api: REST, symbols: List[str]) -> None:
     from datetime import time as _t
     REG_START_T = _t(9, 30)
     REG_END_T   = _t(16, 0)
-
     for o in closed:
         try:
             if o.side != "sell" or o.symbol not in symbols:
@@ -120,11 +120,8 @@ def record_today_sells(api: REST, symbols: List[str]) -> None:
             filled_at = o.filled_at if o.filled_at.tzinfo else o.filled_at.replace(tzinfo=timezone.utc)
             if filled_at.date() != utc_today():
                 continue
-
             sold_registry[o.symbol] = filled_at
-
-            filled_et = filled_at.astimezone(ET)
-            tt = filled_et.time()
+            tt = filled_at.astimezone(ET).time()
             if tt < REG_START_T:
                 sold_pre_market[o.symbol] = filled_at
             elif REG_START_T <= tt < REG_END_T:
@@ -148,7 +145,6 @@ def in_cooldown(symbol: str) -> bool:
     ts = sold_registry.get(symbol)
     return bool(ts and utc_now() < ts + timedelta(minutes=COOLDOWN_MINUTES))
 
-# ---- Market helpers ----
 def last_trade_price(symbol: str) -> Optional[float]:
     try:
         trade = api.get_latest_trade(symbol)
@@ -210,7 +206,7 @@ def cancel_symbol_open_orders(symbol: str):
     except Exception:
         pass
 
-# ---- Momentum ----
+# ---------------- Momentum ----------------
 def momentum_for_last_min(symbol: str) -> Optional[float]:
     try:
         bars = api.get_bars(symbol, TimeFrame(1, TimeFrameUnit.Minute), limit=2).df
@@ -224,7 +220,7 @@ def momentum_for_last_min(symbol: str) -> Optional[float]:
         log.debug(f"momentum calc error {symbol}: {e}")
         return None
 
-# ---- Guards ----
+# ---------------- Guards ----------------
 def guard_states(symbol: str, open_orders: Dict[str, bool]) -> Dict[str, bool]:
     return {
         "has_pos": has_open_position(symbol),
@@ -248,7 +244,7 @@ def can_open_new_long(symbol: str, states: Dict[str, bool], session: str) -> Tup
     if states["sold_today"] and session == "regular" and symbol in sold_pre_market:
         return True, "re-entry after pre-market sell"
 
-    # block same-day re-entry in regular after a regular-session sell
+    # block re-entry during same regular session
     if session == "regular" and sold_regular_today(symbol):
         return False, "sold earlier in regular session"
 
@@ -257,7 +253,7 @@ def can_open_new_long(symbol: str, states: Dict[str, bool], session: str) -> Tup
 
     return True, ""
 
-# ---- Pre-market lock for auto-sell ----
+# ---------------- Pre-market lock for auto-sell ----------------
 PREMARKET_LOCK: Dict[str, str] = {}
 
 def record_prebuy(symbol: str):
@@ -282,7 +278,7 @@ def should_allow_auto_sell(symbol: str) -> bool:
         return False
     return True
 
-# ---- Orders ----
+# ---------------- Orders ----------------
 def place_market_buy_qty_regular(symbol: str, qty: int) -> Optional[str]:
     try:
         o = api.submit_order(symbol=symbol, side="buy", type="market",
@@ -393,7 +389,7 @@ def auto_fix_premarket_market_sells():
     except Exception as e:
         log.debug(f"[AUTO-FIX] list_orders failed: {e}")
 
-# ---- Allocation ----
+# ---------------- Allocation ----------------
 def get_buying_power_cash() -> float:
     try:
         acct = api.get_account()
@@ -417,7 +413,7 @@ def compute_qty_for_budget(symbol: str, budget: float) -> int:
         return 0
     return qty
 
-# ---- Positions for instant sell detection ----
+# ---------------- Positions (instant sell detect) ----------------
 def positions_qty_map() -> Dict[str, float]:
     try:
         return {p.symbol: float(p.qty) for p in api.list_positions()}
@@ -426,7 +422,7 @@ def positions_qty_map() -> Dict[str, float]:
 
 _last_qty: Dict[str, float] = {}
 
-# ---- Main loop ----
+# ---------------- Main loop ----------------
 def main_loop():
     log.info(f"SYMBOLS LOADED: {SYMBOLS}")
     log.info(
@@ -449,7 +445,7 @@ def main_loop():
             else:
                 heartbeat(f"Session={session} - cycle begin")
 
-                # --- Instant sell detection at START of cycle ---
+                # Instant sell detection at START
                 pos_now = positions_qty_map()
                 if session == "regular":
                     try:
@@ -463,7 +459,6 @@ def main_loop():
                                 sold_regular_lock[s] = now
                     except Exception:
                         pass
-                # keep snapshot for end-of-cycle refresh
                 _last_qty.clear()
                 _last_qty.update(pos_now)
 
@@ -471,6 +466,7 @@ def main_loop():
                 record_today_sells(api, SYMBOLS)
                 open_map = open_orders_map()
 
+                # Compute candidates
                 candidates = []
                 for symbol in SYMBOLS:
                     mom = momentum_for_last_min(symbol)
@@ -483,10 +479,8 @@ def main_loop():
 
                     log.info(
                         f"{symbol}: mom={mom:.5f} thr={MOMENTUM_THRESHOLD} | "
-                        f"guards: pos={states['has_pos']}, "
-                        f"open_order={states['has_open_order']}, "
-                        f"sold_today={states['sold_today']}, "
-                        f"cooldown={states['cooldown']}, "
+                        f"guards: pos={states['has_pos']}, open_order={states['has_open_order']}, "
+                        f"sold_today={states['sold_today']}, cooldown={states['cooldown']}, "
                         f"maxpos={states['max_positions_reached']}"
                     )
 
@@ -504,6 +498,7 @@ def main_loop():
                 candidates.sort(key=lambda x: x[1], reverse=True)
                 best = [c[0] for c in candidates[:TOP_K]]
 
+                # Capacity
                 currently_open_syms = set(list_open_positions_symbols())
                 open_count = len(currently_open_syms)
                 slots_left = max(0, min(MAX_OPEN_POSITIONS, TOP_K) - open_count)
@@ -511,6 +506,7 @@ def main_loop():
 
                 log.info(f"BEST={best} | open={list(currently_open_syms)} | to_open={symbols_to_open} | slots_left={slots_left}")
 
+                # Execute
                 if symbols_to_open:
                     if ALLOCATE_FROM_CASH:
                         cash_or_bp = get_buying_power_cash()
@@ -521,6 +517,11 @@ def main_loop():
                     log.info(f"Per-position budget ≈ ${per_budget:.2f}")
 
                     for sym in symbols_to_open:
+                        # Final gate: block if sold earlier in regular (redundant safety)
+                        if session == "regular" and sold_regular_today(sym):
+                            log.info(f"[SKIP BUY] {sym}: locked for rest of regular session")
+                            continue
+
                         cancel_symbol_open_orders(sym)
                         qty = compute_qty_for_budget(sym, per_budget)
                         if qty < 1:
@@ -544,7 +545,6 @@ def main_loop():
                                 time.sleep(1.5)
                                 try_attach_trailing_stop_if_allowed(sym)
 
-                # optional: refresh from API at end
                 record_today_sells(api, SYMBOLS)
 
                 elapsed = time.time() - cycle_started
