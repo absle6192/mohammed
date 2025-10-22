@@ -24,8 +24,13 @@ MOMENTUM_THRESHOLD = float(os.getenv("MOMENTUM_THRESHOLD", "0.00005"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
 TOP_K = int(os.getenv("TOP_K", "2"))
 
+# ======= Allocation Settings (الجديدة) ======= #
 ALLOCATE_FROM_CASH = os.getenv("ALLOCATE_FROM_CASH", "true").lower() == "true"
 FALLBACK_NOTIONAL_PER_TRADE = float(os.getenv("NOTIONAL_PER_TRADE", "6250"))
+
+STRICT_CASH_ONLY   = os.getenv("STRICT_CASH_ONLY", "true").lower() == "true"   # NEW
+CASH_RESERVE_PCT   = float(os.getenv("CASH_RESERVE_PCT", "0.02"))              # NEW (2% احتياطي)
+PER_TRADE_PCT      = float(os.getenv("PER_TRADE_PCT", "0.0"))                  # NEW (نسبة ثابتة لكل صفقة، 0 = تقسيم تلقائي بالتساوي)
 
 TRAIL_PCT   = float(os.getenv("TRAIL_PCT", "0.7"))
 TRAIL_PRICE = float(os.getenv("TRAIL_PRICE", "0.0"))
@@ -52,7 +57,7 @@ def _mask(s: str):
 log.info(f"BASE_URL={BASE_URL} | KEY={_mask(API_KEY)}")
 try:
     acct = api.get_account()
-    log.info(f"account status ok, buying_power={getattr(acct, 'buying_power', None)}")
+    log.info(f"account status ok, buying_power={getattr(acct, 'buying_power', None)} | cash={getattr(acct,'cash',None)}")
 except Exception as e:
     log.error(f"account check failed: {e}")
 
@@ -130,7 +135,6 @@ def record_today_sells(api: REST, symbols: List[str]) -> None:
             continue
 
 def recent_regular_sell_symbols(window_sec: int = 20) -> set:
-    """Symbols sold in the last `window_sec` seconds during regular session."""
     syms = set()
     try:
         closed = api.list_orders(status="closed", limit=100, direction="desc")
@@ -412,29 +416,66 @@ def auto_fix_premarket_market_sells():
     except Exception as e:
         log.debug(f"[AUTO-FIX] list_orders failed: {e}")
 
-# ---------------- Allocation ----------------
-def get_buying_power_cash() -> float:
+# ---------------- Allocation (CHANGED) ----------------
+def get_cash_balance(strict_cash_only: bool = True) -> float:
+    """يرجع رصيد الكاش فقط. لا يستخدم Buying Power إذا strict_cash_only=True."""
     try:
         acct = api.get_account()
         cash = float(getattr(acct, "cash", "0") or 0)
-        if cash and cash > 0:
-            return cash
+        if strict_cash_only:
+            return max(0.0, cash)
+        # fallback: لو تبغى تستخدم BP عند عدم توفر كاش
         bp = float(getattr(acct, "buying_power", "0") or 0)
-        return bp
+        return cash if cash > 0 else bp
     except Exception as e:
         log.warning(f"account read failed: {e}")
         return 0.0
 
-def compute_qty_for_budget(symbol: str, budget: float) -> int:
+def compute_qty_for_budget(symbol: str, budget: float) -> Tuple[int, float]:
+    """يرجع (الكمية, السعر_الأخير)."""
     price = last_trade_price(symbol)
     if not price or price <= 0:
         log.warning(f"[SKIP] {symbol} no price available.")
-        return 0
+        return 0, 0.0
     qty = int(budget // price)
     if qty < 1:
         log.warning(f"[SKIP] {symbol} budget too small: ${budget:.2f}, price={price:.2f}")
-        return 0
-    return qty
+        return 0, price
+    return qty, price
+
+def plan_budgets_for_opens(total_cash: float, open_count: int, to_open_count: int) -> List[float]:
+    """
+    يخطط ميزانيات لكل صفقة جديدة بحيث:
+    - يحجز احتياط CASH_RESERVE_PCT
+    - لو PER_TRADE_PCT>0 يستخدم نسبة ثابتة لكل صفقة
+    - غير ذلك يقسم بالتساوي على الخانات المتبقية فقط
+    """
+    if to_open_count <= 0:
+        return []
+    reserve = max(0.0, total_cash * CASH_RESERVE_PCT)
+    usable = max(0.0, total_cash - reserve)
+
+    # كم خانة مسموح بها إجمالاً
+    target_slots = max(1, min(MAX_OPEN_POSITIONS, TOP_K))
+    # الخانات المتبقية لفتحها الآن
+    remaining_slots = max(1, target_slots - open_count)
+    remaining_slots = min(remaining_slots, to_open_count)
+
+    budgets: List[float] = []
+
+    if PER_TRADE_PCT > 0.0:
+        per = usable * PER_TRADE_PCT
+        # لا نتجاوز الـ usable
+        total_need = per * remaining_slots
+        if total_need > usable and remaining_slots > 0:
+            per = usable / remaining_slots
+        budgets = [per for _ in range(remaining_slots)]
+    else:
+        # تقسيم بالتساوي على الخانات المتبقية
+        per = usable / remaining_slots if remaining_slots > 0 else 0.0
+        budgets = [per for _ in range(remaining_slots)]
+
+    return budgets
 
 # ---------------- Positions (instant sell detect) ----------------
 def positions_qty_map() -> Dict[str, float]:
@@ -452,6 +493,7 @@ def main_loop():
         "SETTINGS: "
         f"thr={MOMENTUM_THRESHOLD} max_pos={MAX_OPEN_POSITIONS} top_k={TOP_K} "
         f"allocate_from_cash={ALLOCATE_FROM_CASH} "
+        f"strict_cash_only={STRICT_CASH_ONLY} reserve={CASH_RESERVE_PCT} per_trade_pct={PER_TRADE_PCT} "
         f"trail_pct={TRAIL_PCT} trail_price={TRAIL_PRICE} "
         f"no_reentry_today={NO_REENTRY_TODAY} cooldown_minutes={COOLDOWN_MINUTES} "
         f"interval_s={INTERVAL_SECONDS} pre_slip_usd={PRE_SLIPPAGE_USD} "
@@ -534,17 +576,29 @@ def main_loop():
 
                 log.info(f"BEST={best} | open={list(currently_open_syms)} | to_open={symbols_to_open} | slots_left={slots_left}")
 
-                # Execute
+                # ===== Execute (CHANGED: تقسيم الكاش فقط) =====
                 if symbols_to_open:
                     if ALLOCATE_FROM_CASH:
-                        cash_or_bp = get_buying_power_cash()
-                        per_budget = (cash_or_bp / len(symbols_to_open)) if cash_or_bp > 0 else FALLBACK_NOTIONAL_PER_TRADE
+                        total_cash = get_cash_balance(strict_cash_only=STRICT_CASH_ONLY)  # CHANGED
+                        budgets = plan_budgets_for_opens(total_cash, open_count, len(symbols_to_open))  # NEW
+                        if not budgets:
+                            log.info("[ALLOC] No budgets computed; fallback to notional per trade.")
+                            budgets = [FALLBACK_NOTIONAL_PER_TRADE for _ in symbols_to_open]
                     else:
-                        per_budget = FALLBACK_NOTIONAL_PER_TRADE
+                        budgets = [FALLBACK_NOTIONAL_PER_TRADE for _ in symbols_to_open]
 
-                    log.info(f"Per-position budget ≈ ${per_budget:.2f}")
+                    # تنفيذ مع عدم تجاوز الكاش المستخدَم في نفس الدورة
+                    remaining_cash_for_cycle = get_cash_balance(strict_cash_only=STRICT_CASH_ONLY)
+                    reserve_amount = remaining_cash_for_cycle * CASH_RESERVE_PCT
+                    remaining_cash_for_cycle = max(0.0, remaining_cash_for_cycle - reserve_amount)
 
-                    for sym in symbols_to_open:
+                    for sym, budget in zip(symbols_to_open, budgets):
+                        # لا تتجاوز المتبقي من الكاش في الدورة
+                        budget = min(budget, remaining_cash_for_cycle)
+                        if budget <= 1.0:
+                            log.info(f"[ALLOC] Budget depleted/too small for {sym}.")
+                            continue
+
                         # فحص أخير للتثبيت قبل الشراء
                         record_today_sells(api, SYMBOLS)
                         if session == "regular" and (sold_regular_today(sym) or sym in recent_regular_sell_symbols(10)):
@@ -552,17 +606,23 @@ def main_loop():
                             continue
 
                         cancel_symbol_open_orders(sym)
-                        qty = compute_qty_for_budget(sym, per_budget)
-                        if qty < 1:
-                            continue
-
-                        price = last_trade_price(sym)
-                        if price is None:
+                        qty, price = compute_qty_for_budget(sym, budget)
+                        if qty < 1 or not price:
                             continue
 
                         trade_ok, ext = can_trade_now()
                         if not trade_ok:
                             continue
+
+                        est_notional = qty * price
+                        if est_notional > remaining_cash_for_cycle:
+                            # قلّل الميزانية لتناسب المتبقي تقريبًا
+                            max_affordable_qty = int(remaining_cash_for_cycle // price)
+                            if max_affordable_qty < 1:
+                                log.info(f"[ALLOC] Not enough cash left for {sym}.")
+                                continue
+                            qty = max_affordable_qty
+                            est_notional = qty * price
 
                         if ext:
                             buy_id = place_limit_buy_qty_premarket(sym, qty, ref_price=price)
@@ -573,6 +633,9 @@ def main_loop():
                             if buy_id:
                                 time.sleep(1.5)
                                 try_attach_trailing_stop_if_allowed(sym)
+
+                        # حدّث المتبقي
+                        remaining_cash_for_cycle = max(0.0, remaining_cash_for_cycle - est_notional)
 
                 record_today_sells(api, SYMBOLS)
 
