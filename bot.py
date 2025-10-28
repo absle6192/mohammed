@@ -46,6 +46,22 @@ SELL_PAD_USD     = float(os.getenv("SELL_PAD_USD", "0.02"))
 
 ALLOW_PRE_AUTO_SELL = os.getenv("ALLOW_PRE_AUTO_SELL", "false").lower() == "true"
 
+# ======= إعدادات خاصة قبل الافتتاح (جديدة) ======= #
+MAX_PREMARKET_SLOTS = int(os.getenv("MAX_PREMARKET_SLOTS", "2"))   # عدد الخانات المتاحة قبل الافتتاح
+ORDER_COOLDOWN_SECONDS = int(os.getenv("ORDER_COOLDOWN_SECONDS", "8"))  # تهدئة بين أوامر الشراء قبل الافتتاح
+MAX_ORDERS_PER_CYCLE_PRE = int(os.getenv("MAX_ORDERS_PER_CYCLE_PRE", "1"))  # إدخال سهم واحد فقط بكل دورة
+
+# قفل إرسال الأوامر
+_is_submitting = False
+_last_submit_ts = 0.0
+
+def _can_submit_now() -> bool:
+    return (time.time() - _last_submit_ts) >= ORDER_COOLDOWN_SECONDS
+
+def _mark_submit():
+    global _last_submit_ts
+    _last_submit_ts = time.time()
+
 if not API_KEY or not API_SECRET:
     log.error("Missing API keys in environment.")
     raise SystemExit(1)
@@ -84,7 +100,7 @@ def current_session_et(dt: datetime | None = None) -> str:
         return "closed"
     t = now.time()
     from datetime import time as _t
-    PRE_START  = _t(4, 0)
+    PRE_START  = _t(5, 0)   # ضبطناها 05:00 نيويورك
     REG_START  = _t(9, 30)
     REG_END    = _t(16, 0)
     if PRE_START <= t < REG_START:
@@ -223,6 +239,17 @@ def open_orders_map() -> Dict[str, bool]:
         pass
     return m
 
+def count_open_buy_orders_in_universe() -> int:
+    c = 0
+    try:
+        orders = api.list_orders(status="open")
+        for o in orders:
+            if o.side == "buy" and o.symbol in SYMBOLS:
+                c += 1
+    except Exception:
+        pass
+    return c
+
 def cancel_symbol_open_orders(symbol: str):
     try:
         for o in api.list_orders(status="open"):
@@ -266,8 +293,9 @@ def can_open_new_long(symbol: str, states: Dict[str, bool], session: str) -> Tup
         return False, "open order exists"
     if states["cooldown"]:
         return False, "in cooldown"
-    if states["max_positions_reached"]:
-        return False, "max positions reached"
+    if states["max_positions_reached"] and session != "pre":
+        return False, "max positions reached (regular)"
+    # في pre راح نستخدم Slots خاصة، فلا نمنع هنا
 
     if states["sold_today"] and session == "regular" and symbol in sold_pre_market:
         return True, "re-entry after pre-market sell"
@@ -275,7 +303,7 @@ def can_open_new_long(symbol: str, states: Dict[str, bool], session: str) -> Tup
     if session == "regular" and sold_regular_today(symbol):
         return False, "sold earlier in regular session"
 
-    if states["sold_today"]:
+    if states["sold_today"] and session != "regular":
         return False, "no-reentry-today"
 
     return True, ""
@@ -443,39 +471,22 @@ def compute_qty_for_budget(symbol: str, budget: float) -> Tuple[int, float]:
         return 0, price
     return qty, price
 
-def plan_budgets_for_opens(total_cash: float, open_count: int, to_open_count: int) -> List[float]:
+def plan_budgets_for_opens(total_cash: float, open_count: int, to_open_count: int, target_slots: int) -> List[float]:
     """
     يخطط ميزانيات لكل صفقة جديدة بحيث:
     - يحجز احتياط CASH_RESERVE_PCT
-    - لو PER_TRADE_PCT>0 يستخدم نسبة ثابتة لكل صفقة
-    - غير ذلك يقسم بالتساوي على الخانات المتبقية فقط
+    - يقسم بالتساوي على الخانات المتبقية فقط (حسب target_slots)
     """
     if to_open_count <= 0:
         return []
     reserve = max(0.0, total_cash * CASH_RESERVE_PCT)
     usable = max(0.0, total_cash - reserve)
 
-    # كم خانة مسموح بها إجمالاً
-    target_slots = max(1, min(MAX_OPEN_POSITIONS, TOP_K))
-    # الخانات المتبقية لفتحها الآن
     remaining_slots = max(1, target_slots - open_count)
     remaining_slots = min(remaining_slots, to_open_count)
 
-    budgets: List[float] = []
-
-    if PER_TRADE_PCT > 0.0:
-        per = usable * PER_TRADE_PCT
-        # لا نتجاوز الـ usable
-        total_need = per * remaining_slots
-        if total_need > usable and remaining_slots > 0:
-            per = usable / remaining_slots
-        budgets = [per for _ in range(remaining_slots)]
-    else:
-        # تقسيم بالتساوي على الخانات المتبقية
-        per = usable / remaining_slots if remaining_slots > 0 else 0.0
-        budgets = [per for _ in range(remaining_slots)]
-
-    return budgets
+    per = usable / remaining_slots if remaining_slots > 0 else 0.0
+    return [per for _ in range(remaining_slots)]
 
 # ---------------- Positions (instant sell detect) ----------------
 def positions_qty_map() -> Dict[str, float]:
@@ -497,7 +508,8 @@ def main_loop():
         f"trail_pct={TRAIL_PCT} trail_price={TRAIL_PRICE} "
         f"no_reentry_today={NO_REENTRY_TODAY} cooldown_minutes={COOLDOWN_MINUTES} "
         f"interval_s={INTERVAL_SECONDS} pre_slip_usd={PRE_SLIPPAGE_USD} "
-        f"sell_pad_usd={SELL_PAD_USD} allow_pre_auto_sell={ALLOW_PRE_AUTO_SELL}"
+        f"sell_pad_usd={SELL_PAD_USD} allow_pre_auto_sell={ALLOW_PRE_AUTO_SELL} "
+        f"pre_slots={MAX_PREMARKET_SLOTS} pre_cooldown_s={ORDER_COOLDOWN_SECONDS} max_orders_per_cycle_pre={MAX_ORDERS_PER_CYCLE_PRE}"
     )
 
     log.info("Bot started.")
@@ -536,7 +548,24 @@ def main_loop():
                 record_today_sells(api, SYMBOLS)
                 open_map = open_orders_map()
 
-                # Compute candidates
+                # === حساب الطاقة الاستيعابية (Capacity) ===
+                open_syms = set(list_open_positions_symbols())
+                open_count = len(open_syms)
+
+                if session == "pre":
+                    # في قبل الافتتاح نستخدم Slots خاصة
+                    target_slots = MAX_PREMARKET_SLOTS
+                    # نحسب أوامر الشراء المفتوحة ضمن الكون (حتى لا نملأ أكثر من اللازم)
+                    busy_slots = open_count + count_open_buy_orders_in_universe()
+                    slots_left = max(0, target_slots - busy_slots)
+                    per_cycle_limit = MAX_ORDERS_PER_CYCLE_PRE
+                else:
+                    # في الجلسة الرسمية نرجع لمنطقك الأصلي
+                    target_slots = min(MAX_OPEN_POSITIONS, TOP_K)
+                    slots_left = max(0, target_slots - open_count)
+                    per_cycle_limit = target_slots  # لا تقييد خاص
+
+                # === بناء المرشحين حسب الزخم والحمايات ===
                 candidates = []
                 for symbol in SYMBOLS:
                     mom = momentum_for_last_min(symbol)
@@ -565,41 +594,50 @@ def main_loop():
 
                     candidates.append((symbol, mom, price))
 
+                # ترتيب أفضل المرشحين
                 candidates.sort(key=lambda x: x[1], reverse=True)
                 best = [c[0] for c in candidates[:TOP_K]]
 
-                # Capacity
-                currently_open_syms = set(list_open_positions_symbols())
-                open_count = len(currently_open_syms)
-                slots_left = max(0, min(MAX_OPEN_POSITIONS, TOP_K) - open_count)
-                symbols_to_open = [s for s in best if s not in currently_open_syms][:slots_left]
+                # رموز نفتحها الآن وفق السِّعة
+                symbols_to_open = [s for s in best if s not in open_syms][:slots_left]
 
-                log.info(f"BEST={best} | open={list(currently_open_syms)} | to_open={symbols_to_open} | slots_left={slots_left}")
+                # **قبل الافتتاح**: ادخل صفقة واحدة فقط في كل دورة + تهدئة
+                if session == "pre" and symbols_to_open:
+                    symbols_to_open = symbols_to_open[:min(len(symbols_to_open), per_cycle_limit)]
 
-                # ===== Execute (CHANGED: تقسيم الكاش فقط) =====
+                log.info(f"BEST={best} | open={list(open_syms)} | to_open={symbols_to_open} | slots_left={slots_left} | target_slots={target_slots}")
+
+                # ===== تنفيذ الشراء (مع تقسيم الكاش على الخانات المتبقية) =====
                 if symbols_to_open:
                     if ALLOCATE_FROM_CASH:
-                        total_cash = get_cash_balance(strict_cash_only=STRICT_CASH_ONLY)  # CHANGED
-                        budgets = plan_budgets_for_opens(total_cash, open_count, len(symbols_to_open))  # NEW
+                        total_cash = get_cash_balance(strict_cash_only=STRICT_CASH_ONLY)
+                        budgets = plan_budgets_for_opens(total_cash, open_count, len(symbols_to_open), target_slots)
                         if not budgets:
                             log.info("[ALLOC] No budgets computed; fallback to notional per trade.")
                             budgets = [FALLBACK_NOTIONAL_PER_TRADE for _ in symbols_to_open]
                     else:
                         budgets = [FALLBACK_NOTIONAL_PER_TRADE for _ in symbols_to_open]
 
-                    # تنفيذ مع عدم تجاوز الكاش المستخدَم في نفس الدورة
                     remaining_cash_for_cycle = get_cash_balance(strict_cash_only=STRICT_CASH_ONLY)
                     reserve_amount = remaining_cash_for_cycle * CASH_RESERVE_PCT
                     remaining_cash_for_cycle = max(0.0, remaining_cash_for_cycle - reserve_amount)
 
+                    orders_sent_this_cycle = 0
+
                     for sym, budget in zip(symbols_to_open, budgets):
-                        # لا تتجاوز المتبقي من الكاش في الدورة
+                        # **قبل الافتتاح**: لا ترسل أكثر من أمر واحد/دورة + تبريد إرسال
+                        if session == "pre":
+                            if orders_sent_this_cycle >= per_cycle_limit:
+                                break
+                            if not _can_submit_now():
+                                log.info("[PRE] cooldown active, skip this cycle.")
+                                break
+
                         budget = min(budget, remaining_cash_for_cycle)
                         if budget <= 1.0:
                             log.info(f"[ALLOC] Budget depleted/too small for {sym}.")
                             continue
 
-                        # فحص أخير للتثبيت قبل الشراء
                         record_today_sells(api, SYMBOLS)
                         if session == "regular" and (sold_regular_today(sym) or sym in recent_regular_sell_symbols(10)):
                             log.info(f"[SKIP BUY] {sym}: locked for rest of regular session")
@@ -616,7 +654,6 @@ def main_loop():
 
                         est_notional = qty * price
                         if est_notional > remaining_cash_for_cycle:
-                            # قلّل الميزانية لتناسب المتبقي تقريبًا
                             max_affordable_qty = int(remaining_cash_for_cycle // price)
                             if max_affordable_qty < 1:
                                 log.info(f"[ALLOC] Not enough cash left for {sym}.")
@@ -624,18 +661,30 @@ def main_loop():
                             qty = max_affordable_qty
                             est_notional = qty * price
 
-                        if ext:
-                            buy_id = place_limit_buy_qty_premarket(sym, qty, ref_price=price)
-                            if buy_id and not ALLOW_PRE_AUTO_SELL:
-                                record_prebuy(sym)
-                        else:
-                            buy_id = place_market_buy_qty_regular(sym, qty)
-                            if buy_id:
-                                time.sleep(1.5)
-                                try_attach_trailing_stop_if_allowed(sym)
+                        try:
+                            global _is_submitting
+                            if _is_submitting:
+                                log.info("[LOCK] submission in progress; skip.")
+                                continue
+                            _is_submitting = True
 
-                        # حدّث المتبقي
-                        remaining_cash_for_cycle = max(0.0, remaining_cash_for_cycle - est_notional)
+                            if ext:
+                                buy_id = place_limit_buy_qty_premarket(sym, qty, ref_price=price)
+                                if buy_id and not ALLOW_PRE_AUTO_SELL:
+                                    record_prebuy(sym)
+                                if buy_id and session == "pre":
+                                    _mark_submit()  # حدّث الموقّت
+                            else:
+                                buy_id = place_market_buy_qty_regular(sym, qty)
+                                if buy_id:
+                                    time.sleep(1.5)
+                                    try_attach_trailing_stop_if_allowed(sym)
+                        finally:
+                            _is_submitting = False
+
+                        if buy_id:
+                            remaining_cash_for_cycle = max(0.0, remaining_cash_for_cycle - est_notional)
+                            orders_sent_this_cycle += 1
 
                 record_today_sells(api, SYMBOLS)
 
