@@ -22,7 +22,7 @@ SYMBOLS: List[str] = [s.strip().upper() for s in os.getenv(
 
 MOMENTUM_THRESHOLD = float(os.getenv("MOMENTUM_THRESHOLD", "0.00005"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
-TOP_K = int(os.getenv("TOP_K", "2"))
+TOP_K = int(os.getenv("TOP_K", "3"))
 
 # ======= Allocation Settings (الجديدة) ======= #
 ALLOCATE_FROM_CASH = os.getenv("ALLOCATE_FROM_CASH", "true").lower() == "true"
