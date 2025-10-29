@@ -100,7 +100,7 @@ def current_session_et(dt: datetime | None = None) -> str:
         return "closed"
     t = now.time()
     from datetime import time as _t
-    PRE_START  = _t(5, 0)   # ضبطناها 05:00 نيويورك
+    PRE_START  = _t(4, 0)   # 04:00 نيويورك (≈ 11:00 صباحًا بتوقيت السعودية وقت DST)
     REG_START  = _t(9, 30)
     REG_END    = _t(16, 0)
     if PRE_START <= t < REG_START:
