@@ -51,9 +51,17 @@ MAX_PREMARKET_SLOTS = int(os.getenv("MAX_PREMARKET_SLOTS", "2"))   # عدد ال
 ORDER_COOLDOWN_SECONDS = int(os.getenv("ORDER_COOLDOWN_SECONDS", "8"))  # تهدئة بين أوامر الشراء قبل الافتتاح
 MAX_ORDERS_PER_CYCLE_PRE = int(os.getenv("MAX_ORDERS_PER_CYCLE_PRE", "1"))  # إدخال سهم واحد فقط بكل دورة
 
+# ======= فاصل الفحص الفوري للتحويل (جديد) ======= #
+INSTANT_FIX_INTERVAL_SEC = float(os.getenv("INSTANT_FIX_INTERVAL_SEC", "0.5"))  # فحص كل 0.5 ثانية
+
 # قفل إرسال الأوامر
 _is_submitting = False
 _last_submit_ts = 0.0
+
+# --- Instant Fix state (جديد) ---
+INSTANT_FIX_DONE: Dict[str, bool] = {}   # رموز تم تحويلها بالفعل في نفس الجلسة
+_instant_fixing = False                  # قفل داخلي لمنع التضارب
+_last_instant_fix_ts = 0.0               # آخر وقت شغّلنا فيه الفحص الفوري
 
 def _can_submit_now() -> bool:
     return (time.time() - _last_submit_ts) >= ORDER_COOLDOWN_SECONDS
@@ -100,7 +108,7 @@ def current_session_et(dt: datetime | None = None) -> str:
         return "closed"
     t = now.time()
     from datetime import time as _t
-    PRE_START  = _t(4, 0)   # 04:00 نيويورك (≈ 11:00 صباحًا بتوقيت السعودية وقت DST)
+    PRE_START  = _t(4, 0)   # 04:00 نيويورك
     REG_START  = _t(9, 30)
     REG_END    = _t(16, 0)
     if PRE_START <= t < REG_START:
@@ -418,6 +426,69 @@ def force_exit_pre(symbol: str, pad: float = None):
         log.error(f"[EXIT-PRE] {symbol} failed: {e}")
         return None
 
+# ======= NEW: Instant Market→Limit fixer for pre-market ======= #
+def instant_fix_market_orders():
+    """
+    تحويل فوري لأي أوامر Market قبل الافتتاح إلى Limit (بيع/شراء) خلال أجزاء من الثانية.
+    - يستهدف SELL/Market أساسًا (مشكلتك الحالية)، ويصلح BUY/Market أيضًا كتحسين.
+    - يستخدم نفس SELL_PAD_USD و PRE_SLIPPAGE_USD لضمان التوافق مع بقية المنطق.
+    """
+    global _instant_fixing
+    if current_session_et() != "pre":
+        return
+
+    # لا نشغّلها إذا كانت شغّالة حاليًا (قفل)
+    if _instant_fixing:
+        return
+
+    try:
+        _instant_fixing = True
+
+        open_orders = api.list_orders(status="open")
+        for o in open_orders:
+            sym = getattr(o, "symbol", "").upper()
+            side = getattr(o, "side", "")
+            otype = getattr(o, "type", "")
+
+            # لا تكرر على نفس الرمز إذا تحوّل بهذا اللوب
+            if INSTANT_FIX_DONE.get(sym):
+                continue
+
+            # SELL/MARKET قبل الافتتاح -> حوّله Limit على bid - SELL_PAD_USD
+            if side == "sell" and otype == "market":
+                try:
+                    api.cancel_order(o.id)
+                except Exception as e:
+                    log.debug(f"[INSTANT-FIX] cancel sell failed {sym}: {e}")
+
+                bid = latest_bid(sym)
+                qty = float(o.qty)
+                if bid > 0 and qty > 0:
+                    placed = place_limit_sell_extended(sym, qty, ref_bid=bid)  # pad=SELL_PAD_USD افتراضيًا
+                    if placed:
+                        INSTANT_FIX_DONE[sym] = True
+                        log.info(f"[INSTANT-FIX] SELL Market→Limit (extended) for {sym}")
+
+            # BUY/MARKET قبل الافتتاح -> حوّله Limit على last + PRE_SLIPPAGE_USD
+            elif side == "buy" and otype == "market":
+                try:
+                    api.cancel_order(o.id)
+                except Exception as e:
+                    log.debug(f"[INSTANT-FIX] cancel buy failed {sym}: {e}")
+
+                last = last_trade_price(sym) or latest_bid(sym)
+                qty_i = int(float(o.qty))
+                if last and qty_i > 0:
+                    placed = place_limit_buy_qty_premarket(sym, qty_i, ref_price=last)  # + PRE_SLIPPAGE_USD داخل الدالة
+                    if placed:
+                        INSTANT_FIX_DONE[sym] = True
+                        log.info(f"[INSTANT-FIX] BUY Market→Limit (extended) for {sym}")
+
+    except Exception as e:
+        log.debug(f"[INSTANT-FIX] list_orders failed: {e}")
+    finally:
+        _instant_fixing = False
+
 def auto_fix_premarket_market_sells():
     if current_session_et() != "pre":
         return
@@ -425,6 +496,10 @@ def auto_fix_premarket_market_sells():
         open_os = api.list_orders(status="open")
         for o in open_os:
             try:
+                # NEW: تجاهل الرموز التي تم معالجتها فوريًا
+                if INSTANT_FIX_DONE.get(o.symbol.upper()):
+                    continue
+
                 if o.side == "sell" and o.type == "market":
                     api.cancel_order(o.id)
                     bid = latest_bid(o.symbol)
@@ -509,7 +584,8 @@ def main_loop():
         f"no_reentry_today={NO_REENTRY_TODAY} cooldown_minutes={COOLDOWN_MINUTES} "
         f"interval_s={INTERVAL_SECONDS} pre_slip_usd={PRE_SLIPPAGE_USD} "
         f"sell_pad_usd={SELL_PAD_USD} allow_pre_auto_sell={ALLOW_PRE_AUTO_SELL} "
-        f"pre_slots={MAX_PREMARKET_SLOTS} pre_cooldown_s={ORDER_COOLDOWN_SECONDS} max_orders_per_cycle_pre={MAX_ORDERS_PER_CYCLE_PRE}"
+        f"pre_slots={MAX_PREMARKET_SLOTS} pre_cooldown_s={ORDER_COOLDOWN_SECONDS} max_orders_per_cycle_pre={MAX_ORDERS_PER_CYCLE_PRE} "
+        f"instant_fix_interval_s={INSTANT_FIX_INTERVAL_SEC}"
     )
 
     log.info("Bot started.")
@@ -544,7 +620,18 @@ def main_loop():
                 for s in just_sold:
                     sold_regular_lock[s] = utc_now()
 
+                # ======= NEW: استدعاء التحويل الفوري على فواصل قصيرة ======= #
+                now_ts = time.time()
+                if (now_ts - _last_instant_fix_ts) >= INSTANT_FIX_INTERVAL_SEC:
+                    instant_fix_market_orders()
+                    # لمسة: نظّف سجل الرموز إذا خرجنا من pre إلى regular
+                    if session != "pre" and INSTANT_FIX_DONE:
+                        INSTANT_FIX_DONE.clear()
+                    globals()['_last_instant_fix_ts'] = now_ts
+
+                # النسخة القديمة كـ Back-up (تشتغل بعد الفوري إذا بقي شيء)
                 auto_fix_premarket_market_sells()
+
                 record_today_sells(api, SYMBOLS)
                 open_map = open_orders_map()
 
