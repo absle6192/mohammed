@@ -25,6 +25,7 @@ MOMENTUM_THRESHOLD = float(os.getenv("MOMENTUM_THRESHOLD", "0.00005"))
 
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
 TOP_K = int(os.getenv("TOP_K", "3"))
+TOP_K = min(TOP_K, MAX_OPEN_POSITIONS)  # تقليل ازدواج المرشحين من الأصل
 
 # ======= Allocation Settings ======= #
 ALLOCATE_FROM_CASH = os.getenv("ALLOCATE_FROM_CASH", "true").lower() == "true"
@@ -277,13 +278,14 @@ def count_open_buy_orders_in_universe() -> int:
         pass
     return c
 
-def cancel_symbol_open_orders(symbol: str):
+def cancel_symbol_open_buy_orders(symbol: str):
+    """لا تلغِ أوامر البيع بالخطأ—إلغاء أوامر الشراء فقط"""
     try:
         for o in api.list_orders(status="open"):
-            if o.symbol == symbol:
+            if o.symbol == symbol and getattr(o, "side", "").lower() == "buy":
                 try:
                     api.cancel_order(o.id)
-                    log.info(f"Canceled open order: {symbol} ({o.side} {o.type})")
+                    log.info(f"Canceled open BUY order: {symbol} ({o.type})")
                 except Exception as e:
                     log.warning(f"Cancel failed for {symbol}: {e}")
     except Exception:
@@ -303,14 +305,33 @@ def momentum_for_last_min(symbol: str) -> Optional[float]:
         log.debug(f"momentum calc error {symbol}: {e}")
         return None
 
+# ---------------- CAP accounting (المراكز + أوامر الشراء) ----------------
+def active_buy_slots(api: REST) -> tuple[int, int, int]:
+    """return (open_positions, open_buy_orders, total_active)"""
+    try:
+        p = len(api.list_positions())
+    except Exception:
+        p = 0
+    try:
+        orders = api.list_orders(status="open")
+        ob = sum(1 for o in orders if getattr(o, "side", "").lower() == "buy")
+    except Exception:
+        ob = 0
+    return p, ob, p + ob
+
+def allowed_slots(api: REST) -> int:
+    _, _, total = active_buy_slots(api)
+    return max(0, MAX_OPEN_POSITIONS - total)
+
 # ---------------- Guards ----------------
 def guard_states(symbol: str, open_orders: Dict[str, bool]) -> Dict[str, bool]:
+    _, _, total = active_buy_slots(api)  # احتسب total بدل المراكز فقط
     return {
         "has_pos": has_open_position(symbol),
         "has_open_order": open_orders.get(symbol, False),
         "sold_today": sold_today(symbol),
         "cooldown": in_cooldown(symbol),
-        "max_positions_reached": count_open_positions() >= MAX_OPEN_POSITIONS
+        "max_positions_reached": total >= MAX_OPEN_POSITIONS
     }
 
 def can_open_new_long(symbol: str, states: Dict[str, bool], session: str) -> Tuple[bool, str]:
@@ -320,8 +341,8 @@ def can_open_new_long(symbol: str, states: Dict[str, bool], session: str) -> Tup
         return False, "open order exists"
     if states["cooldown"]:
         return False, "in cooldown"
-    if states["max_positions_reached"] and session != "pre":
-        return False, "max positions reached (regular)"
+    if states["max_positions_reached"]:
+        return False, "cap reached"
     if states["sold_today"] and session == "regular" and symbol in sold_pre_market:
         return True, "re-entry after pre-market sell"
     if session == "regular" and sold_regular_today(symbol):
@@ -358,8 +379,10 @@ def should_allow_auto_sell(symbol: str) -> bool:
 # ---------------- Orders ----------------
 def place_market_buy_qty_regular(symbol: str, qty: int) -> Optional[str]:
     try:
+        cid = f"open-{symbol}-{int(time.time()*1000)}"
         o = api.submit_order(symbol=symbol, side="buy", type="market",
-                             time_in_force="day", qty=str(qty), extended_hours=False)
+                             time_in_force="day", qty=str(qty), extended_hours=False,
+                             client_order_id=cid)
         log.info(f"[BUY-REG/MKT] {symbol} qty={qty}")
         return o.id
     except Exception as e:
@@ -372,8 +395,10 @@ def place_limit_buy_qty_premarket(symbol: str, qty: int, ref_price: float) -> Op
         ask = best_ask(symbol)
         base = ask if (ask and ask > 0) else ref_price
         limit_price = round(float(base) + PRE_SLIPPAGE_USD, 2)
+        cid = f"open-pre-{symbol}-{int(time.time()*1000)}"
         o = api.submit_order(symbol=symbol, side="buy", type="limit", time_in_force="day",
-                             qty=str(qty), limit_price=str(limit_price), extended_hours=True)
+                             qty=str(qty), limit_price=str(limit_price), extended_hours=True,
+                             client_order_id=cid)
         log.info(f"[BUY-PRE/LMT] {symbol} qty={qty} limit={limit_price:.2f} (ask={ask}, ref={ref_price:.2f})")
         return o.id
     except Exception as e:
@@ -388,8 +413,10 @@ def place_limit_sell_extended(symbol: str, qty: float, ref_bid: Optional[float] 
             return None
         p = SELL_PAD_USD if pad is None else pad
         limit_price = round(bid - p, 2)
+        cid = f"exit-ext-{symbol}-{int(time.time()*1000)}"
         o = api.submit_order(symbol=symbol, side="sell", type="limit", time_in_force="day",
-                             qty=str(qty), limit_price=str(limit_price), extended_hours=True)
+                             qty=str(qty), limit_price=str(limit_price), extended_hours=True,
+                             client_order_id=cid)
         log.info(f"[SELL-EXT/LMT] {symbol} qty={qty} limit={limit_price}")
         return o.id
     except Exception as e:
@@ -620,19 +647,18 @@ def main_loop():
                 record_today_sells(api, SYMBOLS)
                 open_map = open_orders_map()
 
-                # === حساب الطاقة الاستيعابية ===
-                open_syms = set(list_open_positions_symbols())
-                open_count = len(open_syms)
-
+                # === حساب الطاقة الاستيعابية الصارمة ===
                 if session == "pre":
                     target_slots = MAX_PREMARKET_SLOTS
-                    busy_slots = open_count + count_open_buy_orders_in_universe()
+                    # في البري ماركت نأخذ أيضًا الأوامر المعلّقة بعين الاعتبار
+                    p, ob, total = active_buy_slots(api)
+                    busy_slots = min(target_slots, p + ob)
                     slots_left = max(0, target_slots - busy_slots)
                     per_cycle_limit = MAX_ORDERS_PER_CYCLE_PRE
                 else:
                     target_slots = min(MAX_OPEN_POSITIONS, TOP_K)
-                    slots_left = max(0, target_slots - open_count)
-                    per_cycle_limit = target_slots
+                    slots_left = min(target_slots, allowed_slots(api))
+                    per_cycle_limit = target_slots  # حدّ للدورة في الافتتاح أيضًا
 
                 # === بناء المرشحين ===
                 candidates = []
@@ -692,6 +718,7 @@ def main_loop():
                 # ترتيب واختيار
                 candidates.sort(key=lambda x: x[1], reverse=True)
                 best = [c[0] for c in candidates[:TOP_K]]
+                open_syms = set(list_open_positions_symbols())
                 symbols_to_open = [s for s in best if s not in open_syms][:slots_left]
                 if session == "pre" and symbols_to_open:
                     symbols_to_open = symbols_to_open[:min(len(symbols_to_open), per_cycle_limit)]
@@ -702,7 +729,7 @@ def main_loop():
                 if symbols_to_open:
                     if ALLOCATE_FROM_CASH:
                         total_cash = get_cash_balance(strict_cash_only=STRICT_CASH_ONLY)
-                        budgets = plan_budgets_for_opens(total_cash, open_count, len(symbols_to_open), target_slots)
+                        budgets = plan_budgets_for_opens(total_cash, len(open_syms), len(symbols_to_open), target_slots)
                         if not budgets:
                             log.info("[ALLOC] No budgets computed; fallback to notional per trade.")
                             budgets = [FALLBACK_NOTIONAL_PER_TRADE for _ in symbols_to_open]
@@ -716,12 +743,19 @@ def main_loop():
                     orders_sent_this_cycle = 0
 
                     for sym, budget in zip(symbols_to_open, budgets):
+                        # حدّ للدورة في الافتتاح أيضًا + إعادة تحقّق قبل كل أمر
+                        if orders_sent_this_cycle >= per_cycle_limit:
+                            break
+                        if allowed_slots(api) <= 0:
+                            log.info("Cap reached during placement; stop.")
+                            break
+
                         if session == "pre":
-                            if orders_sent_this_cycle >= per_cycle_limit:
-                                break
                             if not _can_submit_now():
                                 log.info("[PRE] cooldown active, skip this cycle.")
                                 break
+                        else:
+                            time.sleep(0.3)  # تبريد خفيف في الافتتاح
 
                         budget = min(budget, remaining_cash_for_cycle)
                         if budget <= 1.0:
@@ -733,7 +767,7 @@ def main_loop():
                             log.info(f"[SKIP BUY] {sym}: locked for rest of regular session")
                             continue
 
-                        cancel_symbol_open_orders(sym)
+                        cancel_symbol_open_buy_orders(sym)
                         qty, price = compute_qty_for_budget(sym, budget)
                         if qty < 1 or not price:
                             continue
