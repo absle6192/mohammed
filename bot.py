@@ -44,10 +44,10 @@ COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "60"))
 INTERVAL_SECONDS   = int(os.getenv("INTERVAL_SECONDS", "30"))
 MAX_CYCLE_SECONDS  = int(os.getenv("MAX_CYCLE_SECONDS", "20"))
 
-PRE_SLIPPAGE_USD = float(os.getenv("PRE_SLIPPAGE_USD", "0.05"))  # أبقيتها كما هي
+PRE_SLIPPAGE_USD = float(os.getenv("PRE_SLIPPAGE_USD", "0.05"))
 SELL_PAD_USD     = float(os.getenv("SELL_PAD_USD", "0.02"))
 
-ALLOW_PRE_AUTO_SELL = os.getenv("ALLOW_PRE_AUTO_SELL", "false").lower() == "true"  # أبقيناه
+ALLOW_PRE_AUTO_SELL = os.getenv("ALLOW_PRE_AUTO_SELL", "false").lower() == "true"
 
 # ======= إعدادات خاصة قبل الافتتاح ======= #
 MAX_PREMARKET_SLOTS = int(os.getenv("MAX_PREMARKET_SLOTS", "2"))
@@ -55,8 +55,8 @@ ORDER_COOLDOWN_SECONDS = int(os.getenv("ORDER_COOLDOWN_SECONDS", "8"))
 MAX_ORDERS_PER_CYCLE_PRE = int(os.getenv("MAX_ORDERS_PER_CYCLE_PRE", "1"))
 
 # ===== فلاتر جديدة للـ pre-market =====
-MIN_PREMARKET_DOLLAR_VOL = float(os.getenv("MIN_PREMARKET_DOLLAR_VOL", "500000"))  # سيولة دنيا بالدولار
-MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", "15"))  # 0.15% كحد أقصى للسبريد
+MIN_PREMARKET_DOLLAR_VOL = float(os.getenv("MIN_PREMARKET_DOLLAR_VOL", "500000"))
+MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", "15"))  # 0.15%
 
 # ======= فاصل الفحص الفوري للتحويل ======= #
 INSTANT_FIX_INTERVAL_SEC = float(os.getenv("INSTANT_FIX_INTERVAL_SEC", "0.5"))
@@ -149,7 +149,7 @@ def record_today_sells(api: REST, symbols: List[str]) -> None:
     REG_END_T   = _t(16, 0)
     for o in closed:
         try:
-            if o.side != "sell" or o.symbol not in symbols:
+            if (getattr(o, "side", "") != "sell") or o.symbol not in symbols:
                 continue
             if not getattr(o, "filled_at", None):
                 continue
@@ -174,7 +174,7 @@ def recent_regular_sell_symbols(window_sec: int = 20) -> set:
         REG_START_T = _t(9, 30)
         REG_END_T   = _t(16, 0)
         for o in closed:
-            if o.side != "sell":
+            if getattr(o, "side", "") != "sell":
                 continue
             t = getattr(o, "filled_at", None)
             if not t:
@@ -261,7 +261,7 @@ def count_open_positions() -> int:
 def open_orders_map() -> Dict[str, bool]:
     m: Dict[str, bool] = {}
     try:
-        for o in api.list_orders(status="open"):
+        for o in api.list_orders(status="open", limit=500):
             m[o.symbol] = True
     except Exception:
         pass
@@ -270,9 +270,9 @@ def open_orders_map() -> Dict[str, bool]:
 def count_open_buy_orders_in_universe() -> int:
     c = 0
     try:
-        orders = api.list_orders(status="open")
+        orders = api.list_orders(status="open", limit=500)
         for o in orders:
-            if o.side == "buy" and o.symbol in SYMBOLS:
+            if getattr(o, "side", "").lower() == "buy" and o.symbol in SYMBOLS:
                 c += 1
     except Exception:
         pass
@@ -281,7 +281,7 @@ def count_open_buy_orders_in_universe() -> int:
 def cancel_symbol_open_buy_orders(symbol: str):
     """لا تلغِ أوامر البيع بالخطأ—إلغاء أوامر الشراء فقط"""
     try:
-        for o in api.list_orders(status="open"):
+        for o in api.list_orders(status="open", limit=500):
             if o.symbol == symbol and getattr(o, "side", "").lower() == "buy":
                 try:
                     api.cancel_order(o.id)
@@ -313,7 +313,7 @@ def active_buy_slots(api: REST) -> tuple[int, int, int]:
     except Exception:
         p = 0
     try:
-        orders = api.list_orders(status="open")
+        orders = api.list_orders(status="open", limit=500)
         ob = sum(1 for o in orders if getattr(o, "side", "").lower() == "buy")
     except Exception:
         ob = 0
@@ -471,6 +471,15 @@ def force_exit_pre(symbol: str, pad: float = None):
         return None
 
 # ======= Instant Market→Limit fixer for pre-market ======= #
+def _remaining_qty(o) -> float:
+    try:
+        original_qty = float(getattr(o, "qty", 0) or 0)
+        filled_qty = float(getattr(o, "filled_qty", 0) or 0)
+        remaining = max(0.0, original_qty - filled_qty)
+    except Exception:
+        remaining = float(getattr(o, "qty", 0) or 0)
+    return remaining
+
 def instant_fix_market_orders():
     global _instant_fixing
     if current_session_et() != "pre":
@@ -479,11 +488,11 @@ def instant_fix_market_orders():
         return
     try:
         _instant_fixing = True
-        open_orders = api.list_orders(status="open")
+        open_orders = api.list_orders(status="open", limit=500)
         for o in open_orders:
             sym = getattr(o, "symbol", "").upper()
-            side = getattr(o, "side", "")
-            otype = getattr(o, "type", "")
+            side = (getattr(o, "side", "") or "").lower()
+            otype = (getattr(o, "type", "") or "").lower()
             if INSTANT_FIX_DONE.get(sym):
                 continue
             if side == "sell" and otype == "market":
@@ -492,7 +501,7 @@ def instant_fix_market_orders():
                 except Exception as e:
                     log.debug(f"[INSTANT-FIX] cancel sell failed {sym}: {e}")
                 bid = latest_bid(sym)
-                qty = float(o.qty)
+                qty = _remaining_qty(o)
                 if bid > 0 and qty > 0:
                     placed = place_limit_sell_extended(sym, qty, ref_bid=bid)
                     if placed:
@@ -504,7 +513,7 @@ def instant_fix_market_orders():
                 except Exception as e:
                     log.debug(f"[INSTANT-FIX] cancel buy failed {sym}: {e}")
                 last = last_trade_price(sym) or latest_bid(sym)
-                qty_i = int(float(o.qty))
+                qty_i = int(_remaining_qty(o))
                 if last and qty_i > 0:
                     placed = place_limit_buy_qty_premarket(sym, qty_i, ref_price=last)
                     if placed:
@@ -519,29 +528,85 @@ def auto_fix_premarket_market_sells():
     if current_session_et() != "pre":
         return
     try:
-        open_os = api.list_orders(status="open")
+        open_os = api.list_orders(status="open", limit=500)
         for o in open_os:
             try:
-                if INSTANT_FIX_DONE.get(o.symbol.upper()):
+                sym = getattr(o, "symbol", "").upper()
+                if INSTANT_FIX_DONE.get(sym):
                     continue
-                if o.side == "sell" and o.type == "market":
+                side = (getattr(o, "side", "") or "").lower()
+                otype = (getattr(o, "type", "") or "").lower()
+
+                if side == "sell" and otype == "market":
                     api.cancel_order(o.id)
-                    bid = latest_bid(o.symbol)
-                    qty = float(o.qty)
-                    place_limit_sell_extended(o.symbol, qty, ref_bid=bid)
-                    log.info(f"[AUTO-FIX] Replaced SELL/MARKET with SELL/LIMIT (extended) for {o.symbol}")
+                    bid = latest_bid(sym)
+                    qty = _remaining_qty(o)
+                    if bid > 0 and qty > 0:
+                        place_limit_sell_extended(sym, qty, ref_bid=bid)
+                        log.info(f"[AUTO-FIX] Replaced SELL/MARKET with SELL/LIMIT (extended) for {sym}")
                     continue
-                if o.side == "buy" and o.type == "market":
+
+                if side == "buy" and otype == "market":
                     api.cancel_order(o.id)
-                    last = last_trade_price(o.symbol) or latest_bid(o.symbol)
-                    qty = int(float(o.qty))
+                    last = last_trade_price(sym) or latest_bid(sym)
+                    qty = int(_remaining_qty(o))
                     if last and qty > 0:
-                        place_limit_buy_qty_premarket(o.symbol, qty, ref_price=last)
-                        log.info(f"[AUTO-FIX] Replaced BUY/MARKET with BUY/LIMIT (extended) for {o.symbol}")
+                        place_limit_buy_qty_premarket(sym, qty, ref_price=last)
+                        log.info(f"[AUTO-FIX] Replaced BUY/MARKET with BUY/LIMIT (extended) for {sym}")
             except Exception as e:
                 log.warning(f"[AUTO-FIX] failed for {getattr(o, 'symbol', '?')}: {e}")
     except Exception as e:
         log.debug(f"[AUTO-FIX] list_orders failed: {e}")
+
+def rescue_rejected_premarket_market_sells(window_sec: int = 5):
+    """
+    يلتقط أي SELL/MARKET مرفوض خلال آخر ثوانٍ قبل/أثناء البري ماركت،
+    ويعيد إصداره كـ SELL/LIMIT (extended).
+    """
+    if current_session_et() != "pre":
+        return
+    cutoff = utc_now() - timedelta(seconds=window_sec)
+    try:
+        closed = api.list_orders(status="closed", limit=200, direction="desc")
+    except Exception as e:
+        log.debug(f"[RESCUE] list_orders closed failed: {e}")
+        return
+
+    for o in closed:
+        try:
+            side = (getattr(o, "side", "") or "").lower()
+            otype = (getattr(o, "type", "") or "").lower()
+            status = (getattr(o, "status", "") or "").lower()
+            sym = getattr(o, "symbol", "").upper()
+            t = getattr(o, "filled_at", None) or getattr(o, "updated_at", None) or getattr(o, "created_at", None)
+            if not t:
+                continue
+            t = t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+            if side != "sell":
+                continue
+            if otype != "market":
+                continue
+            if status != "rejected":
+                continue
+            if t < cutoff:
+                continue
+            if INSTANT_FIX_DONE.get(sym):
+                continue
+
+            qty = float(getattr(o, "qty", 0) or 0)
+            if qty <= 0:
+                continue
+
+            bid = latest_bid(sym)
+            if bid <= 0:
+                continue
+            placed = place_limit_sell_extended(sym, qty, ref_bid=bid)
+            if placed:
+                INSTANT_FIX_DONE[sym] = True
+                log.info(f"[RESCUE] Replaced REJECTED SELL/MKT -> SELL/LMT for {sym}")
+        except Exception as e:
+            log.debug(f"[RESCUE] error: {e}")
 
 # ---------------- Allocation ----------------
 def get_cash_balance(strict_cash_only: bool = True) -> float:
@@ -635,7 +700,7 @@ def main_loop():
                 for s in just_sold:
                     sold_regular_lock[s] = utc_now()
 
-                # ======= استدعاء التحويل الفوري ======= #
+                # ======= استدعاء التحويل/الإنقاذ الفوري ======= #
                 now_ts = time.time()
                 if (now_ts - _last_instant_fix_ts) >= INSTANT_FIX_INTERVAL_SEC:
                     instant_fix_market_orders()
@@ -644,13 +709,14 @@ def main_loop():
                     globals()['_last_instant_fix_ts'] = now_ts
 
                 auto_fix_premarket_market_sells()
+                rescue_rejected_premarket_market_sells()  # <<— جديد
+
                 record_today_sells(api, SYMBOLS)
                 open_map = open_orders_map()
 
                 # === حساب الطاقة الاستيعابية الصارمة ===
                 if session == "pre":
                     target_slots = MAX_PREMARKET_SLOTS
-                    # في البري ماركت نأخذ أيضًا الأوامر المعلّقة بعين الاعتبار
                     p, ob, total = active_buy_slots(api)
                     busy_slots = min(target_slots, p + ob)
                     slots_left = max(0, target_slots - busy_slots)
@@ -658,7 +724,7 @@ def main_loop():
                 else:
                     target_slots = min(MAX_OPEN_POSITIONS, TOP_K)
                     slots_left = min(target_slots, allowed_slots(api))
-                    per_cycle_limit = target_slots  # حدّ للدورة في الافتتاح أيضًا
+                    per_cycle_limit = target_slots
 
                 # === بناء المرشحين ===
                 candidates = []
@@ -743,7 +809,6 @@ def main_loop():
                     orders_sent_this_cycle = 0
 
                     for sym, budget in zip(symbols_to_open, budgets):
-                        # حدّ للدورة في الافتتاح أيضًا + إعادة تحقّق قبل كل أمر
                         if orders_sent_this_cycle >= per_cycle_limit:
                             break
                         if allowed_slots(api) <= 0:
@@ -822,7 +887,8 @@ def main_loop():
             log.warning(f"Slow cycle: {total_elapsed:.1f}s (limit {MAX_CYCLE_SECONDS}s)")
 
         session = current_session_et()
-        dynamic_interval = 3 if session == "pre" else INTERVAL_SECONDS
+        # تقليل فاصل البري ماركت لتفادي ضياع نافذة الرفض/التحويل
+        dynamic_interval = 0.3 if session == "pre" else INTERVAL_SECONDS
         sleep_until_next_interval(dynamic_interval, cycle_started)
 
 if __name__ == "__main__":
