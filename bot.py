@@ -17,7 +17,7 @@ API_SECRET = os.getenv("APCA_API_SECRET_KEY", "")
 BASE_URL   = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
 
 SYMBOLS: List[str] = [s.strip().upper() for s in os.getenv(
-    "SYMBOLS", "TSLA,NVDA,AAPL,MSFT,AMZN,AMD,GOOGL,MU"
+    "SYMBOLS", "TSLA,NVDA,AAPL,CRWD,AMZN,AMD,GOOGL,MU"
 ).split(",") if s.strip()]
 
 # ===== لا تغيير في عتبة المومنتوم =====
