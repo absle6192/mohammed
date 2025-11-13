@@ -115,7 +115,7 @@ def current_session_et(dt: datetime | None = None) -> str:
         return "closed"
     t = now.time()
     from datetime import time as _t
-    PRE_START  = _t(4, 0)
+    PRE_START  = _t(4, 10)
     REG_START  = _t(9, 30)
     REG_END    = _t(16, 0)
     if PRE_START <= t < REG_START:
