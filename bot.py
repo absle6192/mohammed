@@ -70,6 +70,11 @@ INSTANT_FIX_DONE: Dict[str, bool] = {}
 _instant_fixing = False
 _last_instant_fix_ts = 0.0
 
+# ---------- NEW: central switch to disable pre-market trading ----------
+ENABLE_PREMARKET = False  # <-- اضبط False لمنع أي تداول قبل الافتتاح (الافتراضي هنا معطل)
+if not ENABLE_PREMARKET:
+    log.info("PREMARKET trading is DISABLED (ENABLE_PREMARKET=False). No extended-hours/pre-market orders will be sent.")
+
 def _can_submit_now() -> bool:
     return (time.time() - _last_submit_ts) >= ORDER_COOLDOWN_SECONDS
 
@@ -126,6 +131,9 @@ def current_session_et(dt: datetime | None = None) -> str:
 
 def can_trade_now() -> tuple[bool, bool]:
     s = current_session_et()
+    # if pre-market disabled, do not allow trading in 'pre'
+    if s == "pre" and not ENABLE_PREMARKET:
+        return False, False
     if s == "pre":
         return True, True
     if s == "regular":
@@ -372,7 +380,7 @@ def should_allow_auto_sell(symbol: str) -> bool:
     session = current_session_et()
     if ALLOW_PRE_AUTO_SELL:
         return True
-    if sym in PREMARKET_LOCK and session == "pre":
+    if sym in PREMARKET_LOCK and session == "pre" and ENABLE_PREMARKET:
         return False
     return True
 
@@ -390,14 +398,19 @@ def place_market_buy_qty_regular(symbol: str, qty: int) -> Optional[str]:
         return None
 
 def place_limit_buy_qty_premarket(symbol: str, qty: int, ref_price: float) -> Optional[str]:
-    """يستخدم سعر الـ Ask الحقيقي (إن توفر) بدلاً من آخر صفقة لتسعير أمر الشراء قبل الافتتاح."""
+    """Originally used for pre-market limit buys — now guarded by ENABLE_PREMARKET.
+       If pre-market disabled this is a no-op and returns None."""
+    if not ENABLE_PREMARKET:
+        log.debug(f"[BUY-PRE/LMT SKIP] Pre-market disabled, skipping buy for {symbol}.")
+        return None
     try:
         ask = best_ask(symbol)
         base = ask if (ask and ask > 0) else ref_price
         limit_price = round(float(base) + PRE_SLIPPAGE_USD, 2)
         cid = f"open-pre-{symbol}-{int(time.time()*1000)}"
+        # Even for extended hours we avoid setting extended_hours=True if disabled above
         o = api.submit_order(symbol=symbol, side="buy", type="limit", time_in_force="day",
-                             qty=str(qty), limit_price=str(limit_price), extended_hours=True,
+                             qty=str(qty), limit_price=str(limit_price), extended_hours=False,
                              client_order_id=cid)
         log.info(f"[BUY-PRE/LMT] {symbol} qty={qty} limit={limit_price:.2f} (ask={ask}, ref={ref_price:.2f})")
         return o.id
@@ -406,6 +419,10 @@ def place_limit_buy_qty_premarket(symbol: str, qty: int, ref_price: float) -> Op
         return None
 
 def place_limit_sell_extended(symbol: str, qty: float, ref_bid: Optional[float] = None, pad: Optional[float] = None) -> Optional[str]:
+    """Originally used to place extended-hours sell orders; now will not send extended-hours if premarket disabled."""
+    if not ENABLE_PREMARKET and current_session_et() == "pre":
+        log.debug(f"[SELL-EXT SKIP] Pre-market disabled, not placing extended sell for {symbol}.")
+        return None
     try:
         bid = ref_bid if (ref_bid is not None and ref_bid > 0) else latest_bid(symbol)
         if bid <= 0:
@@ -414,8 +431,9 @@ def place_limit_sell_extended(symbol: str, qty: float, ref_bid: Optional[float] 
         p = SELL_PAD_USD if pad is None else pad
         limit_price = round(bid - p, 2)
         cid = f"exit-ext-{symbol}-{int(time.time()*1000)}"
+        # ensure extended_hours=False to avoid pre/post market execution
         o = api.submit_order(symbol=symbol, side="sell", type="limit", time_in_force="day",
-                             qty=str(qty), limit_price=str(limit_price), extended_hours=True,
+                             qty=str(qty), limit_price=str(limit_price), extended_hours=False,
                              client_order_id=cid)
         log.info(f"[SELL-EXT/LMT] {symbol} qty={qty} limit={limit_price}")
         return o.id
@@ -481,9 +499,12 @@ def _remaining_qty(o) -> float:
     return remaining
 
 def instant_fix_market_orders():
-    global _instant_fixing
+    """No-op when pre-market disabled to prevent touching pre-market orders."""
+    if not ENABLE_PREMARKET:
+        return
     if current_session_et() != "pre":
         return
+    global _instant_fixing
     if _instant_fixing:
         return
     try:
@@ -525,6 +546,9 @@ def instant_fix_market_orders():
         _instant_fixing = False
 
 def auto_fix_premarket_market_sells():
+    """No-op when pre-market disabled."""
+    if not ENABLE_PREMARKET:
+        return
     if current_session_et() != "pre":
         return
     try:
@@ -560,9 +584,10 @@ def auto_fix_premarket_market_sells():
 
 def rescue_rejected_premarket_market_sells(window_sec: int = 5):
     """
-    يلتقط أي SELL/MARKET مرفوض خلال آخر ثوانٍ قبل/أثناء البري ماركت،
-    ويعيد إصداره كـ SELL/LIMIT (extended).
+    No-op when pre-market disabled. Otherwise same behavior as before.
     """
+    if not ENABLE_PREMARKET:
+        return
     if current_session_et() != "pre":
         return
     cutoff = utc_now() - timedelta(seconds=window_sec)
@@ -665,7 +690,7 @@ def main_loop():
         f"sell_pad_usd={SELL_PAD_USD} allow_pre_auto_sell={ALLOW_PRE_AUTO_SELL} "
         f"pre_slots={MAX_PREMARKET_SLOTS} pre_cooldown_s={ORDER_COOLDOWN_SECONDS} max_orders_per_cycle_pre={MAX_ORDERS_PER_CYCLE_PRE} "
         f"instant_fix_interval_s={INSTANT_FIX_INTERVAL_SEC} "
-        f"min_pre_dollar_vol={MIN_PREMARKET_DOLLAR_VOL} max_spread_bps={MAX_SPREAD_BPS}"
+        f"min_pre_dollar_vol={MIN_PREMARKET_DOLLAR_VOL} max_spread_bps={MAX_SPREAD_BPS} pre_enabled={ENABLE_PREMARKET}"
     )
 
     log.info("Bot started.")
@@ -673,6 +698,10 @@ def main_loop():
         cycle_started = time.time()
         try:
             session = current_session_et()
+            # If pre-market is disabled, treat 'pre' as 'closed' locally to skip all pre-market branches
+            if session == "pre" and not ENABLE_PREMARKET:
+                session = "closed"
+
             if session == "closed":
                 heartbeat("Out of allowed sessions (no trading) - sleeping")
             else:
@@ -709,13 +738,14 @@ def main_loop():
                     globals()['_last_instant_fix_ts'] = now_ts
 
                 auto_fix_premarket_market_sells()
-                rescue_rejected_premarket_market_sells()  # <<— جديد
+                rescue_rejected_premarket_market_sells()  # <<— لن تعمل إذا pre-market معطّل
 
                 record_today_sells(api, SYMBOLS)
                 open_map = open_orders_map()
 
                 # === حساب الطاقة الاستيعابية الصارمة ===
                 if session == "pre":
+                    # لن نصل هنا لأن session تم تغييره إلى "closed" عندما يكون pre-market معطّل
                     target_slots = MAX_PREMARKET_SLOTS
                     p, ob, total = active_buy_slots(api)
                     busy_slots = min(target_slots, p + ob)
@@ -763,7 +793,7 @@ def main_loop():
                         f"dollar_vol={int(dollar_vol)}"
                     )
 
-                    # فلترة ما قبل الافتتاح
+                    # فلترة ما قبل الافتتاح — لن تُطبّق لأن session == "pre" لم يعد مسموحًا إن كان معطّل
                     if session == "pre":
                         if (spread_bps is None) or (spread_bps > MAX_SPREAD_BPS):
                             continue
@@ -857,7 +887,8 @@ def main_loop():
                                 continue
                             _is_submitting = True
 
-                            if ext:
+                            # ext indicates "pre-market attempt" — but ext will be False when pre-market is disabled
+                            if ext and ENABLE_PREMARKET:
                                 buy_id = place_limit_buy_qty_premarket(sym, qty, ref_price=price)
                                 if buy_id and not ALLOW_PRE_AUTO_SELL:
                                     record_prebuy(sym)
@@ -888,7 +919,7 @@ def main_loop():
 
         session = current_session_et()
         # تقليل فاصل البري ماركت لتفادي ضياع نافذة الرفض/التحويل
-        dynamic_interval = 0.3 if session == "pre" else INTERVAL_SECONDS
+        dynamic_interval = 0.3 if session == "pre" and ENABLE_PREMARKET else INTERVAL_SECONDS
         sleep_until_next_interval(dynamic_interval, cycle_started)
 
 if __name__ == "__main__":
