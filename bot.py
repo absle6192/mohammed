@@ -23,7 +23,9 @@ SYMBOLS: List[str] = [s.strip().upper() for s in os.getenv(
 # ===== لا تغيير في عتبة المومنتوم =====
 MOMENTUM_THRESHOLD = float(os.getenv("MOMENTUM_THRESHOLD", "0.00005"))
 
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
+# أقصى عدد صفقات مفتوحة في نفس الوقت
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+
 TOP_K = int(os.getenv("TOP_K", "3"))
 TOP_K = min(TOP_K, MAX_OPEN_POSITIONS)  # تقليل ازدواج المرشحين من الأصل
 
@@ -46,6 +48,9 @@ MAX_CYCLE_SECONDS  = int(os.getenv("MAX_CYCLE_SECONDS", "20"))
 
 PRE_SLIPPAGE_USD = float(os.getenv("PRE_SLIPPAGE_USD", "0.05"))
 SELL_PAD_USD     = float(os.getenv("SELL_PAD_USD", "0.02"))
+
+# ======= هدف ربح ثابت بالدولار لكل صفقة (بيع فوري ماركت) ======= #
+TAKE_PROFIT_USD = float(os.getenv("TAKE_PROFIT_USD", "20"))
 
 ALLOW_PRE_AUTO_SELL = os.getenv("ALLOW_PRE_AUTO_SELL", "false").lower() == "true"
 
@@ -132,7 +137,7 @@ def current_session_et(dt: datetime | None = None) -> str:
 def can_trade_now() -> tuple[bool, bool]:
     s = current_session_et()
     # if pre-market disabled, do not allow trading in 'pre'
-    if s == "pre" and not ENABLE_PREMARKET:
+    if s == "pre" and not ENABLEPREMARKET:
         return False, False
     if s == "pre":
         return True, True
@@ -400,7 +405,7 @@ def place_market_buy_qty_regular(symbol: str, qty: int) -> Optional[str]:
 def place_limit_buy_qty_premarket(symbol: str, qty: int, ref_price: float) -> Optional[str]:
     """Originally used for pre-market limit buys — now guarded by ENABLE_PREMARKET.
        If pre-market disabled this is a no-op and returns None."""
-    if not ENABLE_PREMARKET:
+    if not ENABLEPREMARKET:
         log.debug(f"[BUY-PRE/LMT SKIP] Pre-market disabled, skipping buy for {symbol}.")
         return None
     try:
@@ -420,7 +425,7 @@ def place_limit_buy_qty_premarket(symbol: str, qty: int, ref_price: float) -> Op
 
 def place_limit_sell_extended(symbol: str, qty: float, ref_bid: Optional[float] = None, pad: Optional[float] = None) -> Optional[str]:
     """Originally used to place extended-hours sell orders; now will not send extended-hours if premarket disabled."""
-    if not ENABLE_PREMARKET and current_session_et() == "pre":
+    if not ENABLEPREMARKET and current_session_et() == "pre":
         log.debug(f"[SELL-EXT SKIP] Pre-market disabled, not placing extended sell for {symbol}.")
         return None
     try:
@@ -500,7 +505,7 @@ def _remaining_qty(o) -> float:
 
 def instant_fix_market_orders():
     """No-op when pre-market disabled to prevent touching pre-market orders."""
-    if not ENABLE_PREMARKET:
+    if not ENABLEPREMARKET:
         return
     if current_session_et() != "pre":
         return
@@ -547,7 +552,7 @@ def instant_fix_market_orders():
 
 def auto_fix_premarket_market_sells():
     """No-op when pre-market disabled."""
-    if not ENABLE_PREMARKET:
+    if not ENABLEPREMARKET:
         return
     if current_session_et() != "pre":
         return
@@ -586,7 +591,7 @@ def rescue_rejected_premarket_market_sells(window_sec: int = 5):
     """
     No-op when pre-market disabled. Otherwise same behavior as before.
     """
-    if not ENABLE_PREMARKET:
+    if not ENABLEPREMARKET:
         return
     if current_session_et() != "pre":
         return
@@ -676,6 +681,53 @@ def positions_qty_map() -> Dict[str, float]:
 
 _last_qty: Dict[str, float] = {}
 
+# ======= NEW: دالة تحقق هدف الربح بالدولار وتبيع فوراً ماركت ======= #
+def maybe_take_profit_market(symbol: str, pos, last_price: Optional[float], tp_usd: float) -> bool:
+    """
+    إذا الربح العائم وصل أو تجاوز tp_usd → يرسل أمر بيع MARKET فوري.
+    ترجع True إذا أرسلت أمر بيع، و False إذا لم يحدث شيء.
+    """
+    if tp_usd <= 0:
+        return False
+    if last_price is None or last_price <= 0:
+        return False
+
+    try:
+        qty = float(pos.qty)
+        avg_price = float(pos.avg_entry_price)
+    except Exception:
+        return False
+
+    if qty <= 0:
+        return False
+
+    unrealized_pnl = (last_price - avg_price) * qty
+
+    if unrealized_pnl >= tp_usd:
+        log.info(
+            f"[TP] {symbol}: unrealized_pnl={unrealized_pnl:.2f} >= {tp_usd:.2f} → SELL MARKET (take profit NOW)"
+        )
+        try:
+            api.submit_order(
+                symbol=symbol,
+                qty=str(qty),
+                side="sell",
+                type="market",
+                time_in_force="day",
+                extended_hours=False
+            )
+            # نسجّل البيع الآن
+            now = utc_now()
+            sold_registry[symbol] = now
+            if current_session_et() == "regular":
+                sold_regular_lock[symbol] = now
+            return True
+        except Exception as e:
+            log.exception(f"[TP] Failed to submit take-profit market sell for {symbol}: {e}")
+            return False
+
+    return False
+
 # ---------------- Main loop ----------------
 def main_loop():
     log.info(f"SYMBOLS LOADED: {SYMBOLS}")
@@ -690,7 +742,8 @@ def main_loop():
         f"sell_pad_usd={SELL_PAD_USD} allow_pre_auto_sell={ALLOW_PRE_AUTO_SELL} "
         f"pre_slots={MAX_PREMARKET_SLOTS} pre_cooldown_s={ORDER_COOLDOWN_SECONDS} max_orders_per_cycle_pre={MAX_ORDERS_PER_CYCLE_PRE} "
         f"instant_fix_interval_s={INSTANT_FIX_INTERVAL_SEC} "
-        f"min_pre_dollar_vol={MIN_PREMARKET_DOLLAR_VOL} max_spread_bps={MAX_SPREAD_BPS} pre_enabled={ENABLE_PREMARKET}"
+        f"min_pre_dollar_vol={MIN_PREMARKET_DOLLAR_VOL} max_spread_bps={MAX_SPREAD_BPS} pre_enabled={ENABLE_PREMARKET} "
+        f"take_profit_usd={TAKE_PROFIT_USD}"
     )
 
     log.info("Bot started.")
@@ -699,13 +752,26 @@ def main_loop():
         try:
             session = current_session_et()
             # If pre-market is disabled, treat 'pre' as 'closed' locally to skip all pre-market branches
-            if session == "pre" and not ENABLE_PREMARKET:
+            if session == "pre" and not ENABLEPREMARKET:
                 session = "closed"
 
             if session == "closed":
                 heartbeat("Out of allowed sessions (no trading) - sleeping")
             else:
                 heartbeat(f"Session={session} - cycle begin")
+
+                # ======= أولاً: تحقق من جميع المراكز المفتوحة وطبّق هدف الربح الفوري ======= #
+                if TAKE_PROFIT_USD > 0:
+                    try:
+                        open_positions = api.list_positions()
+                        for pos in open_positions:
+                            sym = pos.symbol
+                            if sym not in SYMBOLS:
+                                continue
+                            lp = last_trade_price(sym)
+                            maybe_take_profit_market(sym, pos, lp, TAKE_PROFIT_USD)
+                    except Exception as e:
+                        log.debug(f"[TP] scanning positions failed: {e}")
 
                 # (A) قفل فوري من تغيّر الكميات
                 pos_now = positions_qty_map()
@@ -752,7 +818,8 @@ def main_loop():
                     slots_left = max(0, target_slots - busy_slots)
                     per_cycle_limit = MAX_ORDERS_PER_CYCLE_PRE
                 else:
-                    target_slots = min(MAX_OPEN_POSITIONS, TOP_K)
+                    # نستخدم فقط MAX_OPEN_POSITIONS للتحكم في عدد الصفقات، بدون قص المرشحين بـ TOP_K
+                    target_slots = MAX_OPEN_POSITIONS
                     slots_left = min(target_slots, allowed_slots(api))
                     per_cycle_limit = target_slots
 
@@ -813,13 +880,25 @@ def main_loop():
 
                 # ترتيب واختيار
                 candidates.sort(key=lambda x: x[1], reverse=True)
-                best = [c[0] for c in candidates[:TOP_K]]
+                ordered_syms = [c[0] for c in candidates]
+                # للعرض فقط نطبع أفضل TOP_K في اللوق
+                best_preview = ordered_syms[:TOP_K]
+
                 open_syms = set(list_open_positions_symbols())
-                symbols_to_open = [s for s in best if s not in open_syms][:slots_left]
+
+                # أي سهم مرشح ومو مفتوح حاليًا، ومعنا Slots فاضية → نفتح عليه (بدون قص القائمة بـ TOP_K)
+                symbols_to_open: List[str] = []
+                for s in ordered_syms:
+                    if s in open_syms:
+                        continue
+                    if len(symbols_to_open) >= slots_left:
+                        break
+                    symbols_to_open.append(s)
+
                 if session == "pre" and symbols_to_open:
                     symbols_to_open = symbols_to_open[:min(len(symbols_to_open), per_cycle_limit)]
 
-                log.info(f"BEST={best} | open={list(open_syms)} | to_open={symbols_to_open} | slots_left={slots_left} | target_slots={target_slots}")
+                log.info(f"BEST={best_preview} | open={list(open_syms)} | to_open={symbols_to_open} | slots_left={slots_left} | target_slots={target_slots}")
 
                 # ===== تنفيذ الشراء =====
                 if symbols_to_open:
@@ -880,6 +959,7 @@ def main_loop():
                             qty = max_affordable_qty
                             est_notional = qty * price
 
+                        buy_id = None
                         try:
                             global _is_submitting
                             if _is_submitting:
@@ -888,7 +968,7 @@ def main_loop():
                             _is_submitting = True
 
                             # ext indicates "pre-market attempt" — but ext will be False when pre-market is disabled
-                            if ext and ENABLE_PREMARKET:
+                            if ext and ENABLEPREMARKET:
                                 buy_id = place_limit_buy_qty_premarket(sym, qty, ref_price=price)
                                 if buy_id and not ALLOW_PRE_AUTO_SELL:
                                     record_prebuy(sym)
@@ -919,7 +999,7 @@ def main_loop():
 
         session = current_session_et()
         # تقليل فاصل البري ماركت لتفادي ضياع نافذة الرفض/التحويل
-        dynamic_interval = 0.3 if session == "pre" and ENABLE_PREMARKET else INTERVAL_SECONDS
+        dynamic_interval = 0.3 if session == "pre" and ENABLEPREMARKET else INTERVAL_SECONDS
         sleep_until_next_interval(dynamic_interval, cycle_started)
 
 if __name__ == "__main__":
