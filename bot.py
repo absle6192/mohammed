@@ -1,8 +1,6 @@
 import os
 import time
-import math
 import logging
-from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -20,16 +18,16 @@ SYMBOLS: List[str] = [s.strip().upper() for s in os.getenv(
     "SYMBOLS", "TSLA,NVDA,AAPL,CRWD,AMZN,AMD,GOOGL,MU"
 ).split(",") if s.strip()]
 
-# ===== لا تغيير في عتبة المومنتوم =====
+# ===== إعدادات المومنتوم =====
 MOMENTUM_THRESHOLD = float(os.getenv("MOMENTUM_THRESHOLD", "0.00005"))
 
-# أقصى عدد صفقات مفتوحة في نفس الوقت
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+# أقصى عدد مراكز مفتوحة في نفس الوقت
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "4"))
 
 TOP_K = int(os.getenv("TOP_K", "3"))
-TOP_K = min(TOP_K, MAX_OPEN_POSITIONS)  # تقليل ازدواج المرشحين من الأصل
+TOP_K = min(TOP_K, MAX_OPEN_POSITIONS)
 
-# ======= Allocation Settings ======= #
+# ===== Allocation Settings =====
 ALLOCATE_FROM_CASH = os.getenv("ALLOCATE_FROM_CASH", "true").lower() == "true"
 FALLBACK_NOTIONAL_PER_TRADE = float(os.getenv("NOTIONAL_PER_TRADE", "6250"))
 
@@ -49,44 +47,29 @@ MAX_CYCLE_SECONDS  = int(os.getenv("MAX_CYCLE_SECONDS", "20"))
 PRE_SLIPPAGE_USD = float(os.getenv("PRE_SLIPPAGE_USD", "0.05"))
 SELL_PAD_USD     = float(os.getenv("SELL_PAD_USD", "0.02"))
 
-# ======= هدف ربح ثابت بالدولار لكل صفقة (بيع فوري ماركت) ======= #
+# هدف ربح ثابت بالدولار لكل صفقة → بيع MARKET فوري
 TAKE_PROFIT_USD = float(os.getenv("TAKE_PROFIT_USD", "20"))
 
 ALLOW_PRE_AUTO_SELL = os.getenv("ALLOW_PRE_AUTO_SELL", "false").lower() == "true"
 
-# ======= إعدادات خاصة قبل الافتتاح ======= #
-MAX_PREMARKET_SLOTS = int(os.getenv("MAX_PREMARKET_SLOTS", "2"))
-ORDER_COOLDOWN_SECONDS = int(os.getenv("ORDER_COOLDOWN_SECONDS", "8"))
-MAX_ORDERS_PER_CYCLE_PRE = int(os.getenv("MAX_ORDERS_PER_CYCLE_PRE", "1"))
+# إعدادات pre-market (سيتم تعطيلها إذا ENABLE_PREMARKET=False)
+MAX_PREMARKET_SLOTS       = int(os.getenv("MAX_PREMARKET_SLOTS", "2"))
+ORDER_COOLDOWN_SECONDS    = int(os.getenv("ORDER_COOLDOWN_SECONDS", "8"))
+MAX_ORDERS_PER_CYCLE_PRE  = int(os.getenv("MAX_ORDERS_PER_CYCLE_PRE", "1"))
+MIN_PREMARKET_DOLLAR_VOL  = float(os.getenv("MIN_PREMARKET_DOLLAR_VOL", "500000"))
+MAX_SPREAD_BPS            = float(os.getenv("MAX_SPREAD_BPS", "15"))  # 0.15%
 
-# ===== فلاتر جديدة للـ pre-market =====
-MIN_PREMARKET_DOLLAR_VOL = float(os.getenv("MIN_PREMARKET_DOLLAR_VOL", "500000"))
-MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", "15"))  # 0.15%
-
-# ======= فاصل الفحص الفوري للتحويل ======= #
 INSTANT_FIX_INTERVAL_SEC = float(os.getenv("INSTANT_FIX_INTERVAL_SEC", "0.5"))
 
-# قفل إرسال الأوامر
 _is_submitting = False
 _last_submit_ts = 0.0
 
-# --- Instant Fix state ---
 INSTANT_FIX_DONE: Dict[str, bool] = {}
 _instant_fixing = False
 _last_instant_fix_ts = 0.0
 
-# ---------- NEW: central switch to disable pre-market trading ----------
-ENABLE_PREMARKET = False  # <-- اضبط False لمنع أي تداول قبل الافتتاح (الافتراضي هنا معطل)
-if not ENABLE_PREMARKET:
-    log.info("PREMARKET trading is DISABLED (ENABLE_PREMARKET=False). No extended-hours/pre-market orders will be sent.")
-
-def _can_submit_now() -> bool:
-    return (time.time() - _last_submit_ts) >= ORDER_COOLDOWN_SECONDS
-
-def _mark_submit():
-    global _last_submit_ts
-    _last_submit_ts = time.time()
-
+# مفتاح واحد للتحكم في تداول ما قبل الافتتاح
+ENABLE_PREMARKET = False
 if not API_KEY or not API_SECRET:
     log.error("Missing API keys in environment.")
     raise SystemExit(1)
@@ -95,6 +78,7 @@ api = REST(API_KEY, API_SECRET, BASE_URL)
 
 def _mask(s: str):
     return "(empty)" if not s else f"{s[:3]}***{s[-3:]}"
+
 log.info(f"BASE_URL={BASE_URL} | KEY={_mask(API_KEY)}")
 try:
     acct = api.get_account()
@@ -102,7 +86,17 @@ try:
 except Exception as e:
     log.error(f"account check failed: {e}")
 
+if not ENABLE_PREMARKET:
+    log.info("PREMARKET trading is DISABLED (ENABLE_PREMARKET=False). No extended-hours/pre-market orders will be sent.")
+
 ET = ZoneInfo("America/New_York")
+
+def _can_submit_now() -> bool:
+    return (time.time() - _last_submit_ts) >= ORDER_COOLDOWN_SECONDS
+
+def _mark_submit():
+    global _last_submit_ts
+    _last_submit_ts = time.time()
 
 def utc_now():
     return datetime.now(timezone.utc)
@@ -135,9 +129,11 @@ def current_session_et(dt: datetime | None = None) -> str:
     return "closed"
 
 def can_trade_now() -> tuple[bool, bool]:
+    """
+    returns (can_trade, is_pre)
+    """
     s = current_session_et()
-    # if pre-market disabled, do not allow trading in 'pre'
-    if s == "pre" and not ENABLEPREMARKET:
+    if s == "pre" and not ENABLE_PREMARKET:
         return False, False
     if s == "pre":
         return True, True
@@ -145,12 +141,11 @@ def can_trade_now() -> tuple[bool, bool]:
         return True, False
     return False, False
 
-# ---------------- Registries ----------------
+# ===== سجلات البيع / الكول داون =====
 sold_registry: Dict[str, datetime] = {}
 sold_pre_market: Dict[str, datetime] = {}
 sold_regular_lock: Dict[str, datetime] = {}
 
-# ---------------- Helpers ----------------
 def record_today_sells(api: REST, symbols: List[str]) -> None:
     try:
         closed = api.list_orders(status="closed", limit=200, direction="desc")
@@ -240,7 +235,6 @@ def latest_bid(symbol: str) -> float:
         return 0.0
 
 def best_ask(symbol: str) -> Optional[float]:
-    """سعر الطلب الحالي لاستخدامه في الشراء قبل الافتتاح."""
     try:
         q = api.get_latest_quote(symbol)
         a = (
@@ -280,19 +274,7 @@ def open_orders_map() -> Dict[str, bool]:
         pass
     return m
 
-def count_open_buy_orders_in_universe() -> int:
-    c = 0
-    try:
-        orders = api.list_orders(status="open", limit=500)
-        for o in orders:
-            if getattr(o, "side", "").lower() == "buy" and o.symbol in SYMBOLS:
-                c += 1
-    except Exception:
-        pass
-    return c
-
 def cancel_symbol_open_buy_orders(symbol: str):
-    """لا تلغِ أوامر البيع بالخطأ—إلغاء أوامر الشراء فقط"""
     try:
         for o in api.list_orders(status="open", limit=500):
             if o.symbol == symbol and getattr(o, "side", "").lower() == "buy":
@@ -304,7 +286,6 @@ def cancel_symbol_open_buy_orders(symbol: str):
     except Exception:
         pass
 
-# ---------------- Momentum ----------------
 def momentum_for_last_min(symbol: str) -> Optional[float]:
     try:
         bars = api.get_bars(symbol, TimeFrame(1, TimeFrameUnit.Minute), limit=2).df
@@ -318,9 +299,7 @@ def momentum_for_last_min(symbol: str) -> Optional[float]:
         log.debug(f"momentum calc error {symbol}: {e}")
         return None
 
-# ---------------- CAP accounting (المراكز + أوامر الشراء) ----------------
 def active_buy_slots(api: REST) -> tuple[int, int, int]:
-    """return (open_positions, open_buy_orders, total_active)"""
     try:
         p = len(api.list_positions())
     except Exception:
@@ -336,9 +315,8 @@ def allowed_slots(api: REST) -> int:
     _, _, total = active_buy_slots(api)
     return max(0, MAX_OPEN_POSITIONS - total)
 
-# ---------------- Guards ----------------
 def guard_states(symbol: str, open_orders: Dict[str, bool]) -> Dict[str, bool]:
-    _, _, total = active_buy_slots(api)  # احتسب total بدل المراكز فقط
+    _, _, total = active_buy_slots(api)
     return {
         "has_pos": has_open_position(symbol),
         "has_open_order": open_orders.get(symbol, False),
@@ -364,7 +342,6 @@ def can_open_new_long(symbol: str, states: Dict[str, bool], session: str) -> Tup
         return False, "no-reentry-today"
     return True, ""
 
-# ---------------- Pre-market lock for auto-sell ----------------
 PREMARKET_LOCK: Dict[str, str] = {}
 
 def record_prebuy(symbol: str):
@@ -389,13 +366,14 @@ def should_allow_auto_sell(symbol: str) -> bool:
         return False
     return True
 
-# ---------------- Orders ----------------
 def place_market_buy_qty_regular(symbol: str, qty: int) -> Optional[str]:
     try:
         cid = f"open-{symbol}-{int(time.time()*1000)}"
-        o = api.submit_order(symbol=symbol, side="buy", type="market",
-                             time_in_force="day", qty=str(qty), extended_hours=False,
-                             client_order_id=cid)
+        o = api.submit_order(
+            symbol=symbol, side="buy", type="market",
+            time_in_force="day", qty=str(qty),
+            extended_hours=False, client_order_id=cid
+        )
         log.info(f"[BUY-REG/MKT] {symbol} qty={qty}")
         return o.id
     except Exception as e:
@@ -403,9 +381,7 @@ def place_market_buy_qty_regular(symbol: str, qty: int) -> Optional[str]:
         return None
 
 def place_limit_buy_qty_premarket(symbol: str, qty: int, ref_price: float) -> Optional[str]:
-    """Originally used for pre-market limit buys — now guarded by ENABLE_PREMARKET.
-       If pre-market disabled this is a no-op and returns None."""
-    if not ENABLEPREMARKET:
+    if not ENABLE_PREMARKET:
         log.debug(f"[BUY-PRE/LMT SKIP] Pre-market disabled, skipping buy for {symbol}.")
         return None
     try:
@@ -413,33 +389,35 @@ def place_limit_buy_qty_premarket(symbol: str, qty: int, ref_price: float) -> Op
         base = ask if (ask and ask > 0) else ref_price
         limit_price = round(float(base) + PRE_SLIPPAGE_USD, 2)
         cid = f"open-pre-{symbol}-{int(time.time()*1000)}"
-        # Even for extended hours we avoid setting extended_hours=True if disabled above
-        o = api.submit_order(symbol=symbol, side="buy", type="limit", time_in_force="day",
-                             qty=str(qty), limit_price=str(limit_price), extended_hours=False,
-                             client_order_id=cid)
-        log.info(f"[BUY-PRE/LMT] {symbol} qty={qty} limit={limit_price:.2f} (ask={ask}, ref={ref_price:.2f})")
+        o = api.submit_order(
+            symbol=symbol, side="buy", type="limit", time_in_force="day",
+            qty=str(qty), limit_price=str(limit_price),
+            extended_hours=False, client_order_id=cid
+        )
+        log.info(f"[BUY-PRE/LMT] {symbol} qty={qty} limit={limit_price:.2f}")
         return o.id
     except Exception as e:
         log.error(f"BUY pre-market limit failed {symbol}: {e}")
         return None
 
-def place_limit_sell_extended(symbol: str, qty: float, ref_bid: Optional[float] = None, pad: Optional[float] = None) -> Optional[str]:
-    """Originally used to place extended-hours sell orders; now will not send extended-hours if premarket disabled."""
-    if not ENABLEPREMARKET and current_session_et() == "pre":
+def place_limit_sell_extended(symbol: str, qty: float, ref_bid: Optional[float] = None,
+                              pad: Optional[float] = None) -> Optional[str]:
+    if not ENABLE_PREMARKET and current_session_et() == "pre":
         log.debug(f"[SELL-EXT SKIP] Pre-market disabled, not placing extended sell for {symbol}.")
         return None
     try:
         bid = ref_bid if (ref_bid is not None and ref_bid > 0) else latest_bid(symbol)
         if bid <= 0:
-            log.warning(f"[SELL-PRE] {symbol}: no bid available.")
+            log.warning(f"[SELL-EXT] {symbol}: no bid available.")
             return None
         p = SELL_PAD_USD if pad is None else pad
         limit_price = round(bid - p, 2)
         cid = f"exit-ext-{symbol}-{int(time.time()*1000)}"
-        # ensure extended_hours=False to avoid pre/post market execution
-        o = api.submit_order(symbol=symbol, side="sell", type="limit", time_in_force="day",
-                             qty=str(qty), limit_price=str(limit_price), extended_hours=False,
-                             client_order_id=cid)
+        o = api.submit_order(
+            symbol=symbol, side="sell", type="limit", time_in_force="day",
+            qty=str(qty), limit_price=str(limit_price),
+            extended_hours=False, client_order_id=cid
+        )
         log.info(f"[SELL-EXT/LMT] {symbol} qty={qty} limit={limit_price}")
         return o.id
     except Exception as e:
@@ -449,13 +427,17 @@ def place_limit_sell_extended(symbol: str, qty: float, ref_bid: Optional[float] 
 def place_trailing_stop_regular(symbol: str, qty: float) -> Optional[str]:
     try:
         if TRAIL_PRICE > 0:
-            o = api.submit_order(symbol=symbol, side="sell", type="trailing_stop",
-                                 time_in_force="day", trail_price=str(TRAIL_PRICE), qty=str(qty),
-                                 extended_hours=False)
+            o = api.submit_order(
+                symbol=symbol, side="sell", type="trailing_stop",
+                time_in_force="day", trail_price=str(TRAIL_PRICE),
+                qty=str(qty), extended_hours=False
+            )
         else:
-            o = api.submit_order(symbol=symbol, side="sell", type="trailing_stop",
-                                 time_in_force="day", trail_percent=str(TRAIL_PCT), qty=str(qty),
-                                 extended_hours=False)
+            o = api.submit_order(
+                symbol=symbol, side="sell", type="trailing_stop",
+                time_in_force="day", trail_percent=str(TRAIL_PCT),
+                qty=str(qty), extended_hours=False
+            )
         log.info(f"[TRAIL-REG] {symbol} qty={qty}")
         return o.id
     except Exception as e:
@@ -464,48 +446,41 @@ def place_trailing_stop_regular(symbol: str, qty: float) -> Optional[str]:
 
 def try_attach_trailing_stop_if_allowed(symbol: str):
     if current_session_et() != "regular":
-        log.info(f"[TRAIL SKIP] {symbol}: not regular session.")
         return
     if not should_allow_auto_sell(symbol):
-        log.info(f"[TRAIL SKIP] {symbol}: pre-market lock active.")
         return
     try:
         pos = api.get_position(symbol)
         qty = float(pos.qty)
         if qty > 0:
             place_trailing_stop_regular(symbol, qty)
-    except Exception as e:
-        log.debug(f"attach trail skipped {symbol}: {e}")
+    except Exception:
+        pass
 
 def force_exit_pre(symbol: str, pad: float = None):
     try:
         pos = api.get_position(symbol)
         qty = float(pos.qty)
         if qty <= 0:
-            log.info(f"[EXIT-PRE] {symbol}: no long qty.")
             return None
         bid = latest_bid(symbol)
         if bid <= 0:
-            log.warning(f"[EXIT-PRE] {symbol}: no bid.")
             return None
         return place_limit_sell_extended(symbol, qty, ref_bid=bid, pad=pad)
     except Exception as e:
         log.error(f"[EXIT-PRE] {symbol} failed: {e}")
         return None
 
-# ======= Instant Market→Limit fixer for pre-market ======= #
 def _remaining_qty(o) -> float:
     try:
         original_qty = float(getattr(o, "qty", 0) or 0)
-        filled_qty = float(getattr(o, "filled_qty", 0) or 0)
-        remaining = max(0.0, original_qty - filled_qty)
+        filled_qty   = float(getattr(o, "filled_qty", 0) or 0)
+        return max(0.0, original_qty - filled_qty)
     except Exception:
-        remaining = float(getattr(o, "qty", 0) or 0)
-    return remaining
+        return float(getattr(o, "qty", 0) or 0)
 
 def instant_fix_market_orders():
-    """No-op when pre-market disabled to prevent touching pre-market orders."""
-    if not ENABLEPREMARKET:
+    if not ENABLE_PREMARKET:
         return
     if current_session_et() != "pre":
         return
@@ -516,7 +491,7 @@ def instant_fix_market_orders():
         _instant_fixing = True
         open_orders = api.list_orders(status="open", limit=500)
         for o in open_orders:
-            sym = getattr(o, "symbol", "").upper()
+            sym  = getattr(o, "symbol", "").upper()
             side = (getattr(o, "side", "") or "").lower()
             otype = (getattr(o, "type", "") or "").lower()
             if INSTANT_FIX_DONE.get(sym):
@@ -524,35 +499,34 @@ def instant_fix_market_orders():
             if side == "sell" and otype == "market":
                 try:
                     api.cancel_order(o.id)
-                except Exception as e:
-                    log.debug(f"[INSTANT-FIX] cancel sell failed {sym}: {e}")
+                except Exception:
+                    pass
                 bid = latest_bid(sym)
                 qty = _remaining_qty(o)
                 if bid > 0 and qty > 0:
                     placed = place_limit_sell_extended(sym, qty, ref_bid=bid)
                     if placed:
                         INSTANT_FIX_DONE[sym] = True
-                        log.info(f"[INSTANT-FIX] SELL Market→Limit (extended) for {sym}")
+                        log.info(f"[INSTANT-FIX] SELL Market→Limit for {sym}")
             elif side == "buy" and otype == "market":
                 try:
                     api.cancel_order(o.id)
-                except Exception as e:
-                    log.debug(f"[INSTANT-FIX] cancel buy failed {sym}: {e}")
+                except Exception:
+                    pass
                 last = last_trade_price(sym) or latest_bid(sym)
                 qty_i = int(_remaining_qty(o))
                 if last and qty_i > 0:
                     placed = place_limit_buy_qty_premarket(sym, qty_i, ref_price=last)
                     if placed:
                         INSTANT_FIX_DONE[sym] = True
-                        log.info(f"[INSTANT-FIX] BUY Market→Limit (extended) for {sym}")
+                        log.info(f"[INSTANT-FIX] BUY Market→Limit for {sym}")
     except Exception as e:
-        log.debug(f"[INSTANT-FIX] list_orders failed: {e}")
+        log.debug(f"[INSTANT-FIX] failed: {e}")
     finally:
         _instant_fixing = False
 
 def auto_fix_premarket_market_sells():
-    """No-op when pre-market disabled."""
-    if not ENABLEPREMARKET:
+    if not ENABLE_PREMARKET:
         return
     if current_session_et() != "pre":
         return
@@ -560,38 +534,32 @@ def auto_fix_premarket_market_sells():
         open_os = api.list_orders(status="open", limit=500)
         for o in open_os:
             try:
-                sym = getattr(o, "symbol", "").upper()
+                sym  = getattr(o, "symbol", "").upper()
+                side = (getattr(o, "side", "") or "").lower()
+                otype= (getattr(o, "type", "") or "").lower()
                 if INSTANT_FIX_DONE.get(sym):
                     continue
-                side = (getattr(o, "side", "") or "").lower()
-                otype = (getattr(o, "type", "") or "").lower()
-
                 if side == "sell" and otype == "market":
                     api.cancel_order(o.id)
                     bid = latest_bid(sym)
                     qty = _remaining_qty(o)
                     if bid > 0 and qty > 0:
                         place_limit_sell_extended(sym, qty, ref_bid=bid)
-                        log.info(f"[AUTO-FIX] Replaced SELL/MARKET with SELL/LIMIT (extended) for {sym}")
-                    continue
-
+                        log.info(f"[AUTO-FIX] SELL MKT→LMT {sym}")
                 if side == "buy" and otype == "market":
                     api.cancel_order(o.id)
                     last = last_trade_price(sym) or latest_bid(sym)
-                    qty = int(_remaining_qty(o))
+                    qty  = int(_remaining_qty(o))
                     if last and qty > 0:
                         place_limit_buy_qty_premarket(sym, qty, ref_price=last)
-                        log.info(f"[AUTO-FIX] Replaced BUY/MARKET with BUY/LIMIT (extended) for {sym}")
+                        log.info(f"[AUTO-FIX] BUY MKT→LMT {sym}")
             except Exception as e:
-                log.warning(f"[AUTO-FIX] failed for {getattr(o, 'symbol', '?')}: {e}")
+                log.debug(f"[AUTO-FIX] one failed: {e}")
     except Exception as e:
         log.debug(f"[AUTO-FIX] list_orders failed: {e}")
 
 def rescue_rejected_premarket_market_sells(window_sec: int = 5):
-    """
-    No-op when pre-market disabled. Otherwise same behavior as before.
-    """
-    if not ENABLEPREMARKET:
+    if not ENABLE_PREMARKET:
         return
     if current_session_et() != "pre":
         return
@@ -599,46 +567,37 @@ def rescue_rejected_premarket_market_sells(window_sec: int = 5):
     try:
         closed = api.list_orders(status="closed", limit=200, direction="desc")
     except Exception as e:
-        log.debug(f"[RESCUE] list_orders closed failed: {e}")
+        log.debug(f"[RESCUE] list_orders failed: {e}")
         return
-
     for o in closed:
         try:
-            side = (getattr(o, "side", "") or "").lower()
-            otype = (getattr(o, "type", "") or "").lower()
+            side   = (getattr(o, "side", "") or "").lower()
+            otype  = (getattr(o, "type", "") or "").lower()
             status = (getattr(o, "status", "") or "").lower()
-            sym = getattr(o, "symbol", "").upper()
+            sym    = getattr(o, "symbol", "").upper()
             t = getattr(o, "filled_at", None) or getattr(o, "updated_at", None) or getattr(o, "created_at", None)
             if not t:
                 continue
             t = t if t.tzinfo else t.replace(tzinfo=timezone.utc)
-
-            if side != "sell":
-                continue
-            if otype != "market":
-                continue
-            if status != "rejected":
+            if side != "sell" or otype != "market" or status != "rejected":
                 continue
             if t < cutoff:
                 continue
             if INSTANT_FIX_DONE.get(sym):
                 continue
-
             qty = float(getattr(o, "qty", 0) or 0)
             if qty <= 0:
                 continue
-
             bid = latest_bid(sym)
             if bid <= 0:
                 continue
             placed = place_limit_sell_extended(sym, qty, ref_bid=bid)
             if placed:
                 INSTANT_FIX_DONE[sym] = True
-                log.info(f"[RESCUE] Replaced REJECTED SELL/MKT -> SELL/LMT for {sym}")
+                log.info(f"[RESCUE] SELL REJECTED MKT→LMT {sym}")
         except Exception as e:
             log.debug(f"[RESCUE] error: {e}")
 
-# ---------------- Allocation ----------------
 def get_cash_balance(strict_cash_only: bool = True) -> float:
     try:
         acct = api.get_account()
@@ -662,17 +621,17 @@ def compute_qty_for_budget(symbol: str, budget: float) -> Tuple[int, float]:
         return 0, price
     return qty, price
 
-def plan_budgets_for_opens(total_cash: float, open_count: int, to_open_count: int, target_slots: int) -> List[float]:
+def plan_budgets_for_opens(total_cash: float, open_count: int,
+                           to_open_count: int, target_slots: int) -> List[float]:
     if to_open_count <= 0:
         return []
     reserve = max(0.0, total_cash * CASH_RESERVE_PCT)
-    usable = max(0.0, total_cash - reserve)
+    usable  = max(0.0, total_cash - reserve)
     remaining_slots = max(1, target_slots - open_count)
     remaining_slots = min(remaining_slots, to_open_count)
     per = usable / remaining_slots if remaining_slots > 0 else 0.0
     return [per for _ in range(remaining_slots)]
 
-# ---------------- Positions (instant sell detect) ----------------
 def positions_qty_map() -> Dict[str, float]:
     try:
         return {p.symbol: float(p.qty) for p in api.list_positions()}
@@ -681,32 +640,23 @@ def positions_qty_map() -> Dict[str, float]:
 
 _last_qty: Dict[str, float] = {}
 
-# ======= NEW: دالة تحقق هدف الربح بالدولار وتبيع فوراً ماركت ======= #
-def maybe_take_profit_market(symbol: str, pos, last_price: Optional[float], tp_usd: float) -> bool:
-    """
-    إذا الربح العائم وصل أو تجاوز tp_usd → يرسل أمر بيع MARKET فوري.
-    ترجع True إذا أرسلت أمر بيع، و False إذا لم يحدث شيء.
-    """
+# ===== تحقق هدف الربح +20$ وبيع ماركت فوراً =====
+def maybe_take_profit_market(symbol: str, pos, last_price: Optional[float],
+                             tp_usd: float) -> bool:
     if tp_usd <= 0:
         return False
     if last_price is None or last_price <= 0:
         return False
-
     try:
-        qty = float(pos.qty)
+        qty       = float(pos.qty)
         avg_price = float(pos.avg_entry_price)
     except Exception:
         return False
-
     if qty <= 0:
         return False
-
     unrealized_pnl = (last_price - avg_price) * qty
-
     if unrealized_pnl >= tp_usd:
-        log.info(
-            f"[TP] {symbol}: unrealized_pnl={unrealized_pnl:.2f} >= {tp_usd:.2f} → SELL MARKET (take profit NOW)"
-        )
+        log.info(f"[TP] {symbol}: unrealized_pnl={unrealized_pnl:.2f} >= {tp_usd:.2f} → SELL MARKET NOW")
         try:
             api.submit_order(
                 symbol=symbol,
@@ -716,43 +666,43 @@ def maybe_take_profit_market(symbol: str, pos, last_price: Optional[float], tp_u
                 time_in_force="day",
                 extended_hours=False
             )
-            # نسجّل البيع الآن
             now = utc_now()
             sold_registry[symbol] = now
             if current_session_et() == "regular":
                 sold_regular_lock[symbol] = now
             return True
         except Exception as e:
-            log.exception(f"[TP] Failed to submit take-profit market sell for {symbol}: {e}")
+            log.error(f"[TP] Failed to submit TP sell for {symbol}: {e}")
             return False
-
     return False
 
-# ---------------- Main loop ----------------
 def main_loop():
     log.info(f"SYMBOLS LOADED: {SYMBOLS}")
     log.info(
         "SETTINGS: "
         f"thr={MOMENTUM_THRESHOLD} max_pos={MAX_OPEN_POSITIONS} top_k={TOP_K} "
-        f"allocate_from_cash={ALLOCATE_FROM_CASH} "
-        f"strict_cash_only={STRICT_CASH_ONLY} reserve={CASH_RESERVE_PCT} per_trade_pct={PER_TRADE_PCT} "
+        f"allocate_from_cash={ALLOCATE_FROM_CASH} strict_cash_only={STRICT_CASH_ONLY} "
+        f"reserve={CASH_RESERVE_PCT} per_trade_pct={PER_TRADE_PCT} "
         f"trail_pct={TRAIL_PCT} trail_price={TRAIL_PRICE} "
         f"no_reentry_today={NO_REENTRY_TODAY} cooldown_minutes={COOLDOWN_MINUTES} "
         f"interval_s={INTERVAL_SECONDS} pre_slip_usd={PRE_SLIPPAGE_USD} "
         f"sell_pad_usd={SELL_PAD_USD} allow_pre_auto_sell={ALLOW_PRE_AUTO_SELL} "
-        f"pre_slots={MAX_PREMARKET_SLOTS} pre_cooldown_s={ORDER_COOLDOWN_SECONDS} max_orders_per_cycle_pre={MAX_ORDERS_PER_CYCLE_PRE} "
+        f"pre_slots={MAX_PREMARKET_SLOTS} pre_cooldown_s={ORDER_COOLDOWN_SECONDS} "
+        f"max_orders_per_cycle_pre={MAX_ORDERS_PER_CYCLE_PRE} "
         f"instant_fix_interval_s={INSTANT_FIX_INTERVAL_SEC} "
-        f"min_pre_dollar_vol={MIN_PREMARKET_DOLLAR_VOL} max_spread_bps={MAX_SPREAD_BPS} pre_enabled={ENABLE_PREMARKET} "
+        f"min_pre_dollar_vol={MIN_PREMARKET_DOLLAR_VOL} "
+        f"max_spread_bps={MAX_SPREAD_BPS} pre_enabled={ENABLE_PREMARKET} "
         f"take_profit_usd={TAKE_PROFIT_USD}"
     )
-
     log.info("Bot started.")
+
+    global _last_instant_fix_ts
+
     while True:
         cycle_started = time.time()
         try:
             session = current_session_et()
-            # If pre-market is disabled, treat 'pre' as 'closed' locally to skip all pre-market branches
-            if session == "pre" and not ENABLEPREMARKET:
+            if session == "pre" and not ENABLE_PREMARKET:
                 session = "closed"
 
             if session == "closed":
@@ -760,7 +710,7 @@ def main_loop():
             else:
                 heartbeat(f"Session={session} - cycle begin")
 
-                # ======= أولاً: تحقق من جميع المراكز المفتوحة وطبّق هدف الربح الفوري ======= #
+                # أولاً: تحقق من كل المراكز المفتوحة وطبّق TP
                 if TAKE_PROFIT_USD > 0:
                     try:
                         open_positions = api.list_positions()
@@ -771,9 +721,9 @@ def main_loop():
                             lp = last_trade_price(sym)
                             maybe_take_profit_market(sym, pos, lp, TAKE_PROFIT_USD)
                     except Exception as e:
-                        log.debug(f"[TP] scanning positions failed: {e}")
+                        log.debug(f"[TP] scan failed: {e}")
 
-                # (A) قفل فوري من تغيّر الكميات
+                # قفل تغيّر الكميات
                 pos_now = positions_qty_map()
                 if session == "regular":
                     try:
@@ -790,51 +740,43 @@ def main_loop():
                 _last_qty.clear()
                 _last_qty.update(pos_now)
 
-                # (B) قفل سريع لأي بيع مغلق قبل ثوانٍ
                 just_sold = recent_regular_sell_symbols(window_sec=20)
                 for s in just_sold:
                     sold_regular_lock[s] = utc_now()
 
-                # ======= استدعاء التحويل/الإنقاذ الفوري ======= #
                 now_ts = time.time()
                 if (now_ts - _last_instant_fix_ts) >= INSTANT_FIX_INTERVAL_SEC:
                     instant_fix_market_orders()
                     if session != "pre" and INSTANT_FIX_DONE:
                         INSTANT_FIX_DONE.clear()
-                    globals()['_last_instant_fix_ts'] = now_ts
+                    _last_instant_fix_ts = now_ts
 
                 auto_fix_premarket_market_sells()
-                rescue_rejected_premarket_market_sells()  # <<— لن تعمل إذا pre-market معطّل
+                rescue_rejected_premarket_market_sells()
 
                 record_today_sells(api, SYMBOLS)
                 open_map = open_orders_map()
 
-                # === حساب الطاقة الاستيعابية الصارمة ===
                 if session == "pre":
-                    # لن نصل هنا لأن session تم تغييره إلى "closed" عندما يكون pre-market معطّل
                     target_slots = MAX_PREMARKET_SLOTS
                     p, ob, total = active_buy_slots(api)
                     busy_slots = min(target_slots, p + ob)
                     slots_left = max(0, target_slots - busy_slots)
                     per_cycle_limit = MAX_ORDERS_PER_CYCLE_PRE
                 else:
-                    # نستخدم فقط MAX_OPEN_POSITIONS للتحكم في عدد الصفقات، بدون قص المرشحين بـ TOP_K
                     target_slots = MAX_OPEN_POSITIONS
                     slots_left = min(target_slots, allowed_slots(api))
                     per_cycle_limit = target_slots
 
-                # === بناء المرشحين ===
+                # بناء المرشحين
                 candidates = []
                 for symbol in SYMBOLS:
                     mom = momentum_for_last_min(symbol)
                     if mom is None:
-                        log.info(f"{symbol}: no bar data / bad open; skip")
                         continue
-
                     states = guard_states(symbol, open_map)
-                    allowed, reason = can_open_new_long(symbol, states, session)
+                    allowed, _ = can_open_new_long(symbol, states, session)
 
-                    # حساب سبريد وسيولة دقيقة أخيرة
                     bid = ask = 0.0
                     spread_bps = None
                     dollar_vol = 0.0
@@ -853,14 +795,13 @@ def main_loop():
 
                     log.info(
                         f"{symbol}: mom={mom:.5f} thr={MOMENTUM_THRESHOLD} | "
-                        f"guards: pos={states['has_pos']}, open_order={states['has_open_order']}, "
-                        f"sold_today={states['sold_today']}, cooldown={states['cooldown']}, "
+                        f"guards pos={states['has_pos']} open_order={states['has_open_order']} "
+                        f"sold_today={states['sold_today']} cooldown={states['cooldown']} "
                         f"maxpos={states['max_positions_reached']} | "
-                        f"pre_filters: spread_bps={None if spread_bps is None else round(spread_bps,1)}, "
+                        f"pre_filters spread_bps={None if spread_bps is None else round(spread_bps,1)} "
                         f"dollar_vol={int(dollar_vol)}"
                     )
 
-                    # فلترة ما قبل الافتتاح — لن تُطبّق لأن session == "pre" لم يعد مسموحًا إن كان معطّل
                     if session == "pre":
                         if (spread_bps is None) or (spread_bps > MAX_SPREAD_BPS):
                             continue
@@ -871,22 +812,16 @@ def main_loop():
                         continue
                     if not allowed:
                         continue
-
                     price = last_trade_price(symbol)
                     if not price or price <= 0:
                         continue
-
                     candidates.append((symbol, mom, price))
 
-                # ترتيب واختيار
                 candidates.sort(key=lambda x: x[1], reverse=True)
                 ordered_syms = [c[0] for c in candidates]
-                # للعرض فقط نطبع أفضل TOP_K في اللوق
                 best_preview = ordered_syms[:TOP_K]
 
                 open_syms = set(list_open_positions_symbols())
-
-                # أي سهم مرشح ومو مفتوح حاليًا، ومعنا Slots فاضية → نفتح عليه (بدون قص القائمة بـ TOP_K)
                 symbols_to_open: List[str] = []
                 for s in ordered_syms:
                     if s in open_syms:
@@ -898,15 +833,18 @@ def main_loop():
                 if session == "pre" and symbols_to_open:
                     symbols_to_open = symbols_to_open[:min(len(symbols_to_open), per_cycle_limit)]
 
-                log.info(f"BEST={best_preview} | open={list(open_syms)} | to_open={symbols_to_open} | slots_left={slots_left} | target_slots={target_slots}")
+                log.info(
+                    f"BEST={best_preview} | open={list(open_syms)} "
+                    f"| to_open={symbols_to_open} | slots_left={slots_left} | target_slots={target_slots}"
+                )
 
-                # ===== تنفيذ الشراء =====
                 if symbols_to_open:
                     if ALLOCATE_FROM_CASH:
                         total_cash = get_cash_balance(strict_cash_only=STRICT_CASH_ONLY)
-                        budgets = plan_budgets_for_opens(total_cash, len(open_syms), len(symbols_to_open), target_slots)
+                        budgets = plan_budgets_for_opens(
+                            total_cash, len(open_syms), len(symbols_to_open), target_slots
+                        )
                         if not budgets:
-                            log.info("[ALLOC] No budgets computed; fallback to notional per trade.")
                             budgets = [FALLBACK_NOTIONAL_PER_TRADE for _ in symbols_to_open]
                     else:
                         budgets = [FALLBACK_NOTIONAL_PER_TRADE for _ in symbols_to_open]
@@ -921,24 +859,23 @@ def main_loop():
                         if orders_sent_this_cycle >= per_cycle_limit:
                             break
                         if allowed_slots(api) <= 0:
-                            log.info("Cap reached during placement; stop.")
                             break
-
                         if session == "pre":
                             if not _can_submit_now():
                                 log.info("[PRE] cooldown active, skip this cycle.")
                                 break
                         else:
-                            time.sleep(0.3)  # تبريد خفيف في الافتتاح
+                            time.sleep(0.3)
 
                         budget = min(budget, remaining_cash_for_cycle)
                         if budget <= 1.0:
-                            log.info(f"[ALLOC] Budget depleted/too small for {sym}.")
                             continue
 
                         record_today_sells(api, SYMBOLS)
-                        if session == "regular" and (sold_regular_today(sym) or sym in recent_regular_sell_symbols(10)):
-                            log.info(f"[SKIP BUY] {sym}: locked for rest of regular session")
+                        if session == "regular" and (
+                            sold_regular_today(sym) or sym in recent_regular_sell_symbols(10)
+                        ):
+                            log.info(f"[SKIP BUY] {sym}: locked for regular session")
                             continue
 
                         cancel_symbol_open_buy_orders(sym)
@@ -954,7 +891,6 @@ def main_loop():
                         if est_notional > remaining_cash_for_cycle:
                             max_affordable_qty = int(remaining_cash_for_cycle // price)
                             if max_affordable_qty < 1:
-                                log.info(f"[ALLOC] Not enough cash left for {sym}.")
                                 continue
                             qty = max_affordable_qty
                             est_notional = qty * price
@@ -963,12 +899,10 @@ def main_loop():
                         try:
                             global _is_submitting
                             if _is_submitting:
-                                log.info("[LOCK] submission in progress; skip.")
                                 continue
                             _is_submitting = True
 
-                            # ext indicates "pre-market attempt" — but ext will be False when pre-market is disabled
-                            if ext and ENABLEPREMARKET:
+                            if ext and ENABLE_PREMARKET:
                                 buy_id = place_limit_buy_qty_premarket(sym, qty, ref_price=price)
                                 if buy_id and not ALLOW_PRE_AUTO_SELL:
                                     record_prebuy(sym)
@@ -998,8 +932,7 @@ def main_loop():
             log.warning(f"Slow cycle: {total_elapsed:.1f}s (limit {MAX_CYCLE_SECONDS}s)")
 
         session = current_session_et()
-        # تقليل فاصل البري ماركت لتفادي ضياع نافذة الرفض/التحويل
-        dynamic_interval = 0.3 if session == "pre" and ENABLEPREMARKET else INTERVAL_SECONDS
+        dynamic_interval = 0.3 if session == "pre" and ENABLE_PREMARKET else INTERVAL_SECONDS
         sleep_until_next_interval(dynamic_interval, cycle_started)
 
 if __name__ == "__main__":
