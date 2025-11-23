@@ -35,7 +35,8 @@ STRICT_CASH_ONLY   = os.getenv("STRICT_CASH_ONLY", "true").lower() == "true"
 CASH_RESERVE_PCT   = float(os.getenv("CASH_RESERVE_PCT", "0.02"))
 PER_TRADE_PCT      = float(os.getenv("PER_TRADE_PCT", "0.0"))
 
-TRAIL_PCT   = float(os.getenv("TRAIL_PCT", "0.7"))
+# قيم Trailing لا نستخدمها الآن في الخروج، تركناها فقط جاهزة للمستقبل لو احتجناها
+TRAIL_PCT   = float(os.getenv("TRAIL_PCT", "0.3"))   # كنسبة مئوية (0.3 = 0.3%)
 TRAIL_PRICE = float(os.getenv("TRAIL_PRICE", "0.0"))
 
 NO_REENTRY_TODAY = os.getenv("NO_REENTRY_TODAY", "true").lower() == "true"
@@ -416,7 +417,7 @@ def place_limit_sell_extended(symbol: str, qty: float, ref_bid: Optional[float] 
         o = api.submit_order(
             symbol=symbol, side="sell", type="limit", time_in_force="day",
             qty=str(qty), limit_price=str(limit_price),
-            extended_hours=False, client_order_id=cid
+            extended_hours=False
         )
         log.info(f"[SELL-EXT/LMT] {symbol} qty={qty} limit={limit_price}")
         return o.id
@@ -424,6 +425,7 @@ def place_limit_sell_extended(symbol: str, qty: float, ref_bid: Optional[float] 
         log.error(f"SELL extended limit failed {symbol}: {e}")
         return None
 
+# دوال Trailing موجودة لكن لا نستدعيها في المنطق الحالي (الخروج الآن بالـ TP فقط)
 def place_trailing_stop_regular(symbol: str, qty: float) -> Optional[str]:
     try:
         if TRAIL_PRICE > 0:
@@ -445,17 +447,8 @@ def place_trailing_stop_regular(symbol: str, qty: float) -> Optional[str]:
         return None
 
 def try_attach_trailing_stop_if_allowed(symbol: str):
-    if current_session_et() != "regular":
-        return
-    if not should_allow_auto_sell(symbol):
-        return
-    try:
-        pos = api.get_position(symbol)
-        qty = float(pos.qty)
-        if qty > 0:
-            place_trailing_stop_regular(symbol, qty)
-    except Exception:
-        pass
+    # حالياً لا نستخدم Trailing Stop بعد الشراء
+    return
 
 def force_exit_pre(symbol: str, pad: float = None):
     try:
@@ -640,7 +633,7 @@ def positions_qty_map() -> Dict[str, float]:
 
 _last_qty: Dict[str, float] = {}
 
-# ===== تحقق هدف الربح +20$ وبيع ماركت فوراً =====
+# ===== تحقق هدف الربح +TP_USD وبيع ماركت فوراً =====
 def maybe_take_profit_market(symbol: str, pos, last_price: Optional[float],
                              tp_usd: float) -> bool:
     if tp_usd <= 0:
@@ -723,7 +716,7 @@ def main_loop():
                     except Exception as e:
                         log.debug(f"[TP] scan failed: {e}")
 
-                # قفل تغيّر الكميات
+                # قفل تغيّر الكميات (تسجيل عمليات البيع في جلسة ريجولار)
                 pos_now = positions_qty_map()
                 if session == "regular":
                     try:
@@ -910,9 +903,7 @@ def main_loop():
                                     _mark_submit()
                             else:
                                 buy_id = place_market_buy_qty_regular(sym, qty)
-                                if buy_id:
-                                    time.sleep(1.5)
-                                    try_attach_trailing_stop_if_allowed(sym)
+                                # ما عاد نربط Trailing بعد الشراء، الخروج فقط عن طريق TP
                         finally:
                             _is_submitting = False
 
