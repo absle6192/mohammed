@@ -39,8 +39,11 @@ PER_TRADE_PCT      = float(os.getenv("PER_TRADE_PCT", "0.0"))
 TRAIL_PCT   = float(os.getenv("TRAIL_PCT", "0.3"))   # كنسبة مئوية (0.3 = 0.3%)
 TRAIL_PRICE = float(os.getenv("TRAIL_PRICE", "0.0"))
 
-NO_REENTRY_TODAY = os.getenv("NO_REENTRY_TODAY", "true").lower() == "true"
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "60"))
+# الآن الافتراضي: يسمح بإعادة الدخول لنفس السهم في نفس اليوم
+NO_REENTRY_TODAY = os.getenv("NO_REENTRY_TODAY", "false").lower() == "true"
+
+# الافتراضي الآن 0 دقيقة → ما فيه انتظار إجباري بعد البيع
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "0"))
 
 INTERVAL_SECONDS   = int(os.getenv("INTERVAL_SECONDS", "30"))
 MAX_CYCLE_SECONDS  = int(os.getenv("MAX_CYCLE_SECONDS", "20"))
@@ -335,12 +338,18 @@ def can_open_new_long(symbol: str, states: Dict[str, bool], session: str) -> Tup
         return False, "in cooldown"
     if states["max_positions_reached"]:
         return False, "cap reached"
-    if states["sold_today"] and session == "regular" and symbol in sold_pre_market:
-        return True, "re-entry after pre-market sell"
-    if session == "regular" and sold_regular_today(symbol):
-        return False, "sold earlier in regular session"
-    if states["sold_today"] and session != "regular":
-        return False, "no-reentry-today"
+
+    # منطق منع إعادة الدخول نفس اليوم (اختياري عبر NO_REENTRY_TODAY)
+    if NO_REENTRY_TODAY:
+        # يسمح فقط بإعادة الدخول في الريجولار إذا كان البيع الأول في pre-market
+        if states["sold_today"] and session == "regular" and symbol in sold_pre_market:
+            return True, "re-entry after pre-market sell"
+        if session == "regular" and sold_regular_today(symbol):
+            return False, "sold earlier in regular session"
+        if states["sold_today"] and session != "regular":
+            return False, "no-reentry-today"
+
+    # إذا NO_REENTRY_TODAY=False → يسمح بإعادة الدخول لنفس السهم في نفس اليوم
     return True, ""
 
 PREMARKET_LOCK: Dict[str, str] = {}
@@ -865,10 +874,12 @@ def main_loop():
                             continue
 
                         record_today_sells(api, SYMBOLS)
-                        if session == "regular" and (
+
+                        # لو NO_REENTRY_TODAY=True فقط وقتها نقفل إعادة الشراء في نفس الجلسة
+                        if NO_REENTRY_TODAY and session == "regular" and (
                             sold_regular_today(sym) or sym in recent_regular_sell_symbols(10)
                         ):
-                            log.info(f"[SKIP BUY] {sym}: locked for regular session")
+                            log.info(f"[SKIP BUY] {sym}: locked for regular session (NO_REENTRY_TODAY)")
                             continue
 
                         cancel_symbol_open_buy_orders(sym)
