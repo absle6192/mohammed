@@ -1,214 +1,319 @@
 import os
+import time
 import asyncio
-from datetime import datetime, timezone
+import logging
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
+import pytz
+from alpaca.common.exceptions import APIError
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import MarketOrderRequest
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+# -----------------------
+# Logging
+# -----------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+log = logging.getLogger("bot")
 
-# ----------------------------
-# Config
-# ----------------------------
-SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "TSLA,NVDA,AAPL,CRWD,AMZN,AMD,GOOGL,MU").split(",") if s.strip()]
-CHECK_EVERY_SEC = int(os.getenv("CHECK_EVERY_SEC", "15"))
-MOM_THRESHOLD = float(os.getenv("MOM_THRESHOLD", "0.15"))
+# -----------------------
+# Env
+# -----------------------
+APCA_API_KEY_ID = os.getenv("APCA_API_KEY_ID", "").strip()
+APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY", "").strip()
+APCA_BASE_URL = os.getenv("APCA_BASE_URL", "https://paper-api.alpaca.markets").strip()
 
-APCA_API_KEY_ID = os.getenv("APCA_API_KEY_ID", "")
-APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY", "")
-APCA_BASE_URL = os.getenv("APCA_BASE_URL", "https://paper-api.alpaca.markets")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()  # keep as string for telegram
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+WATCHLIST = [s.strip().upper() for s in os.getenv(
+    "WATCHLIST", "TSLA,NVDA,AAPL,AMZN,AMD,GOOGL,MU,CRWD"
+).split(",") if s.strip()]
 
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
-if not TELEGRAM_CHAT_ID:
-    raise RuntimeError("Missing TELEGRAM_CHAT_ID")
+POLL_SEC = int(os.getenv("POLL_SEC", "15"))
+MOMENTUM_MIN = int(os.getenv("MOMENTUM_MIN", "5"))
+MOMENTUM_THRESHOLD_PCT = float(os.getenv("MOMENTUM_THRESHOLD_PCT", "0.20"))  # %
+COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "120"))
+
+AUTO_TRADE = os.getenv("AUTO_TRADE", "0").strip() == "1"
+USD_PER_TRADE = float(os.getenv("USD_PER_TRADE", "200"))
+
+SA_TZ = pytz.timezone("Asia/Riyadh")
+
+# -----------------------
+# Clients
+# -----------------------
 if not APCA_API_KEY_ID or not APCA_API_SECRET_KEY:
-    raise RuntimeError("Missing Alpaca API keys (APCA_API_KEY_ID / APCA_API_SECRET_KEY)")
+    log.warning("⚠️ Missing Alpaca keys. Set APCA_API_KEY_ID & APCA_API_SECRET_KEY in Render env.")
 
-
-# Alpaca data client (keys only – base url not needed for data client)
 data_client = StockHistoricalDataClient(APCA_API_KEY_ID, APCA_API_SECRET_KEY)
+trade_client = TradingClient(APCA_API_KEY_ID, APCA_API_SECRET_KEY, paper=True, url_override=APCA_BASE_URL)
 
+# -----------------------
 # State
-last_signal_by_symbol = {}  # symbol -> ("LONG"/"SHORT"/"WAIT", last_price, reason)
-last_best = None
+# -----------------------
+@dataclass
+class Signal:
+    symbol: str
+    side: str            # "BUY" or "SHORT"
+    price: float
+    mom_pct: float
+    sma: float
+    reason: str
+    ts: float
 
+latest_best: Optional[Signal] = None
+latest_snapshot: Dict[str, Dict] = {}
+last_alert_at: Dict[str, float] = {}
+last_trade_at: Dict[str, float] = {}
 
-def classify_signal(bars_6):
-    """
-    bars_6: list of 6 close prices (old->new)
-    Returns: (signal, last_price, reason, mom, sma5)
-    """
-    closes = [b.close for b in bars_6]
-    last_price = float(closes[-1])
-    sma5 = sum(float(x) for x in closes[-5:]) / 5.0
-    mom = float(closes[-1]) - float(closes[0])  # ~5 دقائق
+# -----------------------
+# Helpers
+# -----------------------
+def now_sa_str() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
-    # قواعد بسيطة
-    if mom >= MOM_THRESHOLD and last_price >= sma5:
-        return "LONG", last_price, "زخم إيجابي + فوق متوسط 5 دقائق", mom, sma5
-    if mom <= -MOM_THRESHOLD and last_price <= sma5:
-        return "SHORT", last_price, "زخم سلبي + تحت متوسط 5 دقائق", mom, sma5
-    return "WAIT", last_price, "ما فيه أفضلية واضحة الآن", mom, sma5
+def safe_float(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return default
 
-
-async def fetch_symbol_signal(symbol: str):
-    # نطلب آخر 6 دقائق (1-min bars)
-    req = StockBarsRequest(
-        symbol_or_symbols=symbol,
-        timeframe=TimeFrame.Minute,
-        limit=6
+def format_signal_ar(sig: Signal) -> str:
+    side_ar = "شراء" if sig.side == "BUY" else "شورت"
+    arrow = "📈" if sig.side == "BUY" else "📉"
+    return (
+        f"{arrow} <b>إشارة {side_ar}</b>\n"
+        f"🏷️ السهم: <b>{sig.symbol}</b>\n"
+        f"💵 السعر: <b>{sig.price:.2f}</b>\n"
+        f"⚡ الزخم ({MOMENTUM_MIN}د): <b>{sig.mom_pct:.2f}%</b>\n"
+        f"📊 SMA({MOMENTUM_MIN}د): <b>{sig.sma:.2f}</b>\n"
+        f"🧠 السبب: {sig.reason}\n"
+        f"🕒 {now_sa_str()} (السعودية)"
     )
-    bars = data_client.get_stock_bars(req).data.get(symbol, [])
-    if len(bars) < 6:
+
+async def tg_send_text(app: Application, text: str) -> bool:
+    """Send Telegram message; never crash the bot."""
+    if not TELEGRAM_CHAT_ID:
+        log.warning("⚠️ Missing TELEGRAM_CHAT_ID")
+        return False
+    try:
+        await app.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return True
+    except Exception as e:
+        log.warning(f"⚠️ Telegram send failed: {e}")
+        return False
+
+def get_market_status() -> Tuple[str, str]:
+    """Return (status_ar, details)"""
+    try:
+        clock = trade_client.get_clock()
+        if clock.is_open:
+            return "🟢 السوق مفتوح", f"يغلق بعد: {clock.next_close}"
+        else:
+            return "🔴 السوق مغلق", f"يفتح عند: {clock.next_open}"
+    except Exception as e:
+        return "⚠️ تعذر جلب حالة السوق", str(e)
+
+def simple_sma(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+def compute_signal_for_symbol(symbol: str) -> Optional[Signal]:
+    """
+    Pull recent 1-min bars, compute momentum over MOMENTUM_MIN and SMA over MOMENTUM_MIN.
+    Generate BUY if momentum > threshold AND price > SMA.
+    Generate SHORT if momentum < -threshold AND price < SMA.
+    """
+    try:
+        # pull last ~20 minutes for safety
+        req = StockBarsRequest(
+            symbol_or_symbols=[symbol],
+            timeframe=TimeFrame.Minute,
+            limit=max(20, MOMENTUM_MIN + 5),
+        )
+        bars = data_client.get_stock_bars(req).data.get(symbol, [])
+        if not bars or len(bars) < MOMENTUM_MIN + 2:
+            return None
+
+        closes = [safe_float(b.close) for b in bars]
+        last_price = closes[-1]
+        past_price = closes[-(MOMENTUM_MIN + 1)]
+
+        if past_price <= 0:
+            return None
+
+        mom_pct = ((last_price - past_price) / past_price) * 100.0
+        sma = simple_sma(closes[-MOMENTUM_MIN:])
+
+        # keep snapshot for /best /status
+        latest_snapshot[symbol] = {
+            "price": last_price,
+            "mom_pct": mom_pct,
+            "sma": sma,
+            "ts": time.time(),
+        }
+
+        if mom_pct >= MOMENTUM_THRESHOLD_PCT and last_price > sma:
+            reason = f"زخم صاعد + السعر فوق متوسط {MOMENTUM_MIN} دقائق"
+            return Signal(symbol=symbol, side="BUY", price=last_price, mom_pct=mom_pct, sma=sma, reason=reason, ts=time.time())
+
+        if mom_pct <= -MOMENTUM_THRESHOLD_PCT and last_price < sma:
+            reason = f"زخم هابط + السعر تحت متوسط {MOMENTUM_MIN} دقائق"
+            return Signal(symbol=symbol, side="SHORT", price=last_price, mom_pct=mom_pct, sma=sma, reason=reason, ts=time.time())
+
+        return None
+    except Exception as e:
+        log.warning(f"{symbol} analysis error: {e}")
         return None
 
-    signal, last_price, reason, mom, sma5 = classify_signal(bars)
-    return {
-        "symbol": symbol,
-        "signal": signal,
-        "price": last_price,
-        "reason": reason,
-        "mom": mom,
-        "sma5": sma5
-    }
+def should_alert(symbol: str) -> bool:
+    last = last_alert_at.get(symbol, 0.0)
+    return (time.time() - last) >= COOLDOWN_SEC
 
+def mark_alert(symbol: str):
+    last_alert_at[symbol] = time.time()
 
-def score(sig: dict):
-    # نرتّب الأفضل حسب قوة الزخم
-    # LONG الأعلى mom، SHORT الأكثر سلبية
-    if sig["signal"] == "LONG":
-        return abs(sig["mom"])
-    if sig["signal"] == "SHORT":
-        return abs(sig["mom"])
-    return 0.0
+def can_trade(symbol: str) -> bool:
+    last = last_trade_at.get(symbol, 0.0)
+    return (time.time() - last) >= max(COOLDOWN_SEC, 60)
 
+def mark_trade(symbol: str):
+    last_trade_at[symbol] = time.time()
 
-def format_signal_msg(sig: dict):
-    s = sig["signal"]
-    emoji = "📈" if s == "LONG" else ("📉" if s == "SHORT" else "⏸️")
-    label = "شراء (Long)" if s == "LONG" else ("شورت (Short)" if s == "SHORT" else "انتظار")
+def place_trade(signal: Signal) -> Tuple[bool, str]:
+    """
+    Optional: market order by USD notional.
+    BUY => buy notional, SHORT => sell notional.
+    """
+    try:
+        side = OrderSide.BUY if signal.side == "BUY" else OrderSide.SELL
 
-    return (
-        f"{emoji} إشارة {label}\n"
-        f"السهم: {sig['symbol']}\n"
-        f"السعر: {sig['price']:.2f}\n"
-        f"السبب: {sig['reason']}\n"
-        f"الزخم(≈5د): {sig['mom']:.3f}\n"
-        f"متوسط 5د: {sig['sma5']:.2f}\n"
-    )
+        order_req = MarketOrderRequest(
+            symbol=signal.symbol,
+            notional=USD_PER_TRADE,
+            side=side,
+            time_in_force=TimeInForce.DAY,
+        )
+        order = trade_client.submit_order(order_req)
+        return True, f"✅ تم إرسال أمر {signal.symbol} ({signal.side}) بقيمة ${USD_PER_TRADE:.0f} | id={order.id}"
+    except APIError as e:
+        return False, f"❌ فشل تنفيذ الصفقة: {e}"
+    except Exception as e:
+        return False, f"❌ خطأ غير متوقع بالصفقة: {e}"
 
-
-async def send_telegram(app: Application, text: str):
-    await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
-
-
-async def scan_and_notify(app: Application):
-    global last_best
-
-    signals = []
-    for sym in SYMBOLS:
-        try:
-            sig = await asyncio.to_thread(fetch_symbol_signal, sym)
-            # asyncio.to_thread يرجع coroutine؟ لا: fetch_symbol_signal async.
-        except TypeError:
-            # لأن fetch_symbol_signal async، نناديها مباشرة:
-            sig = await fetch_symbol_signal(sym)
-        except Exception:
-            sig = None
-
-        if not sig:
-            continue
-
-        signals.append(sig)
-
-        prev = last_signal_by_symbol.get(sym)
-        now_tuple = (sig["signal"], round(sig["price"], 2), sig["reason"])
-        if prev != now_tuple and sig["signal"] != "WAIT":
-            # نرسل فقط عند LONG/SHORT وتغيّر الحالة
-            await send_telegram(app, format_signal_msg(sig))
-        last_signal_by_symbol[sym] = now_tuple
-
-    if not signals:
-        return
-
-    # اختيار أفضل سهم الآن (الأقوى زخمًا)
-    best = max(signals, key=score)
-    best_key = (best["symbol"], best["signal"], round(best["price"], 2))
-    if best["signal"] != "WAIT" and best_key != last_best:
-        last_best = best_key
-        await send_telegram(app, "⭐️ أفضل فرصة الآن:\n" + format_signal_msg(best))
-
-
-# ----------------------------
+# -----------------------
 # Telegram commands
-# ----------------------------
+# -----------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "✅ شات جبتي للأسهم جاهز.\n"
+    msg = (
+        "👋 <b>هلا! أنا بوت إشارات الأسهم</b>\n"
+        f"📌 أراقب: {', '.join(WATCHLIST)}\n"
+        f"⏱️ كل {POLL_SEC} ثانية\n"
+        f"⚡ زخم {MOMENTUM_MIN} دقائق | حد الإشارة: {MOMENTUM_THRESHOLD_PCT:.2f}%\n\n"
         "الأوامر:\n"
-        "/status - حالة البوت\n"
+        "/status - حالة السوق\n"
         "/best - أفضل سهم الآن"
     )
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"🟢 البوت شغال\n"
-        f"الأسهم: {', '.join(SYMBOLS)}\n"
-        f"فحص كل: {CHECK_EVERY_SEC} ثانية\n"
-        f"عتبة الزخم: {MOM_THRESHOLD}\n"
-        f"الوقت: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    )
+    status_ar, details = get_market_status()
+    await update.message.reply_text(f"{status_ar}\nℹ️ {details}", parse_mode="HTML")
 
 async def cmd_best(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # نجيب أفضل سهم لحظيًا عند الطلب
-    signals = []
-    for sym in SYMBOLS:
-        sig = await fetch_symbol_signal(sym)
-        if sig:
-            signals.append(sig)
-
-    if not signals:
-        await update.message.reply_text("⛔️ ما قدرت أجيب بيانات الآن.")
+    global latest_best
+    if not latest_best:
+        await update.message.reply_text("ما عندي أفضل سهم الآن (مافي إشارة قوية حاليًا).", parse_mode="HTML")
         return
+    await update.message.reply_text(format_signal_ar(latest_best), parse_mode="HTML")
 
-    best = max(signals, key=score)
-    await update.message.reply_text("⭐️ أفضل سهم الآن:\n" + format_signal_msg(best))
+# -----------------------
+# Main loop
+# -----------------------
+async def analysis_loop(app: Application):
+    global latest_best
 
+    # Startup ping
+    await tg_send_text(app, "✅ <b>البوت اشتغل بنجاح</b>\n🕒 " + now_sa_str())
 
-async def periodic_job(app: Application):
     while True:
         try:
-            await scan_and_notify(app)
-        except Exception:
-            # لا نطيح البوت بسبب خطأ مؤقت
-            pass
-        await asyncio.sleep(CHECK_EVERY_SEC)
+            signals: List[Signal] = []
+            for sym in WATCHLIST:
+                sig = compute_signal_for_symbol(sym)
+                if sig:
+                    signals.append(sig)
 
+            # choose best by absolute momentum
+            best = None
+            if signals:
+                best = sorted(signals, key=lambda s: abs(s.mom_pct), reverse=True)[0]
+
+            # send signal if new / cooldown
+            if best:
+                # if different symbol OR momentum changed a lot, allow alert
+                changed = (latest_best is None) or (best.symbol != latest_best.symbol) or (abs(best.mom_pct - latest_best.mom_pct) >= 0.15)
+
+                if changed and should_alert(best.symbol):
+                    latest_best = best
+                    await tg_send_text(app, format_signal_ar(best))
+                    mark_alert(best.symbol)
+
+                    # optional auto trade
+                    if AUTO_TRADE and can_trade(best.symbol):
+                        ok, trade_msg = place_trade(best)
+                        await tg_send_text(app, trade_msg)
+                        if ok:
+                            mark_trade(best.symbol)
+
+            await asyncio.sleep(POLL_SEC)
+
+        except Exception as e:
+            log.exception(f"Loop error: {e}")
+            # don't crash, just wait
+            await asyncio.sleep(5)
 
 async def main():
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN (set it in Render env).")
 
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("status", cmd_status))
-    application.add_handler(CommandHandler("best", cmd_best))
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # تشغيل البوت + المهمة الدورية
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("best", cmd_best))
 
-    # أرسل رسالة تشغيل
-    await send_telegram(application, "✅ تم تشغيل شات جبتي للأسهم (إشارات فقط).")
+    # start telegram polling + analysis loop
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
 
-    await periodic_job(application)
+    # run analysis loop in background
+    asyncio.create_task(analysis_loop(app))
 
+    log.info("✅ Telegram polling started. Bot is running.")
+    await app.updater.idle()
+
+    await app.updater.stop()
+    await app.stop()
+    await app.shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
