@@ -1,5 +1,3 @@
-alpaca-trade-api
-pandas
-numpy
-fastapi
-uvicorn
+alpaca-py>=0.20.0
+requests
+pytz
