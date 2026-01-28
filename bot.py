@@ -1,231 +1,303 @@
 import os
+import time
 import asyncio
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 from telegram import Update
-from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+# Alpaca (alpaca-py)
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
-# ================== ENV ==================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # رقمك مثل: 1682557412
 
-APCA_API_KEY_ID = os.getenv("APCA_API_KEY_ID")
-APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
-APCA_API_BASE_URL = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
+# =========================
+# ENV
+# =========================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # مثال: 1682557412
 
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
-if not TELEGRAM_CHAT_ID:
-    raise RuntimeError("Missing TELEGRAM_CHAT_ID")
-if not APCA_API_KEY_ID or not APCA_API_SECRET_KEY:
-    raise RuntimeError("Missing Alpaca keys")
+ALPACA_KEY = os.getenv("ALPACA_API_KEY")
+ALPACA_SECRET = os.getenv("ALPACA_API_SECRET")
 
-# ================== CONFIG ==================
-WATCHLIST = ["TSLA", "NVDA", "AAPL", "CRWD", "AMZN", "AMD", "GOOGL", "MU"]
-CHECK_ORDERS_EVERY_SEC = int(os.getenv("CHECK_ORDERS_EVERY_SEC", "20"))  # كل كم ثانية يشيّك على تنفيذ الأوامر
+# إعدادات تشغيل
+SYMBOLS = os.getenv("SYMBOLS", "TSLA,NVDA,AAPL,CRWD,AMZN,AMD,GOOGL,MU").split(",")
+INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "20"))          # كل كم ثانية يسوي دورة
+LOOKBACK_MIN = int(os.getenv("LOOKBACK_MIN", "5"))           # آخر كم دقيقة لحساب الزخم
+AUTO_TRADE = os.getenv("AUTO_TRADE", "0") == "1"             # 0 = إشارات فقط / 1 = ينفذ
+TRADE_QTY = float(os.getenv("TRADE_QTY", "1"))               # كمية الصفقة (أسهم)
+MIN_SCORE = float(os.getenv("MIN_SCORE", "0.001"))           # حد أدنى للزخم عشان يطلع إشارة
 
-# ================== CLIENTS ==================
-alpaca_trade = TradingClient(APCA_API_KEY_ID, APCA_API_SECRET_KEY, paper=True)
-alpaca_data = StockHistoricalDataClient(APCA_API_KEY_ID, APCA_API_SECRET_KEY)
-
-# نخزن آخر أمر أرسلناه عشان ما نكرر الرسالة
-LAST_NOTIFIED_ORDER_ID = None
+# Paper / Live
+PAPER = os.getenv("ALPACA_PAPER", "1") == "1"
 
 
-# ================== HELPERS ==================
-def _to_float(x):
-    try:
-        return float(x)
-    except Exception:
-        return None
+def _require_env(name: str, val: Optional[str]):
+    if not val:
+        raise RuntimeError(f"Missing {name}")
 
 
-def format_trade_message(symbol: str, side: str, qty, price, ts: str) -> str:
-    side_ar = "شراء ✅" if side.lower() == "buy" else "شورت 🔻"
+_require_env("TELEGRAM_BOT_TOKEN", TELEGRAM_TOKEN)
+_require_env("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID)
+_require_env("ALPACA_API_KEY", ALPACA_KEY)
+_require_env("ALPACA_API_SECRET", ALPACA_SECRET)
+
+TELEGRAM_CHAT_ID_INT = int(TELEGRAM_CHAT_ID)
+
+
+# =========================
+# CLIENTS
+# =========================
+# alpaca-py uses different endpoints internally; for trading client we pass paper flag.
+trading_client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=PAPER)
+data_client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
+
+
+# =========================
+# MODEL / SIGNAL
+# =========================
+@dataclass
+class Signal:
+    symbol: str
+    side: str  # "buy" or "short"
+    score: float
+    last_price: float
+    reason: str
+
+
+def calc_momentum_score(prices: List[float]) -> float:
+    """
+    زخم بسيط: نسبة التغير من أول السعر لآخر السعر.
+    """
+    if not prices or len(prices) < 2:
+        return 0.0
+    first = prices[0]
+    last = prices[-1]
+    if first <= 0:
+        return 0.0
+    return (last - first) / first
+
+
+def pick_side(score: float) -> str:
+    return "buy" if score > 0 else "short"
+
+
+def format_signal_ar(sig: Signal) -> str:
+    side_ar = "شراء" if sig.side == "buy" else "شورت"
     return (
-        f"📢 *تم تنفيذ صفقة*\n"
-        f"• السهم: *{symbol}*\n"
-        f"• النوع: *{side_ar}*\n"
-        f"• الكمية: *{qty}*\n"
-        f"• السعر: *{price}*\n"
-        f"• الوقت: `{ts}`"
+        "📢 إشارة جديدة\n"
+        f"السهم: {sig.symbol}\n"
+        f"النوع: {side_ar}\n"
+        f"السعر الحالي: {sig.last_price:.2f}\n"
+        f"الزخم: {sig.score*100:.3f}%\n"
+        f"السبب: {sig.reason}\n"
+        f"{'✅ تنفيذ آلي مفعّل' if AUTO_TRADE else 'ℹ️ إشارات فقط (بدون تنفيذ)'}"
     )
 
 
-async def send_to_chat(app: Application, text: str):
-    await app.bot.send_message(
-        chat_id=TELEGRAM_CHAT_ID,
-        text=text,
-        parse_mode=ParseMode.MARKDOWN
+# =========================
+# ALPACA HELPERS (sync -> async)
+# =========================
+def fetch_last_minutes_prices(symbol: str, lookback_min: int) -> List[float]:
+    """
+    يجلب Bars دقيقة (1Min) لآخر lookback_min دقائق.
+    """
+    # نرجع 10 دقائق احتياط (لتفادي فجوات)
+    end = int(time.time())
+    start = end - (lookback_min + 5) * 60
+
+    req = StockBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=TimeFrame.Minute,
+        start=start,
+        end=end,
+        limit=100,
     )
+    bars = data_client.get_stock_bars(req)
+    df = bars.df
+
+    if df is None or df.empty:
+        return []
+
+    # df multi-index: (symbol, timestamp)
+    try:
+        sym_df = df.xs(symbol)
+    except Exception:
+        return []
+
+    closes = sym_df["close"].tail(lookback_min).tolist()
+    return [float(x) for x in closes if x is not None]
 
 
-# ================== COMMANDS ==================
+def place_market_order(symbol: str, side: str, qty: float) -> str:
+    """
+    ينفذ Market order (شراء أو شورت).
+    """
+    alp_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
+
+    order = MarketOrderRequest(
+        symbol=symbol,
+        qty=qty,
+        side=alp_side,
+        time_in_force=TimeInForce.DAY,
+    )
+    submitted = trading_client.submit_order(order_data=order)
+    return str(submitted.id)
+
+
+async def async_fetch_prices(symbol: str, lookback_min: int) -> List[float]:
+    return await asyncio.to_thread(fetch_last_minutes_prices, symbol, lookback_min)
+
+
+async def async_place_order(symbol: str, side: str, qty: float) -> str:
+    return await asyncio.to_thread(place_market_order, symbol, side, qty)
+
+
+# =========================
+# TELEGRAM COMMANDS
+# =========================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "هلا 👋\n"
-        "أنا بوت التنبيهات.\n\n"
+        "✅ البوت شغّال\n\n"
         "الأوامر:\n"
-        "/status - حالة السوق\n"
-        "/best - أفضل سهم الآن (شراء/شورت)\n"
+        "/status - حالة البوت\n"
+        "/best - أفضل سهم الآن\n"
+        "/autoon - تشغيل التنفيذ الآلي (حذر)\n"
+        "/autooff - إيقاف التنفيذ الآلي\n"
     )
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    clock = alpaca_trade.get_clock()
-    is_open = "مفتوح ✅" if clock.is_open else "مغلق ⛔️"
-    nxt_open = clock.next_open.isoformat() if clock.next_open else "—"
-    nxt_close = clock.next_close.isoformat() if clock.next_close else "—"
-
-    msg = (
-        f"🕒 *حالة السوق*\n"
-        f"• الآن: *{is_open}*\n"
-        f"• الفتح القادم: `{nxt_open}`\n"
-        f"• الإغلاق القادم: `{nxt_close}`"
+    auto = "مفعّل ✅" if context.application.bot_data.get("AUTO_TRADE", AUTO_TRADE) else "مقفول ⛔️"
+    last = context.application.bot_data.get("LAST_SIGNAL")
+    last_txt = f"{last.symbol} ({'شراء' if last.side=='buy' else 'شورت'})" if last else "لا يوجد"
+    await update.message.reply_text(
+        "📊 حالة البوت\n"
+        f"- متابعة: {', '.join(SYMBOLS)}\n"
+        f"- الدورة كل: {INTERVAL_SEC} ثانية\n"
+        f"- نافذة التحليل: {LOOKBACK_MIN} دقائق\n"
+        f"- التنفيذ الآلي: {auto}\n"
+        f"- آخر إشارة: {last_txt}"
     )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_best(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sig = await compute_best_signal()
+    if not sig:
+        await update.message.reply_text("ما قدرت أطلع أفضل سهم الآن (بيانات غير كافية).")
+        return
+    await update.message.reply_text(format_signal_ar(sig))
+
+
+async def cmd_autoon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.application.bot_data["AUTO_TRADE"] = True
+    await update.message.reply_text("✅ تم تفعيل التنفيذ الآلي (Auto Trade).")
+
+
+async def cmd_autooff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.application.bot_data["AUTO_TRADE"] = False
+    await update.message.reply_text("⛔️ تم إيقاف التنفيذ الآلي. (إشارات فقط)")
+
+
+# =========================
+# CORE LOGIC
+# =========================
+async def compute_best_signal() -> Optional[Signal]:
+    best: Optional[Signal] = None
+
+    for sym in SYMBOLS:
+        prices = await async_fetch_prices(sym, LOOKBACK_MIN)
+        if len(prices) < 2:
+            continue
+
+        score = calc_momentum_score(prices)
+        last_price = prices[-1]
+
+        # تجاهل الزخم الضعيف جدًا
+        if abs(score) < MIN_SCORE:
+            continue
+
+        side = pick_side(score)
+        reason = f"زخم آخر {LOOKBACK_MIN} دقائق"
+
+        sig = Signal(symbol=sym, side=side, score=score, last_price=last_price, reason=reason)
+        if best is None or abs(sig.score) > abs(best.score):
+            best = sig
+
+    return best
+
+
+async def send_to_telegram(app: Application, text: str):
+    await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID_INT, text=text)
+
+
+async def monitor_loop(app: Application):
     """
-    يحسب زخم آخر 5 دقائق على فريم 1 دقيقة:
-    mom = (آخر إغلاق - إغلاق قبل 5 دقائق) / إغلاق قبل 5 دقائق
-    إذا mom موجب => شراء
-    إذا mom سالب => شورت
-    ويختار الأعلى "بالقيمة المطلقة" (أقوى حركة).
+    حلقة مراقبة مستمرة:
+    - تحسب أفضل سهم
+    - ترسل إشعار عند تغير الإشارة/تجاوز حد الزخم
+    - (اختياري) تنفذ صفقة ثم ترسل إشعار تنفيذ
     """
-    try:
-        end = datetime.now(timezone.utc)
-        start = end.replace(minute=end.minute - 15)  # نافذة أكبر شوي للاحتياط
+    last_key: Optional[Tuple[str, str]] = None
 
-        req = StockBarsRequest(
-            symbol_or_symbols=WATCHLIST,
-            timeframe=TimeFrame.Minute,
-            start=start,
-            end=end,
-            feed="iex"  # paper غالبًا يمشي
-        )
-        bars = alpaca_data.get_stock_bars(req).df
+    while True:
+        try:
+            sig = await compute_best_signal()
+            if sig:
+                app.bot_data["LAST_SIGNAL"] = sig
 
-        if bars is None or len(bars) == 0:
-            await update.message.reply_text("ما قدرت أجيب بيانات الآن. جرّب بعد دقيقة.")
-            return
+                key = (sig.symbol, sig.side)
+                if key != last_key:
+                    last_key = key
+                    await send_to_telegram(app, format_signal_ar(sig))
 
-        best = None  # (score_abs, symbol, mom)
-        details = []
+                    auto = app.bot_data.get("AUTO_TRADE", AUTO_TRADE)
+                    if auto:
+                        # تنفيذ الصفقة
+                        order_id = await async_place_order(sig.symbol, sig.side, TRADE_QTY)
+                        side_ar = "شراء" if sig.side == "buy" else "شورت"
+                        await send_to_telegram(
+                            app,
+                            "✅ تم تنفيذ صفقة\n"
+                            f"السهم: {sig.symbol}\n"
+                            f"النوع: {side_ar}\n"
+                            f"الكمية: {TRADE_QTY}\n"
+                            f"Order ID: {order_id}"
+                        )
 
-        for sym in WATCHLIST:
-            try:
-                sym_df = bars.loc[sym]
-                sym_df = sym_df.sort_index()
-                closes = sym_df["close"].tail(6)  # آخر 6 دقائق
-                if len(closes) < 6:
-                    continue
-                old = _to_float(closes.iloc[0])
-                last = _to_float(closes.iloc[-1])
-                if not old or not last or old == 0:
-                    continue
-                mom = (last - old) / old
-                score = abs(mom)
-                details.append((sym, mom, last))
-                if best is None or score > best[0]:
-                    best = (score, sym, mom, last)
-            except Exception:
-                continue
+        except Exception as e:
+            # لا نوقف البوت بسبب خطأ
+            await send_to_telegram(app, f"⚠️ خطأ في المراقبة: {type(e).__name__}: {e}")
 
-        if not best:
-            await update.message.reply_text("ما فيه بيانات كفاية للحكم الآن.")
-            return
-
-        _, sym, mom, last_price = best
-        side = "شراء ✅" if mom >= 0 else "شورت 🔻"
-        mom_pct = round(mom * 100, 3)
-
-        msg = (
-            f"⭐️ *أفضل سهم الآن*\n"
-            f"• السهم: *{sym}*\n"
-            f"• التوصية: *{side}*\n"
-            f"• الزخم (آخر 5 دقائق): *{mom_pct}%*\n"
-            f"• آخر سعر (تقريبي): *{last_price}*\n\n"
-            f"_تنبيه: هذه إشارة زخم بسيطة وليست نصيحة مالية._"
-        )
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-
-    except Exception as e:
-        await update.message.reply_text(f"صار خطأ في /best:\n{e}")
+        await asyncio.sleep(INTERVAL_SEC)
 
 
-# ================== ORDER MONITOR ==================
-async def monitor_orders_job(context: ContextTypes.DEFAULT_TYPE):
-    """
-    يشيّك آخر أوامر منفذة، وإذا فيه أمر جديد منفذ يرسل رسالة.
-    """
-    global LAST_NOTIFIED_ORDER_ID
-
-    try:
-        orders = alpaca_trade.get_orders(limit=5)
-        if not orders:
-            return
-
-        # ندور أحدث order "filled"
-        latest_filled = None
-        for o in orders:
-            if getattr(o, "status", "") == "filled":
-                latest_filled = o
-                break
-
-        if not latest_filled:
-            return
-
-        oid = getattr(latest_filled, "id", None)
-        if not oid:
-            return
-
-        if LAST_NOTIFIED_ORDER_ID == oid:
-            return  # نفس الأمر ما نكرر
-
-        symbol = latest_filled.symbol
-        side = latest_filled.side.value if hasattr(latest_filled.side, "value") else str(latest_filled.side)
-        qty = getattr(latest_filled, "filled_qty", None) or getattr(latest_filled, "qty", None) or "?"
-        price = getattr(latest_filled, "filled_avg_price", None) or "?"
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        msg = format_trade_message(symbol, side, qty, price, ts)
-        await send_to_chat(context.application, msg)
-
-        LAST_NOTIFIED_ORDER_ID = oid
-
-    except Exception as e:
-        # ما نكثر رسائل أخطاء، بس نرسل واحدة مختصرة
-        await send_to_chat(context.application, f"⚠️ خطأ في مراقبة الأوامر: `{e}`")
+async def on_startup(app: Application):
+    # حفظ حالة التنفيذ الافتراضية
+    app.bot_data["AUTO_TRADE"] = AUTO_TRADE
+    # تشغيل حلقة المراقبة في الخلفية
+    app.create_task(monitor_loop(app))
 
 
-# ================== MAIN ==================
-async def post_init(app: Application):
-    # رسالة تشغيل
-    await send_to_chat(app, "🤖 البوت اشتغل الآن وجاهز يرسل تنبيهات بعد تنفيذ الصفقات.")
-
-
+# =========================
+# RUN
+# =========================
 def main():
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(on_startup).build()
 
-    # Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("best", cmd_best))
+    app.add_handler(CommandHandler("autoon", cmd_autoon))
+    app.add_handler(CommandHandler("autooff", cmd_autooff))
 
-    # Jobs
-    app.job_queue.run_repeating(monitor_orders_job, interval=CHECK_ORDERS_EVERY_SEC, first=5)
-
-    # Start polling
-    app.run_polling(drop_pending_updates=True)
+    print("🚀 Bot running (polling)...")
+    app.run_polling(close_loop=False)
 
 
 if __name__ == "__main__":
