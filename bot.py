@@ -182,6 +182,9 @@ def main():
 
     max_notional_per_trade = env_float("MAX_NOTIONAL_PER_TRADE", "25000")
 
+    # ✅ NEW: close any trade once profit >= X dollars
+    min_profit_usd = env_float("MIN_PROFIT_USD", "0")  # مثال: 20
+
     # clients
     data_client = StockHistoricalDataClient(key_id, secret)
     trading = TradingClient(key_id, secret, paper=is_paper_from_base_url(base_url))
@@ -211,6 +214,7 @@ def main():
         f"Daily TP: +{daily_profit_target}$ | Daily SL: -{daily_max_loss}$\n"
         f"Risk/Trade: {risk_per_trade_usd}$ | Stop: {stop_pct*100:.2f}% | TP: {take_profit_pct*100:.2f}%\n"
         f"Protect Profit (A): at +{protect_profit_at*100:.2f}% => SL to Breakeven\n"
+        f"Min Profit USD: {min_profit_usd}$ (close when >=)\n"
         f"Max Notional/Trade: {max_notional_per_trade}$ | Max Trades/Day: {max_trades_per_day}\n"
         f"Equity start: {start_equity:.2f}$ (UTC day)\n"
     )
@@ -388,17 +392,25 @@ def main():
                 # ===== use completed candle as "now" =====
                 price_now = float(df_all["close"].iloc[-2])  # completed candle close
 
-                # ===== manage open trade first (TP/SL + Protect Profit A) =====
+                # ===== manage open trade first =====
                 if sym in open_trades:
                     tr = open_trades[sym]
                     side = tr["side"]
+                    qty = int(tr["qty"])
                     entry = float(tr["entry_price"])
 
-                    # current unrealized pct
+                    # unrealized pct + pnl usd
                     if side == "LONG":
                         unrealized_pct = (price_now - entry) / entry
+                        pnl_usd = (price_now - entry) * qty
                     else:
                         unrealized_pct = (entry - price_now) / entry
+                        pnl_usd = (entry - price_now) * qty
+
+                    # ✅ NEW RULE: close if profit >= MIN_PROFIT_USD (and positive)
+                    if min_profit_usd > 0 and pnl_usd >= min_profit_usd:
+                        close_position(sym, f"MIN_PROFIT_USD >= {min_profit_usd}$")
+                        continue
 
                     # ✅ Protect Profit A: at +0.20% => SL to breakeven
                     if (not tr.get("protected", False)) and (unrealized_pct >= protect_profit_at):
@@ -415,10 +427,11 @@ def main():
                             f"Entry: {entry:.4f}\n"
                             f"Price now: {price_now:.4f}\n"
                             f"Profit now: {unrealized_pct*100:.2f}%\n"
+                            f"PnL now: {pnl_usd:.2f}$\n"
                             f"New SL (Breakeven): {float(tr['sl']):.4f}"
                         )
 
-                    # exits
+                    # exits TP/SL
                     if side == "LONG":
                         if price_now >= float(tr["tp"]):
                             close_position(sym, "TAKE PROFIT")
@@ -432,7 +445,7 @@ def main():
 
                     continue  # after managing trade, skip signals for this symbol
 
-                # ===== If daily limits hit, don't open new trades (but we still manage exits above) =====
+                # ===== If daily limits hit, don't open new trades =====
                 if auto_trade and not daily_guards_ok():
                     continue
 
