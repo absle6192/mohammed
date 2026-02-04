@@ -1,235 +1,331 @@
-# ========= IMPORTS =========
 import os
 import time
-import math
 import requests
 from datetime import datetime, timezone, timedelta
-import pandas as pd
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
-from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.trading.requests import MarketOrderRequest
 
-
-# ========= HELPERS =========
-def env(name, default=None):
+def env(name: str, default: str | None = None) -> str:
     v = os.getenv(name, default)
     if v is None or str(v).strip() == "":
         raise RuntimeError(f"Missing env var: {name}")
     return str(v).strip()
 
 
-def env_float(name, default):
-    return float(env(name, default))
-
-
-def env_int(name, default):
-    return int(env(name, default))
-
-
-def send_telegram(text):
+def send_telegram(text: str) -> None:
     token = env("TELEGRAM_BOT_TOKEN")
     chat_id = env("TELEGRAM_CHAT_ID")
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
+
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+        "disable_notification": False,
+    }
+
+    r = requests.post(url, json=payload, timeout=15)
+    if not r.ok:
+        raise RuntimeError(f"Telegram error: {r.status_code} {r.text}")
 
 
-def is_paper(base_url: str) -> bool:
-    return "paper" in base_url.lower()
+def pct(a: float, b: float) -> float:
+    if b == 0:
+        return 0.0
+    return (a - b) / b
 
 
-# ========= SETTINGS =========
-POSITION_USD = env_float("POSITION_USD", "25000")
-TP_USD = env_float("TP_USD", "125")
-SL_USD = env_float("SL_USD", "75")
-DAILY_MAX_LOSS = env_float("DAILY_MAX_LOSS", "225")
-MAX_TRADES_PER_DAY = env_int("MAX_TRADES_PER_DAY", "6")
-
-INTERVAL_SEC = env_int("INTERVAL_SEC", "15")
-LOOKBACK_MIN = env_int("LOOKBACK_MIN", "3")
-THRESH_PCT = env_float("THRESH_PCT", "0.0015")
-
-VOLUME_MULT = env_float("VOLUME_MULT", "1.8")
-VOLUME_BASE_MIN = env_int("VOLUME_BASE_MIN", "20")
-
-AUTO_TRADE = env("AUTO_TRADE", "OFF").upper() == "ON"
+def fmt_pct(x: float) -> str:
+    return f"{x * 100:.2f}%"
 
 
-# ========= MAIN =========
+def strength_label(vol_ratio: float) -> str:
+    if vol_ratio >= 3.0:
+        return "🔥🔥🔥 نار (Very Strong)"
+    if vol_ratio >= 2.5:
+        return "🔥🔥 قوية جدًا (Strong+)"
+    if vol_ratio >= 2.0:
+        return "🔥 قوية (Strong)"
+    if vol_ratio >= 1.3:
+        return "✅ متوسطة (OK)"
+    return "⚠️ ضعيفة (Weak)"
+
+
+def candle_filter_light_completed(df_all, side: str, close_pos_min: float = 0.65) -> bool:
+    """
+    فلتر شموع خفيف لكن على شموع مكتملة:
+    - نستخدم آخر شمعة مكتملة = -2
+    - والشمعة اللي قبلها = -3
+
+    LONG:
+      - الشمعة (-2) خضراء
+      - إغلاقها أعلى من إغلاق (-3)
+      - إغلاقها قريب من أعلى الشمعة
+    SHORT:
+      - الشمعة (-2) حمراء
+      - إغلاقها أقل من إغلاق (-3)
+      - إغلاقها قريب من أسفل الشمعة
+    """
+    if df_all is None or len(df_all) < 4:
+        return False
+
+    last = df_all.iloc[-2]  # completed candle
+    prev = df_all.iloc[-3]  # completed candle before it
+
+    o = float(last["open"])
+    h = float(last["high"])
+    l = float(last["low"])
+    c = float(last["close"])
+    prev_c = float(prev["close"])
+
+    rng = h - l
+    if rng <= 0:
+        return False
+
+    close_pos = (c - l) / rng  # 0 عند اللو, 1 عند الهاي
+
+    if side == "LONG":
+        return (c >= o) and (c > prev_c) and (close_pos >= close_pos_min)
+
+    # SHORT
+    return (c <= o) and (c < prev_c) and (close_pos <= (1.0 - close_pos_min))
+
+
+def build_message(
+    mode_tag: str,
+    side: str,
+    symbol: str,
+    price_now: float,
+    ma: float,
+    d: float,
+    vol_last: float,
+    vol_base: float,
+    vol_ratio: float,
+    lookback_min: int,
+    now: datetime,
+    recent_move: float,
+    recent_window_min: int,
+    candle_ok: bool,
+) -> str:
+    if side == "LONG":
+        direction_emoji = "🟢📈"
+        direction_ar = "شراء"
+        bias_emoji = "🚀"
+    else:
+        direction_emoji = "🔴📉"
+        direction_ar = "بيع (شورت)"
+        bias_emoji = "🧨"
+
+    diff_str = fmt_pct(d)
+    diff_arrow = "⬆️" if d > 0 else "⬇️" if d < 0 else "➡️"
+    strength = strength_label(vol_ratio)
+    ts = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    candle_str = "✅ PASS" if candle_ok else "❌ FAIL"
+
+    msg = f"""
+{direction_emoji} {mode_tag} | إشارة {direction_ar} | {side} {bias_emoji}
+📌 السهم | Symbol: {symbol}
+
+💰 السعر | Price: {price_now:.2f}
+📊 المتوسط ({lookback_min}د) | MA({lookback_min}m): {ma:.2f}
+
+{diff_arrow} الفرق | Diff: {diff_str}
+
+🔥 حجم التداول | Volume Spike (baseline):
+{vol_last:.0f} مقابل {vol_base:.0f} (x{vol_ratio:.2f})
+
+🧠 حركة {recent_window_min}د الأخيرة | Recent Move:
+{fmt_pct(recent_move)}
+
+🕯️ Candle Filter (LIGHT):
+{candle_str}
+
+⭐️ قوة الإشارة | Strength:
+{strength}
+
+⏰ الوقت | Time (UTC):
+{ts}
+""".strip()
+
+    return msg
+
+
 def main():
-    base_url = env("APCA_API_BASE_URL")
-    key = env("APCA_API_KEY_ID")
+    _base_url = env("APCA_API_BASE_URL")
+    key_id = env("APCA_API_KEY_ID")
     secret = env("APCA_API_SECRET_KEY")
 
-    tickers = [t.strip().upper() for t in env("TICKERS").split(",")]
+    tickers = [t.strip().upper() for t in env("TICKERS").split(",") if t.strip()]
 
-    data = StockHistoricalDataClient(key, secret)
-    trading = TradingClient(key, secret, paper=is_paper(base_url))
+    mode = env("MODE", "EARLY").upper()
+    if mode not in ("EARLY", "CONFIRM", "BOTH"):
+        mode = "EARLY"
 
-    start_day = datetime.now(timezone.utc).date()
-    start_equity = float(trading.get_account().equity)
-    trades_today = 0
-    open_trades = {}
+    interval_sec = int(env("INTERVAL_SEC", "15" if mode in ("EARLY", "BOTH") else "20"))
+    lookback_min = int(env("LOOKBACK_MIN", "3" if mode in ("EARLY", "BOTH") else "5"))
+
+    thresh_pct = float(env("THRESH_PCT", "0.0008" if mode in ("EARLY", "BOTH") else "0.0015"))
+
+    volume_mult = float(env("VOLUME_MULT", "1.2" if mode in ("EARLY", "BOTH") else "1.8"))
+    min_vol_ratio = float(env("MIN_VOL_RATIO", "1.1" if mode in ("EARLY", "BOTH") else "1.5"))
+
+    cooldown_min = int(env("COOLDOWN_MIN", "6" if mode in ("EARLY", "BOTH") else "10"))
+
+    recent_window_min = int(env("RECENT_WINDOW_MIN", "10"))
+    max_recent_move_pct = float(env("MAX_RECENT_MOVE_PCT", "0.003"))
+
+    candle_filter_mode = env("CANDLE_FILTER", "LIGHT").upper()  # LIGHT / OFF
+    candle_close_pos_min = float(env("CANDLE_CLOSE_POS_MIN", "0.65"))
+
+    client = StockHistoricalDataClient(key_id, secret)
+
+    last_signal_time: dict[str, datetime] = {}
+    last_signal_key: dict[str, str] = {}
 
     send_telegram(
-        "🤖 BOT STARTED (CONFIRMED ONLY)\n"
-        f"Tickers: {', '.join(tickers)}\n"
-        f"Position: {POSITION_USD}$\n"
-        f"TP: +{TP_USD}$ | SL: -{SL_USD}$\n"
-        f"Daily Max Loss: -{DAILY_MAX_LOSS}$\n"
-        f"Max Trades/Day: {MAX_TRADES_PER_DAY}\n"
-        f"AUTO_TRADE: {'ON' if AUTO_TRADE else 'OFF'}"
+        "✅ البوت اشتغل | Bot Started\n"
+        f"👀 يراقب | Watching: {', '.join(tickers)}\n"
+        f"⚙️ MODE: {mode}\n"
+        f"⏱️ Interval: {interval_sec}s | Lookback: {lookback_min}m\n"
+        f"🎯 Threshold: {thresh_pct*100:.2f}%\n"
+        f"🔥 Volume Mult: x{volume_mult} | Min Vol Ratio: x{min_vol_ratio}\n"
+        f"🧠 Late-Entry Filter: abs(move {recent_window_min}m) <= {max_recent_move_pct*100:.2f}%\n"
+        f"🕯️ Candle Filter: {candle_filter_mode} | ClosePosMin: {candle_close_pos_min}\n"
+        f"🕒 Timezone: UTC\n"
+        f"🕯️ Using COMPLETED candles (-2/-3)"
     )
-
-    def daily_pnl():
-        return float(trading.get_account().equity) - start_equity
-
-    def close_position(symbol, reason):
-        pos = open_trades[symbol]
-        side = OrderSide.SELL if pos["side"] == "LONG" else OrderSide.BUY
-
-        trading.submit_order(
-            MarketOrderRequest(
-                symbol=symbol,
-                qty=pos["qty"],
-                side=side,
-                time_in_force=TimeInForce.DAY,
-            )
-        )
-
-        send_telegram(
-            f"🏁 CLOSE ({reason})\n"
-            f"{symbol} | {pos['side']}\n"
-            f"PnL Trade: {pos['pnl']:.2f}$\n"
-            f"PnL Today: {daily_pnl():.2f}$"
-        )
-
-        del open_trades[symbol]
 
     while True:
         try:
             now = datetime.now(timezone.utc)
 
-            # ===== New Day Reset =====
-            if now.date() != start_day:
-                start_day = now.date()
-                trades_today = 0
-                start_equity = float(trading.get_account().equity)
-                open_trades.clear()
-                send_telegram("🆕 New Trading Day")
+            need_min = max(lookback_min, recent_window_min) + 6
+            start = now - timedelta(minutes=need_min)
 
-            # ===== Fetch Data =====
-            start = now - timedelta(minutes=VOLUME_BASE_MIN + LOOKBACK_MIN + 5)
-            bars = data.get_stock_bars(
-                StockBarsRequest(
-                    symbol_or_symbols=tickers,
-                    timeframe=TimeFrame.Minute,
-                    start=start,
-                    end=now,
-                    feed="iex",
-                )
-            ).df
+            req = StockBarsRequest(
+                symbol_or_symbols=tickers,
+                timeframe=TimeFrame.Minute,
+                start=start,
+                end=now,
+                feed="iex",
+            )
 
+            bars = client.get_stock_bars(req).df
             if bars is None or len(bars) == 0:
-                time.sleep(INTERVAL_SEC)
+                time.sleep(interval_sec)
                 continue
 
             for sym in tickers:
                 try:
-                    df = bars.xs(sym, level=0).sort_index()
+                    df_all = bars.xs(sym, level=0).copy()
                 except Exception:
                     continue
 
-                if len(df) < LOOKBACK_MIN + 3:
+                df_all = df_all.sort_index()
+                if len(df_all) < max(8, lookback_min + 4):
                     continue
 
-                price = float(df["close"].iloc[-2])
+                # ===== completed "now" =====
+                price_now = float(df_all["close"].iloc[-2])  # completed candle close
 
-                # ===== Manage Open Trade =====
-                if sym in open_trades:
-                    tr = open_trades[sym]
-                    if tr["side"] == "LONG":
-                        tr["pnl"] = (price - tr["entry"]) * tr["qty"]
-                    else:
-                        tr["pnl"] = (tr["entry"] - price) * tr["qty"]
-
-                    if tr["pnl"] >= TP_USD:
-                        close_position(sym, "TAKE PROFIT")
-                    elif tr["pnl"] <= -SL_USD:
-                        close_position(sym, "STOP LOSS")
+                # ===== late-entry filter (completed candles) =====
+                df_recent = df_all.tail(recent_window_min + 2)
+                if len(df_recent) < 4:
                     continue
 
-                # ===== Daily Guards =====
-                if not AUTO_TRADE:
-                    continue
-                if trades_today >= MAX_TRADES_PER_DAY:
-                    continue
-                if daily_pnl() <= -DAILY_MAX_LOSS:
-                    send_telegram("🛑 DAILY MAX LOSS HIT — BOT STOPPED")
-                    return
+                price_then = float(df_recent["close"].iloc[0])
+                recent_move = pct(price_now, price_then)
 
-                # ===== Indicators =====
-                ma = df["close"].iloc[-(LOOKBACK_MIN+1):-1].mean()
-                diff = (price - ma) / ma
-
-                vol_last = df["volume"].iloc[-2]
-                vol_base = df["volume"].iloc[-(VOLUME_BASE_MIN+2):-2].mean()
-
-                if vol_base <= 0:
-                    continue
-                if vol_last < vol_base * VOLUME_MULT:
+                if abs(recent_move) > max_recent_move_pct:
                     continue
 
-                # ===== CONFIRMED SIGNAL ONLY =====
-                side = None
-                if diff >= THRESH_PCT:
-                    side = "LONG"
-                elif diff <= -THRESH_PCT:
-                    side = "SHORT"
-
-                if side is None:
+                # ===== lookback MA (completed candles) =====
+                df_lb = df_all.tail(lookback_min + 2).copy()
+                if len(df_lb) < (lookback_min + 2):
                     continue
 
-                # ===== ENTER =====
-                qty = int(POSITION_USD // price)
-                if qty <= 0:
+                ma = float(df_lb["close"].iloc[-(lookback_min + 1):-1].mean())
+                d = pct(price_now, ma)
+
+                # ===== volume baseline (completed candle) =====
+                vol_last = float(df_lb["volume"].iloc[-2])  # completed candle volume
+                vol_base = float(df_lb["volume"].iloc[:-2].mean()) if len(df_lb) > 4 else float(df_lb["volume"].mean())
+                vol_ratio = (vol_last / vol_base) if vol_base else 0.0
+
+                vol_ok = (vol_base > 0) and (vol_last >= vol_base * volume_mult) and (vol_ratio >= min_vol_ratio)
+                if not vol_ok:
                     continue
 
-                order_side = OrderSide.BUY if side == "LONG" else OrderSide.SELL
-                trading.submit_order(
-                    MarketOrderRequest(
+                signals_to_send: list[tuple[str, str]] = []
+
+                if mode in ("EARLY", "BOTH"):
+                    if d >= thresh_pct:
+                        signals_to_send.append(("🟡 EARLY", "LONG"))
+                    elif d <= -thresh_pct:
+                        signals_to_send.append(("🟡 EARLY", "SHORT"))
+
+                if mode in ("CONFIRM", "BOTH"):
+                    confirm_thresh = float(env("CONFIRM_THRESH_PCT", str(max(thresh_pct * 1.8, 0.0015))))
+                    confirm_vol_mult = float(env("CONFIRM_VOLUME_MULT", str(max(volume_mult * 1.4, 1.8))))
+                    confirm_ok = (vol_last >= vol_base * confirm_vol_mult)
+
+                    if confirm_ok:
+                        if d >= confirm_thresh:
+                            signals_to_send.append(("🟢 CONFIRM", "LONG"))
+                        elif d <= -confirm_thresh:
+                            signals_to_send.append(("🟢 CONFIRM", "SHORT"))
+
+                if not signals_to_send:
+                    continue
+
+                for mode_tag, side in signals_to_send:
+                    candle_ok = True
+                    if candle_filter_mode != "OFF" and "EARLY" in mode_tag:
+                        candle_ok = candle_filter_light_completed(df_all, side, close_pos_min=candle_close_pos_min)
+                        if not candle_ok:
+                            continue
+
+                    key = f"{mode_tag}_{side}"
+
+                    last_t = last_signal_time.get(sym)
+                    if last_t and (now - last_t) < timedelta(minutes=cooldown_min):
+                        continue
+
+                    if last_signal_key.get(sym) == key and last_t and (now - last_t) < timedelta(minutes=cooldown_min * 2):
+                        continue
+
+                    msg = build_message(
+                        mode_tag=mode_tag,
+                        side=side,
                         symbol=sym,
-                        qty=qty,
-                        side=order_side,
-                        time_in_force=TimeInForce.DAY,
+                        price_now=price_now,
+                        ma=ma,
+                        d=d,
+                        vol_last=vol_last,
+                        vol_base=vol_base,
+                        vol_ratio=vol_ratio,
+                        lookback_min=lookback_min,
+                        now=now,
+                        recent_move=recent_move,
+                        recent_window_min=recent_window_min,
+                        candle_ok=candle_ok,
                     )
-                )
 
-                open_trades[sym] = {
-                    "side": side,
-                    "qty": qty,
-                    "entry": price,
-                    "pnl": 0.0,
-                }
-
-                trades_today += 1
-
-                send_telegram(
-                    f"🚀 ENTRY CONFIRMED\n"
-                    f"{sym} | {side}\n"
-                    f"Qty: {qty}\n"
-                    f"Entry: {price:.2f}\n"
-                    f"Trades Today: {trades_today}/{MAX_TRADES_PER_DAY}"
-                )
+                    send_telegram(msg)
+                    last_signal_time[sym] = now
+                    last_signal_key[sym] = key
 
         except Exception as e:
-            send_telegram(f"⚠️ ERROR: {type(e).__name__}: {e}")
+            try:
+                send_telegram(f"⚠️ خطأ | Bot error: {type(e).__name__}: {e}")
+            except Exception:
+                pass
 
-        time.sleep(INTERVAL_SEC)
+        time.sleep(interval_sec)
 
 
 if __name__ == "__main__":
