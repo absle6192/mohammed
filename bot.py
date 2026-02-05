@@ -2,16 +2,20 @@ import os
 import time
 import math
 import requests
-from datetime import datetime, timezone, timedelta
-
-import pandas as pd
+from datetime import datetime, timezone
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
+# Try to use DataFeed if available (alpaca-py versions differ)
+try:
+    from alpaca.data.enums import DataFeed  # type: ignore
+except Exception:
+    DataFeed = None  # fallback
 
-# ----------------- ENV helpers -----------------
+
+# ----------------- env helpers -----------------
 def env(name: str, default: str | None = None) -> str:
     v = os.getenv(name, default)
     if v is None or str(v).strip() == "":
@@ -20,257 +24,191 @@ def env(name: str, default: str | None = None) -> str:
 
 
 def env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    return float(v) if v and v.strip() else float(default)
+    try:
+        return float(os.getenv(name, str(default)).strip())
+    except Exception:
+        return float(default)
 
 
 def env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    return int(v) if v and v.strip() else int(default)
+    try:
+        return int(os.getenv(name, str(default)).strip())
+    except Exception:
+        return int(default)
 
 
-def env_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name)
-    if v is None or v.strip() == "":
-        return default
-    return v.strip().lower() in ("1", "true", "yes", "on")
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-# ----------------- Telegram -----------------
+def parse_symbols() -> list[str]:
+    raw = os.getenv("SYMBOLS", "").strip()
+    if not raw:
+        return ["TSLA", "AAPL", "NVDA", "AMD", "AMZN", "GOOGL", "MU", "MSFT"]
+    parts = [p.strip().upper() for p in raw.split(",")]
+    return [p for p in parts if p]
+
+
+# ----------------- telegram -----------------
 def send_telegram(text: str) -> None:
     token = env("TELEGRAM_BOT_TOKEN")
     chat_id = env("TELEGRAM_CHAT_ID")
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
 
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": text,
         "disable_web_page_preview": True,
     }
-
     r = requests.post(url, json=payload, timeout=20)
     if r.status_code != 200:
-        raise RuntimeError(f"Telegram error: {r.status_code} {r.text[:200]}")
+        raise RuntimeError(f"Telegram error {r.status_code}: {r.text[:200]}")
 
 
-# ----------------- Symbols -----------------
-def parse_symbols() -> list[str]:
-    raw = os.getenv("SYMBOLS", "TSLA,AAPL,NVDA,AMD,AMZN,GOOGL,MU,MSFT")
-    parts = [p.strip().upper() for p in raw.split(",")]
-    return [p for p in parts if p]
-
-
-# ----------------- Candle filter (LIGHT) -----------------
-def candle_filter_light(df: pd.DataFrame) -> tuple[bool, str]:
-    """
-    فلتر خفيف جدًا:
-    - آخر شمعة: Close > Open
-    - جسم الشمعة ليس صغير جداً (body >= 35% من المدى)
-    """
-    if df is None or len(df) < 2:
-        return False, "no_data"
-
-    last = df.iloc[-1]
-    o, h, l, c = float(last["open"]), float(last["high"]), float(last["low"]), float(last["close"])
-    rng = max(h - l, 1e-9)
-    body = abs(c - o)
-    body_ratio = body / rng
-
-    if c <= o:
-        return False, "red_candle"
-    if body_ratio < 0.35:
-        return False, f"weak_body({body_ratio:.2f})"
-
-    return True, "PASS"
-
-
-# ----------------- Alpaca data -----------------
+# ----------------- alpaca data -----------------
 def build_data_client() -> StockHistoricalDataClient:
-    api_key = env("APCA_API_KEY_ID")
+    key = env("APCA_API_KEY_ID")
     secret = env("APCA_API_SECRET_KEY")
-    return StockHistoricalDataClient(api_key, secret)
+    # IMPORTANT: Do NOT pass feed=... here (caused your error before).
+    return StockHistoricalDataClient(key, secret)
 
 
-def get_bars(client: StockHistoricalDataClient, symbol: str, minutes: int) -> pd.DataFrame:
-    """
-    نجلب 1Min bars لآخر N دقائق.
-    مهم: حسابات كثيرة ما تقدر تستخدم SIP، فنحاول IEX أولاً.
-    """
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(minutes=minutes + 5)
-
-    # جرّب تمرير feed=IEX إذا متاح في إصدارك
+def get_1m_bars(client: StockHistoricalDataClient, symbol: str, limit: int = 30):
     req_kwargs = dict(
         symbol_or_symbols=symbol,
         timeframe=TimeFrame.Minute,
-        start=start,
-        end=end,
-        limit=minutes + 5,
+        limit=limit,
     )
-
-    # feed handling (compatible)
-    try:
-        from alpaca.data.enums import DataFeed  # type: ignore
-        req_kwargs["feed"] = DataFeed.IEX
-    except Exception:
-        # بعض الإصدارات قد تقبل feed كسلسلة
+    # Put feed on request if supported, NOT on client init
+    if DataFeed is not None:
+        req_kwargs["feed"] = DataFeed.IEX  # avoids SIP subscription issue
+    else:
+        # Some versions accept string feed
         req_kwargs["feed"] = "iex"
 
     req = StockBarsRequest(**req_kwargs)
-
-    bars = client.get_stock_bars(req).df
-    if bars is None or len(bars) == 0:
-        return pd.DataFrame()
-
-    # إذا رجعت MultiIndex (symbol, timestamp)
-    if isinstance(bars.index, pd.MultiIndex):
-        bars = bars.xs(symbol)
-
-    bars = bars.reset_index()
-
-    # توحيد الأعمدة
-    out = pd.DataFrame({
-        "ts": bars["timestamp"],
-        "open": bars["open"],
-        "high": bars["high"],
-        "low": bars["low"],
-        "close": bars["close"],
-        "volume": bars["volume"],
-    }).dropna()
-
-    return out
+    bars = client.get_stock_bars(req).data.get(symbol, [])
+    return bars
 
 
-# ----------------- Signal logic -----------------
-def compute_signal(df: pd.DataFrame, ma_minutes: int, recent_window_min: int) -> dict | None:
-    if df is None or len(df) < max(ma_minutes, recent_window_min) + 2:
+# ----------------- signal logic (simple) -----------------
+def analyze_symbol(bars) -> dict | None:
+    if not bars or len(bars) < 10:
         return None
 
-    closes = df["close"].astype(float)
-    vols = df["volume"].astype(float)
+    # Latest close
+    last = bars[-1]
+    price = float(getattr(last, "close"))
 
-    price = float(closes.iloc[-1])
+    # MA over last 3 minutes (like your telegram MA(3m))
+    ma_window = env_int("MA_MIN", 3)
+    if len(bars) < ma_window:
+        return None
+    ma = sum(float(getattr(b, "close")) for b in bars[-ma_window:]) / ma_window
 
-    ma = float(closes.tail(ma_minutes).mean())
-    diff = (price - ma) / ma if ma != 0 else 0.0
+    diff_pct = (price - ma) / ma if ma != 0 else 0.0
 
-    recent = closes.tail(recent_window_min + 1)
-    recent_move = float((recent.iloc[-1] - recent.iloc[0]) / recent.iloc[0]) if float(recent.iloc[0]) != 0 else 0.0
+    # Volume spike vs baseline
+    base_n = env_int("VOL_BASELINE_BARS", 20)
+    base_n = min(base_n, len(bars) - 1)
+    base_vol = [float(getattr(b, "volume")) for b in bars[-(base_n + 1):-1]]
+    avg_vol = (sum(base_vol) / len(base_vol)) if base_vol else 0.0
+    last_vol = float(getattr(last, "volume"))
+    vol_mult = (last_vol / avg_vol) if avg_vol > 0 else 0.0
 
-    # volume spike baseline: متوسط حجم آخر (recent_window_min) شموع بدون آخر شمعة
-    baseline = float(vols.tail(recent_window_min + 1).iloc[:-1].mean())
-    last_vol = float(vols.iloc[-1])
-    vol_ratio = (last_vol / baseline) if baseline > 0 else 0.0
+    # Recent move (last 10 bars by default)
+    recent_n = env_int("RECENT_BARS", 10)
+    recent_n = min(recent_n, len(bars) - 1)
+    old = bars[-(recent_n + 1)]
+    old_close = float(getattr(old, "close"))
+    recent_move = (price - old_close) / old_close if old_close != 0 else 0.0
 
     return {
         "price": price,
         "ma": ma,
-        "diff": diff,
-        "recent_move": recent_move,
+        "diff_pct": diff_pct,
+        "avg_vol": avg_vol,
         "last_vol": last_vol,
-        "baseline": baseline,
-        "vol_ratio": vol_ratio,
+        "vol_mult": vol_mult,
+        "recent_move": recent_move,
     }
 
 
-def format_alert(symbol: str, sig: dict, candle_pass: bool, candle_msg: str, candle_mode: str) -> str:
-    price = sig["price"]
-    ma = sig["ma"]
-    diff = sig["diff"]
-    vol_ratio = sig["vol_ratio"]
-    last_vol = sig["last_vol"]
-    baseline = sig["baseline"]
-    recent_move = sig["recent_move"]
+def pick_signal(stats: dict) -> str | None:
+    min_diff = env_float("MIN_DIFF_PCT", 0.0010)      # 0.10%
+    min_vol = env_float("MIN_VOL_MULT", 1.4)          # 1.4x
+    max_recent = env_float("MAX_RECENT_MOVE_PCT", 0.0030)  # 0.30%
 
-    # اتجاه الإشارة (ALERT فقط)
-    side = "LONG" if diff > 0 else "SHORT"
+    diff = stats["diff_pct"]
+    volm = stats["vol_mult"]
+    recent = abs(stats["recent_move"])
 
-    candle_line = ""
-    if candle_mode != "OFF":
-        candle_line = f"\n🕯 Candle Filter ({candle_mode}):\n{'✅ PASS' if candle_pass else '❌ FAIL'} ({candle_msg})"
+    if volm < min_vol:
+        return None
+    if recent > max_recent:
+        return None
 
-    txt = (
+    if diff >= min_diff:
+        return "LONG"
+    if diff <= -min_diff:
+        return "SHORT"
+    return None
+
+
+def format_alert(symbol: str, side: str, stats: dict) -> str:
+    ts = now_utc().strftime("%Y-%m-%d %H:%M:%S")
+    return (
         f"📣 Signal: {side} | {symbol}\n"
-        f"Price: {price:.2f}\n"
-        f"MA({int(os.getenv('MA_MIN', '3'))}m): {ma:.2f}\n"
-        f"Diff: {diff*100:.2f}%\n"
-        f"Volume Spike: {last_vol:.0f} vs avg {baseline:.0f} (x{vol_ratio:.2f})\n"
-        f"Recent Move ({int(os.getenv('RECENT_WINDOW_MIN', '10'))}m): {recent_move*100:.2f}%"
-        f"{candle_line}\n"
-        f"Time(UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
+        f"Price: {stats['price']:.2f}\n"
+        f"MA({env_int('MA_MIN', 3)}m): {stats['ma']:.2f}\n"
+        f"Diff: {stats['diff_pct']*100:.2f}%\n"
+        f"Volume Spike: {int(stats['last_vol'])} vs avg {int(stats['avg_vol'])} (x{stats['vol_mult']:.2f})\n"
+        f"Recent Move({env_int('RECENT_BARS', 10)} bars): {stats['recent_move']*100:.2f}%\n"
+        f"Time(UTC): {ts}"
     )
-    return txt
 
 
-# ----------------- Main loop (ALERTS only) -----------------
-def main() -> None:
-    # settings (defaults)
-    interval_sec = env_int("INTERVAL_SEC", 15)
-    ma_min = env_int("MA_MIN", 3)
-    recent_window_min = env_int("RECENT_WINDOW_MIN", 10)
-
-    min_diff = env_float("MIN_DIFF_PCT", 0.0010)       # 0.10%
-    max_diff = env_float("MAX_DIFF_PCT", 0.0030)       # 0.30%
-    min_vol_ratio = env_float("MIN_VOL_RATIO", 1.4)    # 1.4x
-
-    candle_mode = os.getenv("CANDLE_FILTER", "LIGHT").strip().upper()  # LIGHT / OFF
-
+def main():
     symbols = parse_symbols()
+    interval = env_int("INTERVAL_SEC", 15)
 
     client = build_data_client()
 
-    send_telegram(
-        f"✅ Bot started (ALERTS)\n"
-        f"symbols={','.join(symbols)} | interval={interval_sec}s | candle={candle_mode}\n"
-        f"min_diff={min_diff} max_diff={max_diff} min_vol_ratio={min_vol_ratio}"
-    )
+    # Startup message (NO trading.paper هنا، ولا TradingClient أصلاً)
+    send_telegram(f"✅ Bot started (ALERTS) | symbols={','.join(symbols)} | interval={interval}s | feed=IEX")
 
-    last_sent = {}  # symbol -> timestamp
+    last_sent: dict[str, float] = {}
+    cooldown = env_int("COOLDOWN_SEC", 60)
 
     while True:
         for sym in symbols:
             try:
-                df = get_bars(client, sym, minutes=max(60, recent_window_min + 10))
-                if df.empty:
+                bars = get_1m_bars(client, sym, limit=30)
+                stats = analyze_symbol(bars)
+                if not stats:
                     continue
 
-                sig = compute_signal(df, ma_minutes=ma_min, recent_window_min=recent_window_min)
-                if not sig:
+                side = pick_signal(stats)
+                if not side:
                     continue
 
-                diff_abs = abs(float(sig["diff"]))
-                vol_ratio = float(sig["vol_ratio"])
-
-                # شروط الإشارة الأساسية
-                if diff_abs < min_diff or diff_abs > max_diff:
-                    continue
-                if vol_ratio < min_vol_ratio:
-                    continue
-
-                # Candle filter
-                candle_pass, candle_msg = True, "OFF"
-                if candle_mode != "OFF":
-                    candle_pass, candle_msg = candle_filter_light(df)
-                    if not candle_pass:
-                        continue
-
-                # منع تكرار نفس السهم بسرعة (تبريد 60 ثانية)
                 now_ts = time.time()
-                if sym in last_sent and (now_ts - last_sent[sym]) < 60:
+                prev = last_sent.get(sym, 0.0)
+                if now_ts - prev < cooldown:
                     continue
 
-                msg = format_alert(sym, sig, candle_pass, candle_msg, candle_mode)
-                send_telegram(msg)
+                send_telegram(format_alert(sym, side, stats))
                 last_sent[sym] = now_ts
 
             except Exception as e:
-                # خطأ واحد لا يطيّح البوت كله
-                try:
+                # Send a short error once per symbol cooldown to avoid spam
+                now_ts = time.time()
+                prev = last_sent.get(f"err:{sym}", 0.0)
+                if now_ts - prev > cooldown:
                     send_telegram(f"⚠️ Bot error ({sym}): {type(e).__name__}: {str(e)[:180]}")
-                except Exception:
-                    pass
+                    last_sent[f"err:{sym}"] = now_ts
 
-        time.sleep(interval_sec)
+        time.sleep(interval)
 
 
 if __name__ == "__main__":
