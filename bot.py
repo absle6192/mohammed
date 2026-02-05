@@ -1,25 +1,13 @@
 import os
 import time
-import math
 import requests
 from datetime import datetime, timezone, timedelta
 
-import pytz
-
-from alpaca.common.exceptions import APIError
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import DataFeed
-
-from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.trading.requests import MarketOrderRequest
 
 
-# =========================
-# ENV helpers
-# =========================
 def env(name: str, default: str | None = None) -> str:
     v = os.getenv(name, default)
     if v is None or str(v).strip() == "":
@@ -27,316 +15,317 @@ def env(name: str, default: str | None = None) -> str:
     return str(v).strip()
 
 
-def env_any(names: list[str], default: str | None = None) -> str:
-    for n in names:
-        v = os.getenv(n)
-        if v is not None and str(v).strip() != "":
-            return str(v).strip()
-    if default is None:
-        raise RuntimeError(f"Missing env var (any of): {', '.join(names)}")
-    return str(default).strip()
-
-
-def env_float(name: str, default: str) -> float:
-    try:
-        return float(os.getenv(name, default))
-    except Exception:
-        raise RuntimeError(f"Invalid float for env var: {name}")
-
-
-def env_int(name: str, default: str) -> int:
-    try:
-        return int(os.getenv(name, default))
-    except Exception:
-        raise RuntimeError(f"Invalid int for env var: {name}")
-
-
-def env_bool(name: str, default: str = "false") -> bool:
-    v = os.getenv(name, default)
-    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
-
-
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def fmt_time_sa(dt_utc: datetime) -> str:
-    # Saudi Arabia timezone
-    sa = pytz.timezone("Asia/Riyadh")
-    return dt_utc.astimezone(sa).strftime("%Y-%m-%d %H:%M:%S")
-
-
-# =========================
-# Telegram
-# =========================
 def send_telegram(text: str) -> None:
-    token = env_any(["TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN"])
-    chat_id = env_any(["TELEGRAM_CHAT_ID", "TELEGRAM_CHATID", "TELEGRAM_ID"])
+    token = env("TELEGRAM_BOT_TOKEN")
+    chat_id = env("TELEGRAM_CHAT_ID")
     url = f"https://api.telegram.org/bot{token}/sendMessage"
+
     payload = {
         "chat_id": chat_id,
         "text": text,
         "disable_web_page_preview": True,
+        "disable_notification": False,
     }
+
     r = requests.post(url, json=payload, timeout=15)
-    if r.status_code != 200:
+    if not r.ok:
         raise RuntimeError(f"Telegram error: {r.status_code} {r.text}")
 
 
-# =========================
-# Symbols / config
-# =========================
-def parse_symbols() -> list[str]:
-    raw = os.getenv("SYMBOLS") or os.getenv("TICKERS") or ""
-    raw = raw.strip()
-    if not raw:
-        # fallback
-        return ["TSLA", "AAPL", "NVDA", "AMD", "AMZN", "GOOGL", "MU", "MSFT"]
-    parts = [p.strip().upper() for p in raw.split(",")]
-    return [p for p in parts if p]
-
-
-# =========================
-# Alpaca clients (0.27 compatible)
-# =========================
-def build_clients() -> tuple[StockHistoricalDataClient, TradingClient, bool]:
-    api_key = env_any(["ALPACA_API_KEY", "APCA_API_KEY_ID", "APCA_API_KEY"])
-    secret = env_any(["ALPACA_API_SECRET", "APCA_API_SECRET_KEY", "APCA_API_SECRET"])
-
-    paper = env_bool("ALPACA_PAPER", "true")
-    # IMPORTANT: alpaca-py 0.27.0 TradingClient does NOT accept base_url kwarg here
-    trade = TradingClient(api_key, secret, paper=paper)
-
-    # IMPORTANT: StockHistoricalDataClient does NOT accept feed kwarg in 0.27.0
-    hist = StockHistoricalDataClient(api_key, secret)
-
-    return hist, trade, paper
-
-
-# =========================
-# Candle filter (LIGHT)
-# =========================
-def candle_filter_light(open_p: float, high_p: float, low_p: float, close_p: float) -> tuple[bool, str]:
-    # Light filter: avoid long upper wicks & tiny bodies
-    body = abs(close_p - open_p)
-    rng = max(high_p - low_p, 1e-9)
-    upper_wick = high_p - max(open_p, close_p)
-    lower_wick = min(open_p, close_p) - low_p
-
-    body_ratio = body / rng
-    upper_ratio = upper_wick / rng
-
-    # PASS if body is reasonable and upper wick not huge
-    if body_ratio >= 0.35 and upper_ratio <= 0.45:
-        return True, "PASS"
-    return False, "FAIL"
-
-
-# =========================
-# Core calculations
-# =========================
-def get_bars(hist: StockHistoricalDataClient, symbol: str, minutes: int, feed: DataFeed) -> list:
-    end = now_utc()
-    start = end - timedelta(minutes=minutes)
-
-    req = StockBarsRequest(
-        symbol_or_symbols=symbol,
-        timeframe=TimeFrame.Minute,
-        start=start,
-        end=end,
-        feed=feed,  # ✅ put feed here to avoid SIP permission error
-    )
-    resp = hist.get_stock_bars(req)
-    df = resp.df
-    if df is None or len(df) == 0:
-        return []
-    # df is multiindex when multiple symbols; for single symbol it still may be multi
-    try:
-        sdf = df.xs(symbol)
-    except Exception:
-        sdf = df
-    return list(sdf.itertuples())
-
-
-def mean(vals: list[float]) -> float:
-    if not vals:
-        return float("nan")
-    return sum(vals) / len(vals)
-
-
-def safe_pct(a: float, b: float) -> float:
-    # (a - b) / b
+def pct(a: float, b: float) -> float:
     if b == 0:
         return 0.0
     return (a - b) / b
 
 
-# =========================
-# Trading (optional)
-# =========================
-def submit_market_order(trade: TradingClient, symbol: str, side: OrderSide, usd: float) -> str:
-    # Estimate qty from last trade price is not available here; we keep it simple:
-    # Use notional orders are not supported in all contexts; we use qty = floor(usd / price)
-    # We'll pass qty later after we compute last_close.
-    raise NotImplementedError
+def fmt_pct(x: float) -> str:
+    return f"{x * 100:.2f}%"
 
 
-# =========================
-# Main loop
-# =========================
-def main() -> None:
-    symbols = parse_symbols()
+def strength_label(vol_ratio: float) -> str:
+    if vol_ratio >= 3.0:
+        return "🔥🔥🔥 نار (Very Strong)"
+    if vol_ratio >= 2.5:
+        return "🔥🔥 قوية جدًا (Strong+)"
+    if vol_ratio >= 2.0:
+        return "🔥 قوية (Strong)"
+    if vol_ratio >= 1.3:
+        return "✅ متوسطة (OK)"
+    return "⚠️ ضعيفة (Weak)"
 
-    # Mode:
-    # ALERTS = only telegram alerts
-    # TRADE  = can trade if AUTO_TRADE=on
-    mode = (os.getenv("MODE") or "ALERTS").strip().upper()
-    auto_trade = env_bool("AUTO_TRADE", "false")
 
-    interval_sec = env_int("INTERVAL_SEC", os.getenv("INTERVAL", "15"))
+def candle_filter_light_completed(df_all, side: str, close_pos_min: float = 0.65) -> bool:
+    """
+    فلتر شموع خفيف لكن على شموع مكتملة:
+    - نستخدم آخر شمعة مكتملة = -2
+    - والشمعة اللي قبلها = -3
 
-    # thresholds
-    ma_min = env_int("MA_MIN", os.getenv("MA_WINDOW_MIN", "3"))          # MA(3m)
-    baseline_min = env_int("BASELINE_MIN", os.getenv("VOL_BASELINE_MIN", "30"))
-    min_diff_pct = env_float("MIN_DIFF_PCT", os.getenv("MIN_DIFF", "0.0010"))   # 0.10%
-    max_diff_pct = env_float("MAX_DIFF_PCT", os.getenv("MAX_DIFF", "0.0030"))   # 0.30%
-    min_vol_ratio = env_float("MIN_VOL_RATIO", os.getenv("MIN_VOL", "1.4"))     # e.g. 1.4x
-    recent_window_min = env_int("RECENT_WINDOW_MIN", "10")
-    max_recent_move_pct = env_float("MAX_RECENT_MOVE_PCT", "0.003")      # 0.30%
-    candle_filter = (os.getenv("CANDLE_FILTER") or "LIGHT").strip().upper()
+    LONG:
+      - الشمعة (-2) خضراء
+      - إغلاقها أعلى من إغلاق (-3)
+      - إغلاقها قريب من أعلى الشمعة
+    SHORT:
+      - الشمعة (-2) حمراء
+      - إغلاقها أقل من إغلاق (-3)
+      - إغلاقها قريب من أسفل الشمعة
+    """
+    if df_all is None or len(df_all) < 4:
+        return False
 
-    # data feed: IEX for free accounts (avoid SIP errors)
-    data_feed = (os.getenv("DATA_FEED") or "IEX").strip().upper()
-    feed = DataFeed.IEX if data_feed == "IEX" else DataFeed.SIP
+    last = df_all.iloc[-2]  # completed candle
+    prev = df_all.iloc[-3]  # completed candle before it
 
-    hist, trade, paper = build_clients()
+    o = float(last["open"])
+    h = float(last["high"])
+    l = float(last["low"])
+    c = float(last["close"])
+    prev_c = float(prev["close"])
 
-    # Start message (IMPORTANT: no trading.paper here)
-    try:
-        send_telegram(
-            f"✅ Bot started ({mode}) | symbols={','.join(symbols)} | "
-            f"interval={interval_sec}s | feed={data_feed} | paper={paper} | candle={candle_filter} | auto_trade={auto_trade}"
-        )
-    except Exception as e:
-        # If telegram fails, still keep running to show logs
-        print(f"Telegram start failed: {e}")
+    rng = h - l
+    if rng <= 0:
+        return False
 
-    last_alert_at: dict[str, float] = {}
-    min_alert_gap_sec = 20.0  # basic spam control
+    close_pos = (c - l) / rng  # 0 عند اللو, 1 عند الهاي
+
+    if side == "LONG":
+        return (c >= o) and (c > prev_c) and (close_pos >= close_pos_min)
+
+    # SHORT
+    return (c <= o) and (c < prev_c) and (close_pos <= (1.0 - close_pos_min))
+
+
+def build_message(
+    mode_tag: str,
+    side: str,
+    symbol: str,
+    price_now: float,
+    ma: float,
+    d: float,
+    vol_last: float,
+    vol_base: float,
+    vol_ratio: float,
+    lookback_min: int,
+    now: datetime,
+    recent_move: float,
+    recent_window_min: int,
+    candle_ok: bool,
+) -> str:
+    if side == "LONG":
+        direction_emoji = "🟢📈"
+        direction_ar = "شراء"
+        bias_emoji = "🚀"
+    else:
+        direction_emoji = "🔴📉"
+        direction_ar = "بيع (شورت)"
+        bias_emoji = "🧨"
+
+    diff_str = fmt_pct(d)
+    diff_arrow = "⬆️" if d > 0 else "⬇️" if d < 0 else "➡️"
+    strength = strength_label(vol_ratio)
+    ts = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    candle_str = "✅ PASS" if candle_ok else "❌ FAIL"
+
+    msg = f"""
+{direction_emoji} {mode_tag} | إشارة {direction_ar} | {side} {bias_emoji}
+📌 السهم | Symbol: {symbol}
+
+💰 السعر | Price: {price_now:.2f}
+📊 المتوسط ({lookback_min}د) | MA({lookback_min}m): {ma:.2f}
+
+{diff_arrow} الفرق | Diff: {diff_str}
+
+🔥 حجم التداول | Volume Spike (baseline):
+{vol_last:.0f} مقابل {vol_base:.0f} (x{vol_ratio:.2f})
+
+🧠 حركة {recent_window_min}د الأخيرة | Recent Move:
+{fmt_pct(recent_move)}
+
+🕯️ Candle Filter (LIGHT):
+{candle_str}
+
+⭐️ قوة الإشارة | Strength:
+{strength}
+
+⏰ الوقت | Time (UTC):
+{ts}
+""".strip()
+
+    return msg
+
+
+def main():
+    _base_url = env("APCA_API_BASE_URL")
+    key_id = env("APCA_API_KEY_ID")
+    secret = env("APCA_API_SECRET_KEY")
+
+    tickers = [t.strip().upper() for t in env("TICKERS").split(",") if t.strip()]
+
+    mode = env("MODE", "EARLY").upper()
+    if mode not in ("EARLY", "CONFIRM", "BOTH"):
+        mode = "EARLY"
+
+    interval_sec = int(env("INTERVAL_SEC", "15" if mode in ("EARLY", "BOTH") else "20"))
+    lookback_min = int(env("LOOKBACK_MIN", "3" if mode in ("EARLY", "BOTH") else "5"))
+
+    thresh_pct = float(env("THRESH_PCT", "0.0008" if mode in ("EARLY", "BOTH") else "0.0015"))
+
+    volume_mult = float(env("VOLUME_MULT", "1.2" if mode in ("EARLY", "BOTH") else "1.8"))
+    min_vol_ratio = float(env("MIN_VOL_RATIO", "1.1" if mode in ("EARLY", "BOTH") else "1.5"))
+
+    cooldown_min = int(env("COOLDOWN_MIN", "6" if mode in ("EARLY", "BOTH") else "10"))
+
+    recent_window_min = int(env("RECENT_WINDOW_MIN", "10"))
+    max_recent_move_pct = float(env("MAX_RECENT_MOVE_PCT", "0.003"))
+
+    candle_filter_mode = env("CANDLE_FILTER", "LIGHT").upper()  # LIGHT / OFF
+    candle_close_pos_min = float(env("CANDLE_CLOSE_POS_MIN", "0.65"))
+
+    client = StockHistoricalDataClient(key_id, secret)
+
+    last_signal_time: dict[str, datetime] = {}
+    last_signal_key: dict[str, str] = {}
+
+    send_telegram(
+        "✅ البوت اشتغل | Bot Started\n"
+        f"👀 يراقب | Watching: {', '.join(tickers)}\n"
+        f"⚙️ MODE: {mode}\n"
+        f"⏱️ Interval: {interval_sec}s | Lookback: {lookback_min}m\n"
+        f"🎯 Threshold: {thresh_pct*100:.2f}%\n"
+        f"🔥 Volume Mult: x{volume_mult} | Min Vol Ratio: x{min_vol_ratio}\n"
+        f"🧠 Late-Entry Filter: abs(move {recent_window_min}m) <= {max_recent_move_pct*100:.2f}%\n"
+        f"🕯️ Candle Filter: {candle_filter_mode} | ClosePosMin: {candle_close_pos_min}\n"
+        f"🕒 Timezone: UTC\n"
+        f"🕯️ Using COMPLETED candles (-2/-3)"
+    )
 
     while True:
-        for sym in symbols:
-            try:
-                # Pull enough bars for baseline + MA + recent window
-                need_min = max(baseline_min, ma_min, recent_window_min) + 2
-                bars = get_bars(hist, sym, minutes=need_min, feed=feed)
-                if len(bars) < max(ma_min, 3):
+        try:
+            now = datetime.now(timezone.utc)
+
+            need_min = max(lookback_min, recent_window_min) + 6
+            start = now - timedelta(minutes=need_min)
+
+            req = StockBarsRequest(
+                symbol_or_symbols=tickers,
+                timeframe=TimeFrame.Minute,
+                start=start,
+                end=now,
+                feed="iex",
+            )
+
+            bars = client.get_stock_bars(req).df
+            if bars is None or len(bars) == 0:
+                time.sleep(interval_sec)
+                continue
+
+            for sym in tickers:
+                try:
+                    df_all = bars.xs(sym, level=0).copy()
+                except Exception:
                     continue
 
-                # Latest bar
-                last = bars[-1]
-                close_p = float(last.close)
-                open_p = float(last.open)
-                high_p = float(last.high)
-                low_p = float(last.low)
-                vol = float(last.volume)
-
-                # MA over last ma_min bars (use closes)
-                ma_closes = [float(b.close) for b in bars[-ma_min:]]
-                ma = mean(ma_closes)
-                diff_pct = safe_pct(close_p, ma)  # (close - ma)/ma
-
-                # volume baseline average over baseline_min bars (exclude latest to be safe)
-                base_slice = bars[-(baseline_min + 1):-1] if len(bars) >= baseline_min + 1 else bars[:-1]
-                base_vols = [float(b.volume) for b in base_slice if float(b.volume) > 0]
-                vol_avg = mean(base_vols) if base_vols else float("nan")
-                vol_ratio = (vol / vol_avg) if (vol_avg and not math.isnan(vol_avg) and vol_avg > 0) else 0.0
-
-                # recent move over recent_window_min (compare now vs N minutes ago)
-                idx_back = max(1, recent_window_min)
-                if len(bars) <= idx_back:
-                    recent_move = 0.0
-                else:
-                    prev_close = float(bars[-(idx_back + 1)].close)
-                    recent_move = safe_pct(close_p, prev_close)
-
-                # Candle filter (LIGHT)
-                candle_pass = True
-                candle_status = "PASS"
-                if candle_filter == "LIGHT":
-                    candle_pass, candle_status = candle_filter_light(open_p, high_p, low_p, close_p)
-
-                # Signal logic
-                # We alert when:
-                # 1) abs(diff) between min/max
-                # 2) vol spike >= min_vol_ratio
-                # 3) recent move not too large (avoid chasing)
-                diff_abs = abs(diff_pct)
-                if not (min_diff_pct <= diff_abs <= max_diff_pct):
+                df_all = df_all.sort_index()
+                if len(df_all) < max(8, lookback_min + 4):
                     continue
-                if vol_ratio < min_vol_ratio:
+
+                # ===== completed "now" =====
+                price_now = float(df_all["close"].iloc[-2])  # completed candle close
+
+                # ===== late-entry filter (completed candles) =====
+                df_recent = df_all.tail(recent_window_min + 2)
+                if len(df_recent) < 4:
                     continue
+
+                price_then = float(df_recent["close"].iloc[0])
+                recent_move = pct(price_now, price_then)
+
                 if abs(recent_move) > max_recent_move_pct:
                     continue
-                if not candle_pass:
+
+                # ===== lookback MA (completed candles) =====
+                df_lb = df_all.tail(lookback_min + 2).copy()
+                if len(df_lb) < (lookback_min + 2):
                     continue
 
-                # Rate limit per symbol
-                t = time.time()
-                if sym in last_alert_at and (t - last_alert_at[sym]) < min_alert_gap_sec:
+                ma = float(df_lb["close"].iloc[-(lookback_min + 1):-1].mean())
+                d = pct(price_now, ma)
+
+                # ===== volume baseline (completed candle) =====
+                vol_last = float(df_lb["volume"].iloc[-2])  # completed candle volume
+                vol_base = float(df_lb["volume"].iloc[:-2].mean()) if len(df_lb) > 4 else float(df_lb["volume"].mean())
+                vol_ratio = (vol_last / vol_base) if vol_base else 0.0
+
+                vol_ok = (vol_base > 0) and (vol_last >= vol_base * volume_mult) and (vol_ratio >= min_vol_ratio)
+                if not vol_ok:
                     continue
-                last_alert_at[sym] = t
 
-                direction = "LONG" if diff_pct > 0 else "SHORT"
-                arrow = "⬆️" if direction == "LONG" else "⬇️"
+                signals_to_send: list[tuple[str, str]] = []
 
-                msg = (
-                    f"📣 Signal: {direction} | {sym}\n"
-                    f"Price: {close_p:.2f} | السعر 💰\n"
-                    f"MA({ma_min}m): {ma:.2f} | المتوسط ({ma_min}د) 📊\n"
-                    f"Diff: {diff_pct*100:+.2f}% | الفرق {arrow}\n\n"
-                    f"Volume Spike (baseline):\n"
-                    f"(x{vol_ratio:.2f}) {int(vol)} مقابل {int(vol_avg) if not math.isnan(vol_avg) else 0} 🔥\n\n"
-                    f"Recent Move | حركة {recent_window_min}د الأخيرة 🧠:\n"
-                    f"{recent_move*100:+.2f}%\n\n"
-                    f"Candle Filter (LIGHT):\n"
-                    f"{'✅' if candle_status=='PASS' else '❌'} {candle_status}\n\n"
-                    f"Strength | قوة الإشارة ⭐:\n"
-                    f"{'✅ متوسطة (OK)'}\n\n"
-                    f"Time (UTC) | الوقت ⏱:\n"
-                    f"{now_utc().strftime('%Y-%m-%d %H:%M:%S')}"
-                )
-                send_telegram(msg)
+                if mode in ("EARLY", "BOTH"):
+                    if d >= thresh_pct:
+                        signals_to_send.append(("🟡 EARLY", "LONG"))
+                    elif d <= -thresh_pct:
+                        signals_to_send.append(("🟡 EARLY", "SHORT"))
 
-                # Trading (optional) - OFF unless MODE=TRADE and AUTO_TRADE=on
-                if mode == "TRADE" and auto_trade:
-                    usd_per_trade = env_float("USD_PER_TRADE", "2000")
-                    # qty by last price
-                    qty = max(1, int(usd_per_trade // close_p))
-                    side = OrderSide.BUY if direction == "LONG" else OrderSide.SELL
+                if mode in ("CONFIRM", "BOTH"):
+                    confirm_thresh = float(env("CONFIRM_THRESH_PCT", str(max(thresh_pct * 1.8, 0.0015))))
+                    confirm_vol_mult = float(env("CONFIRM_VOLUME_MULT", str(max(volume_mult * 1.4, 1.8))))
+                    confirm_ok = (vol_last >= vol_base * confirm_vol_mult)
 
-                    order = MarketOrderRequest(
-                        symbol=sym,
-                        qty=qty,
+                    if confirm_ok:
+                        if d >= confirm_thresh:
+                            signals_to_send.append(("🟢 CONFIRM", "LONG"))
+                        elif d <= -confirm_thresh:
+                            signals_to_send.append(("🟢 CONFIRM", "SHORT"))
+
+                if not signals_to_send:
+                    continue
+
+                for mode_tag, side in signals_to_send:
+                    candle_ok = True
+                    if candle_filter_mode != "OFF" and "EARLY" in mode_tag:
+                        candle_ok = candle_filter_light_completed(df_all, side, close_pos_min=candle_close_pos_min)
+                        if not candle_ok:
+                            continue
+
+                    key = f"{mode_tag}_{side}"
+
+                    last_t = last_signal_time.get(sym)
+                    if last_t and (now - last_t) < timedelta(minutes=cooldown_min):
+                        continue
+
+                    if last_signal_key.get(sym) == key and last_t and (now - last_t) < timedelta(minutes=cooldown_min * 2):
+                        continue
+
+                    msg = build_message(
+                        mode_tag=mode_tag,
                         side=side,
-                        time_in_force=TimeInForce.DAY,
+                        symbol=sym,
+                        price_now=price_now,
+                        ma=ma,
+                        d=d,
+                        vol_last=vol_last,
+                        vol_base=vol_base,
+                        vol_ratio=vol_ratio,
+                        lookback_min=lookback_min,
+                        now=now,
+                        recent_move=recent_move,
+                        recent_window_min=recent_window_min,
+                        candle_ok=candle_ok,
                     )
-                    o = trade.submit_order(order)
-                    send_telegram(f"✅ Order sent: {sym} {side.value} qty={qty} | paper={paper}")
 
-            except APIError as e:
-                # Alpaca API errors (including SIP permissions)
-                try:
-                    send_telegram(f"⚠️ Bot error: APIError:\n{str(e)}")
-                except Exception:
-                    pass
-            except Exception as e:
-                try:
-                    send_telegram(f"⚠️ Bot error:\n{repr(e)}")
-                except Exception:
-                    pass
+                    send_telegram(msg)
+                    last_signal_time[sym] = now
+                    last_signal_key[sym] = key
 
-        time.sleep(max(5, interval_sec))
+        except Exception as e:
+            try:
+                send_telegram(f"⚠️ خطأ | Bot error: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+
+        time.sleep(interval_sec)
 
 
 if __name__ == "__main__":
