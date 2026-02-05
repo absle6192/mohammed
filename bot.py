@@ -17,7 +17,9 @@ from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from alpaca.trading.requests import LimitOrderRequest, TakeProfitRequest, StopLossRequest
 
 
-# ----------------- helpers -----------------
+# ======================
+#        HELPERS
+# ======================
 def env(name: str, default: Optional[str] = None) -> str:
     v = os.getenv(name, default)
     if v is None or str(v).strip() == "":
@@ -46,14 +48,17 @@ def send_telegram(text: str) -> None:
     try:
         requests.post(url, json=payload, timeout=10)
     except Exception:
+        # لا نطيح البوت بسبب تيليجرام
         pass
 
 
-# ----------------- strategy -----------------
+# ======================
+#       STRATEGY
+# ======================
 @dataclass
 class Signal:
     symbol: str
-    side: str   # "LONG" or "SHORT"
+    side: str  # "LONG" or "SHORT"
     price: float
     ma_5m: float
     diff_pct: float
@@ -69,6 +74,11 @@ def round2(x: float) -> float:
     return float(f"{x:.2f}")
 
 def is_strong_candle_light(df_1m: pd.DataFrame, side: str) -> bool:
+    """
+    فلتر شموع خفيف:
+    LONG: شمعة خضراء بجسم واضح، ظل علوي مو طويل
+    SHORT: شمعة حمراء بجسم واضح، ظل سفلي مو طويل
+    """
     if df_1m is None or len(df_1m) < 3:
         return False
 
@@ -83,6 +93,7 @@ def is_strong_candle_light(df_1m: pd.DataFrame, side: str) -> bool:
     upper_ratio = upper_wick / rng
     lower_ratio = lower_wick / rng
 
+    # جسم واضح
     if body_ratio < 0.35:
         return False
 
@@ -103,9 +114,25 @@ def is_strong_candle_light(df_1m: pd.DataFrame, side: str) -> bool:
     return False
 
 
+# ======================
+#     ALPACA CLIENTS
+# ======================
 def build_clients() -> Tuple[StockHistoricalDataClient, TradingClient]:
-    api_key = env("ALPACA_API_KEY")
-    secret = env("ALPACA_SECRET_KEY")
+    """
+    يقبل المفاتيح بأي من النظامين:
+    - الجديد: ALPACA_API_KEY / ALPACA_SECRET_KEY
+    - القديم: APCA_API_KEY_ID / APCA_API_SECRET_KEY
+    (بدون ما نضيف ولا نكرر مفاتيح في Render)
+    """
+    api_key = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
+    secret  = os.getenv("ALPACA_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY")
+
+    if not api_key or not secret:
+        raise RuntimeError(
+            "Missing Alpaca keys. Set either "
+            "ALPACA_API_KEY/ALPACA_SECRET_KEY or APCA_API_KEY_ID/APCA_API_SECRET_KEY"
+        )
+
     paper = env("ALPACA_PAPER", "true").lower() in ("1", "true", "yes", "y")
 
     hist = StockHistoricalDataClient(api_key, secret)
@@ -116,6 +143,7 @@ def build_clients() -> Tuple[StockHistoricalDataClient, TradingClient]:
 def get_bars_1m(hist: StockHistoricalDataClient, symbol: str, minutes: int) -> pd.DataFrame:
     end = now_utc()
     start = end - timedelta(minutes=minutes + 2)
+
     req = StockBarsRequest(
         symbol_or_symbols=symbol,
         timeframe=TimeFrame.Minute,
@@ -123,11 +151,14 @@ def get_bars_1m(hist: StockHistoricalDataClient, symbol: str, minutes: int) -> p
         end=end,
         adjustment="raw",
     )
+
     bars = hist.get_stock_bars(req).df
     if bars is None or len(bars) == 0:
         return pd.DataFrame()
+
     if isinstance(bars.index, pd.MultiIndex):
         bars = bars.xs(symbol)
+
     return bars.sort_index()
 
 
@@ -139,8 +170,8 @@ def compute_signal(symbol: str, df_1m: pd.DataFrame) -> Optional[Signal]:
     ma_5m = float(df_1m["close"].iloc[-5:].mean())
 
     diff_pct = (last_close - ma_5m) / ma_5m
-    vol = float(df_1m["volume"].iloc[-1])
 
+    vol = float(df_1m["volume"].iloc[-1])
     vol_window = env_int("VOL_AVG_WINDOW", "20")
     vol_avg = float(df_1m["volume"].iloc[-vol_window:].mean())
     vol_ratio = vol / max(1e-9, vol_avg)
@@ -181,11 +212,13 @@ def too_big_jump(df_1m: pd.DataFrame) -> bool:
     return jump_pct > max_jump
 
 
+# ======================
+#     TRADING UTILS
+# ======================
 def calc_qty_by_usd(price: float) -> int:
     usd = env_float("USD_PER_TRADE", "2000")
     qty = int(math.floor(usd / max(1e-9, price)))
     return clamp_qty(qty)
-
 
 def compute_pullback_entry(side: str, last_price: float) -> float:
     pb_pct = env_float("PULLBACK_PCT", "0.0008")
@@ -197,7 +230,6 @@ def compute_pullback_entry(side: str, last_price: float) -> float:
         entry = max(last_price * (1.0 + pb_pct), last_price * (1.0 + spread_guard))
 
     return round2(entry)
-
 
 def place_bracket_limit(trading: TradingClient, symbol: str, side: str, qty: int, entry: float) -> str:
     tp_pct = env_float("TAKE_PROFIT_PCT", "0.0025")
@@ -226,8 +258,14 @@ def place_bracket_limit(trading: TradingClient, symbol: str, side: str, qty: int
     return order.id
 
 
+# ======================
+#          MAIN
+# ======================
 def main():
-    symbols = [s.strip().upper() for s in env("SYMBOLS", "TSLA,NVDA,AAPL,AMD,AMZN,GOOGL,MU,MSFT").split(",") if s.strip()]
+    # يقبل SYMBOLS أو TICKERS (عشان ما تتعب بتغيير الاسم)
+    symbols_raw = os.getenv("SYMBOLS") or os.getenv("TICKERS") or "TSLA,NVDA,AAPL,AMD,AMZN,GOOGL,MU,MSFT"
+    symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
+
     poll_sec = env_int("POLL_SEC", "5")
 
     hist, trading = build_clients()
@@ -245,6 +283,7 @@ def main():
                 if sig is None:
                     continue
 
+                # حماية القفز
                 if too_big_jump(df):
                     send_telegram(
                         f"🚫 IGNORE (Jump)\n{sig.symbol} {sig.side}\n"
@@ -254,6 +293,7 @@ def main():
                     )
                     continue
 
+                # فلتر شموع خفيف
                 if not is_strong_candle_light(df, sig.side):
                     send_telegram(
                         f"⚠️ FILTERED (Candle)\n{sig.symbol} {sig.side}\n"
@@ -263,6 +303,7 @@ def main():
                     )
                     continue
 
+                # إشعار الإشارة
                 send_telegram(
                     f"📣 Signal: {sig.side} | {sig.symbol}\n"
                     f"Price: {sig.price}\n"
@@ -272,7 +313,8 @@ def main():
                     f"Time(UTC): {sig.time_utc}"
                 )
 
-                mode = env("MODE", "ALERTS").upper()
+                # تنفيذ تداول فقط إذا MODE=TRADE
+                mode = (os.getenv("MODE") or "ALERTS").upper()
                 if mode != "TRADE":
                     continue
 
