@@ -1,233 +1,276 @@
 import os
 import time
 import math
-import traceback
-from datetime import datetime, timezone
-
 import requests
+from datetime import datetime, timezone, timedelta
+
 import pandas as pd
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
-from alpaca.trading.client import TradingClient
 
-
-# ----------------------------
-# helpers
-# ----------------------------
-def env_required(name: str) -> str:
-    v = os.getenv(name)
+# ----------------- ENV helpers -----------------
+def env(name: str, default: str | None = None) -> str:
+    v = os.getenv(name, default)
     if v is None or str(v).strip() == "":
         raise RuntimeError(f"Missing env var: {name}")
     return str(v).strip()
 
 
-def env_str(name: str, default: str) -> str:
-    v = os.getenv(name, default)
-    return str(v).strip()
+def env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    return float(v) if v and v.strip() else float(default)
 
 
 def env_int(name: str, default: int) -> int:
     v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return int(default)
-    return int(str(v).strip())
-
-
-def env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return float(default)
-    return float(str(v).strip())
+    return int(v) if v and v.strip() else int(default)
 
 
 def env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return bool(default)
-    return str(v).strip().lower() in ("1", "true", "yes", "on")
+    if v is None or v.strip() == "":
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
 
 
-def now_utc_str() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def parse_symbols() -> list[str]:
-    raw = os.getenv("SYMBOLS")
-    if not raw or raw.strip() == "":
-        # fallback safe list
-        return ["TSLA", "AAPL", "NVDA", "AMD", "AMZN", "GOOGL", "MU", "MSFT"]
-    parts = [p.strip().upper() for p in raw.split(",")]
-    return [p for p in parts if p]
-
-
+# ----------------- Telegram -----------------
 def send_telegram(text: str) -> None:
-    token = env_required("TELEGRAM_BOT_TOKEN")
-    chat_id = env_required("TELEGRAM_CHAT_ID")
-
+    token = env("TELEGRAM_BOT_TOKEN")
+    chat_id = env("TELEGRAM_CHAT_ID")
     url = f"https://api.telegram.org/bot{token}/sendMessage"
+
     payload = {
         "chat_id": chat_id,
         "text": text,
         "disable_web_page_preview": True,
-        "disable_notification": False,
     }
+
     r = requests.post(url, json=payload, timeout=20)
     if r.status_code != 200:
         raise RuntimeError(f"Telegram error: {r.status_code} {r.text[:200]}")
 
 
-# ----------------------------
-# alpaca clients
-# ----------------------------
-def build_clients():
-    api_key = env_required("APCA_API_KEY_ID")
-    secret = env_required("APCA_API_SECRET_KEY")
-
-    # TradingClient in alpaca-py supports paper=True/False
-    paper = env_bool("PAPER", True)
-    trading = TradingClient(api_key, secret, paper=paper)
-
-    # Data client (DO NOT pass feed here in alpaca-py==0.27.0)
-    data = StockHistoricalDataClient(api_key, secret)
-
-    return data, trading, paper
+# ----------------- Symbols -----------------
+def parse_symbols() -> list[str]:
+    raw = os.getenv("SYMBOLS", "TSLA,AAPL,NVDA,AMD,AMZN,GOOGL,MU,MSFT")
+    parts = [p.strip().upper() for p in raw.split(",")]
+    return [p for p in parts if p]
 
 
-# ----------------------------
-# signal logic (simple & stable)
-# ----------------------------
-def compute_signal(df: pd.DataFrame):
+# ----------------- Candle filter (LIGHT) -----------------
+def candle_filter_light(df: pd.DataFrame) -> tuple[bool, str]:
     """
-    df: minute bars with columns: close, volume (and datetime index)
-    Returns dict or None
+    فلتر خفيف جدًا:
+    - آخر شمعة: Close > Open
+    - جسم الشمعة ليس صغير جداً (body >= 35% من المدى)
     """
-    if df is None or len(df) < 25:
+    if df is None or len(df) < 2:
+        return False, "no_data"
+
+    last = df.iloc[-1]
+    o, h, l, c = float(last["open"]), float(last["high"]), float(last["low"]), float(last["close"])
+    rng = max(h - l, 1e-9)
+    body = abs(c - o)
+    body_ratio = body / rng
+
+    if c <= o:
+        return False, "red_candle"
+    if body_ratio < 0.35:
+        return False, f"weak_body({body_ratio:.2f})"
+
+    return True, "PASS"
+
+
+# ----------------- Alpaca data -----------------
+def build_data_client() -> StockHistoricalDataClient:
+    api_key = env("APCA_API_KEY_ID")
+    secret = env("APCA_API_SECRET_KEY")
+    return StockHistoricalDataClient(api_key, secret)
+
+
+def get_bars(client: StockHistoricalDataClient, symbol: str, minutes: int) -> pd.DataFrame:
+    """
+    نجلب 1Min bars لآخر N دقائق.
+    مهم: حسابات كثيرة ما تقدر تستخدم SIP، فنحاول IEX أولاً.
+    """
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(minutes=minutes + 5)
+
+    # جرّب تمرير feed=IEX إذا متاح في إصدارك
+    req_kwargs = dict(
+        symbol_or_symbols=symbol,
+        timeframe=TimeFrame.Minute,
+        start=start,
+        end=end,
+        limit=minutes + 5,
+    )
+
+    # feed handling (compatible)
+    try:
+        from alpaca.data.enums import DataFeed  # type: ignore
+        req_kwargs["feed"] = DataFeed.IEX
+    except Exception:
+        # بعض الإصدارات قد تقبل feed كسلسلة
+        req_kwargs["feed"] = "iex"
+
+    req = StockBarsRequest(**req_kwargs)
+
+    bars = client.get_stock_bars(req).df
+    if bars is None or len(bars) == 0:
+        return pd.DataFrame()
+
+    # إذا رجعت MultiIndex (symbol, timestamp)
+    if isinstance(bars.index, pd.MultiIndex):
+        bars = bars.xs(symbol)
+
+    bars = bars.reset_index()
+
+    # توحيد الأعمدة
+    out = pd.DataFrame({
+        "ts": bars["timestamp"],
+        "open": bars["open"],
+        "high": bars["high"],
+        "low": bars["low"],
+        "close": bars["close"],
+        "volume": bars["volume"],
+    }).dropna()
+
+    return out
+
+
+# ----------------- Signal logic -----------------
+def compute_signal(df: pd.DataFrame, ma_minutes: int, recent_window_min: int) -> dict | None:
+    if df is None or len(df) < max(ma_minutes, recent_window_min) + 2:
         return None
 
-    close = df["close"].astype(float)
-    vol = df["volume"].astype(float)
+    closes = df["close"].astype(float)
+    vols = df["volume"].astype(float)
 
-    price = float(close.iloc[-1])
+    price = float(closes.iloc[-1])
 
-    # MA over last 3 minutes
-    ma_3 = float(close.tail(3).mean())
+    ma = float(closes.tail(ma_minutes).mean())
+    diff = (price - ma) / ma if ma != 0 else 0.0
 
-    diff_pct = (price - ma_3) / ma_3 if ma_3 != 0 else 0.0
+    recent = closes.tail(recent_window_min + 1)
+    recent_move = float((recent.iloc[-1] - recent.iloc[0]) / recent.iloc[0]) if float(recent.iloc[0]) != 0 else 0.0
 
-    # baseline volume: average of previous 20 minutes (excluding last bar)
-    baseline = float(vol.iloc[-21:-1].mean())
-    last_vol = float(vol.iloc[-1])
+    # volume spike baseline: متوسط حجم آخر (recent_window_min) شموع بدون آخر شمعة
+    baseline = float(vols.tail(recent_window_min + 1).iloc[:-1].mean())
+    last_vol = float(vols.iloc[-1])
     vol_ratio = (last_vol / baseline) if baseline > 0 else 0.0
 
-    # thresholds (defaults chosen to be mild)
-    min_diff = env_float("MIN_DIFF_PCT", 0.0010)      # 0.10%
-    min_vol_ratio = env_float("MIN_VOL_RATIO", 1.35)  # x1.35
-
-    direction = None
-    if abs(diff_pct) >= min_diff and vol_ratio >= min_vol_ratio:
-        direction = "LONG" if diff_pct > 0 else "SHORT"
-
-    if not direction:
-        return None
-
     return {
-        "direction": direction,
         "price": price,
-        "ma_3": ma_3,
-        "diff_pct": diff_pct,
+        "ma": ma,
+        "diff": diff,
+        "recent_move": recent_move,
         "last_vol": last_vol,
         "baseline": baseline,
         "vol_ratio": vol_ratio,
     }
 
 
-def format_msg(symbol: str, sig: dict) -> str:
-    direction = sig["direction"]
-    arrow = "🟢" if direction == "LONG" else "🔴"
+def format_alert(symbol: str, sig: dict, candle_pass: bool, candle_msg: str, candle_mode: str) -> str:
+    price = sig["price"]
+    ma = sig["ma"]
+    diff = sig["diff"]
+    vol_ratio = sig["vol_ratio"]
+    last_vol = sig["last_vol"]
+    baseline = sig["baseline"]
+    recent_move = sig["recent_move"]
 
-    return (
-        f"📣 Signal: {direction} | {symbol} {arrow}\n"
-        f"Price: {sig['price']:.2f}\n"
-        f"MA(3m): {sig['ma_3']:.2f}\n"
-        f"Diff: {sig['diff_pct']*100:.2f}%\n"
-        f"Volume Spike: {int(sig['last_vol'])} vs avg {int(sig['baseline'])} (x{sig['vol_ratio']:.2f})\n"
-        f"Time(UTC): {now_utc_str()}"
+    # اتجاه الإشارة (ALERT فقط)
+    side = "LONG" if diff > 0 else "SHORT"
+
+    candle_line = ""
+    if candle_mode != "OFF":
+        candle_line = f"\n🕯 Candle Filter ({candle_mode}):\n{'✅ PASS' if candle_pass else '❌ FAIL'} ({candle_msg})"
+
+    txt = (
+        f"📣 Signal: {side} | {symbol}\n"
+        f"Price: {price:.2f}\n"
+        f"MA({int(os.getenv('MA_MIN', '3'))}m): {ma:.2f}\n"
+        f"Diff: {diff*100:.2f}%\n"
+        f"Volume Spike: {last_vol:.0f} vs avg {baseline:.0f} (x{vol_ratio:.2f})\n"
+        f"Recent Move ({int(os.getenv('RECENT_WINDOW_MIN', '10'))}m): {recent_move*100:.2f}%"
+        f"{candle_line}\n"
+        f"Time(UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
     )
+    return txt
 
 
-# ----------------------------
-# main loop
-# ----------------------------
-def main():
-    symbols = parse_symbols()
+# ----------------- Main loop (ALERTS only) -----------------
+def main() -> None:
+    # settings (defaults)
     interval_sec = env_int("INTERVAL_SEC", 15)
+    ma_min = env_int("MA_MIN", 3)
+    recent_window_min = env_int("RECENT_WINDOW_MIN", 10)
 
-    # IMPORTANT: use IEX to avoid SIP subscription error
-    data_feed = env_str("DATA_FEED", "iex").lower().strip()  # "iex"
+    min_diff = env_float("MIN_DIFF_PCT", 0.0010)       # 0.10%
+    max_diff = env_float("MAX_DIFF_PCT", 0.0030)       # 0.30%
+    min_vol_ratio = env_float("MIN_VOL_RATIO", 1.4)    # 1.4x
 
-    data, trading, paper = build_clients()
+    candle_mode = os.getenv("CANDLE_FILTER", "LIGHT").strip().upper()  # LIGHT / OFF
 
-    # startup telegram
+    symbols = parse_symbols()
+
+    client = build_data_client()
+
     send_telegram(
-        "✅ Bot started (ALERTS)\n"
-        f"symbols={','.join(symbols)} | interval={interval_sec}s | feed={data_feed.upper()} | paper={paper}\n"
-        f"Time(UTC): {now_utc_str()}"
+        f"✅ Bot started (ALERTS)\n"
+        f"symbols={','.join(symbols)} | interval={interval_sec}s | candle={candle_mode}\n"
+        f"min_diff={min_diff} max_diff={max_diff} min_vol_ratio={min_vol_ratio}"
     )
 
-    last_sent = {}  # symbol -> (direction, ts)
+    last_sent = {}  # symbol -> timestamp
 
     while True:
-        try:
-            for sym in symbols:
-                # request last ~60 minutes of 1-min bars
-                req = StockBarsRequest(
-                    symbol_or_symbols=sym,
-                    timeframe=TimeFrame.Minute,
-                    limit=60,
-                    feed=data_feed,  # feed goes HERE (not in client init)
-                )
-                bars = data.get_stock_bars(req).df
-
-                if bars is None or len(bars) == 0:
+        for sym in symbols:
+            try:
+                df = get_bars(client, sym, minutes=max(60, recent_window_min + 10))
+                if df.empty:
                     continue
 
-                # when requesting single symbol, index may be multiindex; normalize
-                if isinstance(bars.index, pd.MultiIndex):
-                    bars_sym = bars.xs(sym)
-                else:
-                    bars_sym = bars
-
-                sig = compute_signal(bars_sym)
+                sig = compute_signal(df, ma_minutes=ma_min, recent_window_min=recent_window_min)
                 if not sig:
                     continue
 
-                # anti-spam: don’t send same direction for same symbol within 2 minutes
-                key = sym
-                prev = last_sent.get(key)
-                now_ts = time.time()
-                if prev:
-                    prev_dir, prev_ts = prev
-                    if prev_dir == sig["direction"] and (now_ts - prev_ts) < 120:
+                diff_abs = abs(float(sig["diff"]))
+                vol_ratio = float(sig["vol_ratio"])
+
+                # شروط الإشارة الأساسية
+                if diff_abs < min_diff or diff_abs > max_diff:
+                    continue
+                if vol_ratio < min_vol_ratio:
+                    continue
+
+                # Candle filter
+                candle_pass, candle_msg = True, "OFF"
+                if candle_mode != "OFF":
+                    candle_pass, candle_msg = candle_filter_light(df)
+                    if not candle_pass:
                         continue
 
-                send_telegram(format_msg(sym, sig))
-                last_sent[key] = (sig["direction"], now_ts)
+                # منع تكرار نفس السهم بسرعة (تبريد 60 ثانية)
+                now_ts = time.time()
+                if sym in last_sent and (now_ts - last_sent[sym]) < 60:
+                    continue
 
-            time.sleep(interval_sec)
+                msg = format_alert(sym, sig, candle_pass, candle_msg, candle_mode)
+                send_telegram(msg)
+                last_sent[sym] = now_ts
 
-        except Exception as e:
-            # send ONE error message, then sleep a bit to avoid spam
-            err_txt = f"⚠️ Bot error: {type(e).__name__}: {str(e)}"
-            try:
-                send_telegram(err_txt)
-            except Exception:
-                pass
-            # also print stack for Render logs
-            traceback.print_exc()
-            time.sleep(30)
+            except Exception as e:
+                # خطأ واحد لا يطيّح البوت كله
+                try:
+                    send_telegram(f"⚠️ Bot error ({sym}): {type(e).__name__}: {str(e)[:180]}")
+                except Exception:
+                    pass
+
+        time.sleep(interval_sec)
 
 
 if __name__ == "__main__":
