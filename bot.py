@@ -13,25 +13,10 @@ def env(name, default=None):
     v = os.getenv(name, default)
     if v is None or str(v).strip() == "":
         raise RuntimeError(f"Missing env var: {name}")
-    return str(v).strip()
-
-
-def parse_symbols(raw: str) -> list[str]:
-    # split + strip + remove empties + de-dup while preserving order
-    items = []
-    seen = set()
-    for s in raw.split(","):
-        s = s.strip().upper()
-        if not s:
-            continue
-        if s not in seen:
-            seen.add(s)
-            items.append(s)
-    return items
+    return v.strip()
 
 
 def send_telegram(msg: str):
-    # لا تخلي فشل التليجرام يطيّح البوت
     try:
         token = env("TELEGRAM_BOT_TOKEN")
         chat_id = env("TELEGRAM_CHAT_ID")
@@ -42,20 +27,17 @@ def send_telegram(msg: str):
             "text": msg,
             "disable_web_page_preview": True,
         }
-        requests.post(url, json=payload, timeout=10)
-    except Exception:
-        # نتجاهل أي خطأ في التليجرام عشان البوت يكمل
-        pass
+
+        r = requests.post(url, json=payload, timeout=10)
+        print("TELEGRAM STATUS:", r.status_code, r.text)
+
+    except Exception as e:
+        print("TELEGRAM ERROR:", e)
 
 
 # ========= main =========
 def main():
-    symbols = parse_symbols(env("SYMBOLS"))
-
-    # ✅ إضافة MU تلقائياً لو ناقص (عشان طلبته)
-    if "MU" not in symbols:
-        symbols.append("MU")
-
+    symbols = env("SYMBOLS").split(",")
     interval = int(os.getenv("INTERVAL_SEC", "15"))
 
     client = StockHistoricalDataClient(
@@ -63,16 +45,15 @@ def main():
         secret_key=env("APCA_API_SECRET_KEY"),
     )
 
+    # 🔔 رسالة تشغيل البوت
     send_telegram(
         "✅ Bot started (ALERTS ONLY)\n"
-        f"📊 Monitoring: {', '.join(symbols)}\n"
+        f"📊 Symbols: {', '.join(symbols)}\n"
         f"⏱ Interval: {interval}s\n"
-        f"🕒 Time(UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
+        f"🕒 Time: {datetime.now(timezone.utc)}"
     )
 
-    # نخزن آخر اتجاه لكل سهم عشان ما نرسل تكرار
-    # values: "UP" / "DOWN" / None
-    last_dir: dict[str, str | None] = {s: None for s in symbols}
+    print("BOT STARTED | symbols:", symbols)
 
     while True:
         try:
@@ -82,32 +63,20 @@ def main():
                     timeframe=TimeFrame.Minute,
                     limit=3
                 )
+
                 bars = client.get_stock_bars(req).data.get(sym, [])
+
                 if len(bars) < 2:
                     continue
 
                 last = bars[-1]
                 prev = bars[-2]
 
-                direction = None
                 if last.close > prev.close:
-                    direction = "UP"
-                elif last.close < prev.close:
-                    direction = "DOWN"
-                else:
-                    # مساوي: لا نرسل شيء
-                    continue
-
-                # أرسل فقط إذا تغير الاتجاه أو أول مرة
-                if last_dir.get(sym) != direction:
-                    last_dir[sym] = direction
-
-                    arrow = "📈" if direction == "UP" else "📉"
                     send_telegram(
-                        f"{arrow} {sym} {direction}\n"
+                        f"📈 {sym} UP\n"
                         f"Price: {last.close}\n"
-                        f"Prev:  {prev.close}\n"
-                        f"Time(UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
+                        f"Time: {datetime.now(timezone.utc)}"
                     )
 
             time.sleep(interval)
