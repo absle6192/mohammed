@@ -13,14 +13,10 @@ def env(name, default=None):
     v = os.getenv(name, default)
     if v is None or str(v).strip() == "":
         raise RuntimeError(f"Missing env var: {name}")
-    return str(v).strip()
+    return v.strip()
 
 
-def send_telegram(msg: str) -> bool:
-    """
-    Returns True if message sent successfully, else False.
-    Writes failure reason to stdout so Render Application logs show it.
-    """
+def send_telegram(msg: str):
     token = env("TELEGRAM_BOT_TOKEN")
     chat_id = env("TELEGRAM_CHAT_ID")
 
@@ -29,51 +25,32 @@ def send_telegram(msg: str) -> bool:
         "chat_id": chat_id,
         "text": msg,
         "disable_web_page_preview": True,
-        # إذا تبي بدون صوت، حط TELEGRAM_SILENT=1 في env
-        "disable_notification": env("TELEGRAM_SILENT", "0") in ("1", "true", "True"),
     }
 
-    last_err = None
-    for attempt in range(1, 4):  # 3 retries
-        try:
-            r = requests.post(url, json=payload, timeout=15)
-            if r.status_code == 200:
-                return True
+    r = requests.post(url, json=payload, timeout=10)
 
-            # Telegram returns useful JSON error
-            last_err = f"HTTP {r.status_code} | {r.text}"
-            print(f"[TELEGRAM] send failed attempt={attempt}: {last_err}", flush=True)
-            time.sleep(1.5)
-
-        except Exception as e:
-            last_err = repr(e)
-            print(f"[TELEGRAM] exception attempt={attempt}: {last_err}", flush=True)
-            time.sleep(1.5)
-
-    print(f"[TELEGRAM] giving up: {last_err}", flush=True)
-    return False
+    # 👇 مهم جداً: لو فشل الإرسال نشوفه في logs
+    if r.status_code != 200:
+        raise RuntimeError(f"Telegram error {r.status_code}: {r.text}")
 
 
 # ========= main =========
 def main():
-    symbols = [s.strip().upper() for s in env("SYMBOLS").split(",") if s.strip()]
+    symbols = [s.strip() for s in env("SYMBOLS").split(",")]
     interval = int(env("INTERVAL_SEC", "15"))
-
-    print(f"[BOOT] starting... symbols={symbols} interval={interval}s", flush=True)
 
     client = StockHistoricalDataClient(
         api_key=env("APCA_API_KEY_ID"),
         secret_key=env("APCA_API_SECRET_KEY"),
     )
 
-    # ✅ Startup ping (the one you expect)
-    ok = send_telegram(
-        "✅ Bot started (ALERTS ONLY)\n"
-        f"symbols={','.join(symbols)}\n"
-        f"interval={interval}s\n"
-        f"time(utc)={datetime.now(timezone.utc).isoformat(timespec='seconds')}"
+    # ✅ رسالة تأكيد تشغيل (إجبارية)
+    send_telegram(
+        "🚀 BOT STARTED (ALERTS ONLY)\n\n"
+        f"📊 Symbols: {', '.join(symbols)}\n"
+        f"⏱ Interval: {interval}s\n"
+        f"🕒 Time: {datetime.now(timezone.utc)} UTC"
     )
-    print(f"[BOOT] startup telegram sent={ok}", flush=True)
 
     while True:
         try:
@@ -95,14 +72,14 @@ def main():
                     send_telegram(
                         f"📈 {sym} UP\n"
                         f"Price: {last.close}\n"
-                        f"Time(UTC): {datetime.now(timezone.utc).isoformat(timespec='seconds')}"
+                        f"Time: {datetime.now(timezone.utc)}"
                     )
 
             time.sleep(interval)
 
         except Exception as e:
-            print(f"[ERROR] loop exception: {repr(e)}", flush=True)
-            send_telegram(f"⚠️ Bot error:\n{e}")
+            # 👇 أي خطأ لازم يوصل تيليجرام
+            send_telegram(f"⚠️ BOT ERROR:\n{e}")
             time.sleep(10)
 
 
