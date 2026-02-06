@@ -2,7 +2,7 @@ import os
 import time
 import math
 import requests
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
@@ -10,7 +10,7 @@ from alpaca.data.timeframe import TimeFrame
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
+from alpaca.trading.requests import LimitOrderRequest
 
 
 # ===================== env helpers =====================
@@ -59,8 +59,8 @@ def send_telegram(msg: str) -> None:
 # ===================== market data =====================
 def get_last_two_closed_1m_bars(data_client: StockHistoricalDataClient, sym: str):
     """
-    Returns (prev_bar, last_closed_bar) using 1m bars.
-    We request last 3 bars, and take [-3] and [-2] to avoid the currently-forming bar.
+    Return (prev_closed, last_closed) using 1m bars.
+    We take [-3] and [-2] to avoid the currently-forming bar.
     """
     req = StockBarsRequest(
         symbol_or_symbols=sym,
@@ -70,21 +70,11 @@ def get_last_two_closed_1m_bars(data_client: StockHistoricalDataClient, sym: str
     bars = data_client.get_stock_bars(req).data.get(sym, [])
     if len(bars) < 3:
         return None, None
-    prev_closed = bars[-3]
-    last_closed = bars[-2]
-    return prev_closed, last_closed
+    return bars[-3], bars[-2]
 
 
 # ===================== trading helpers =====================
-def safe_float(x) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return float("nan")
-
-
 def round_price(p: float) -> float:
-    # Most US stocks trade in $0.01 increments
     return round(p, 2)
 
 
@@ -95,10 +85,6 @@ def place_limit_notional(
     notional_usd: float,
     limit_price: float,
 ) -> str:
-    """
-    Place a limit order using notional sizing.
-    NOTE: Alpaca limit orders accept qty, not notional. We approximate qty = floor(notional/price).
-    """
     qty = math.floor(notional_usd / max(limit_price, 0.01))
     if qty <= 0:
         raise RuntimeError(f"qty computed <= 0 for {sym} at price {limit_price}")
@@ -114,15 +100,29 @@ def place_limit_notional(
     return o.id
 
 
+def cancel_all_open_orders(trading: TradingClient) -> int:
+    """
+    Cancel all open orders. Returns count of canceled orders (best-effort).
+    """
+    try:
+        orders = trading.get_orders(status="open")
+    except Exception:
+        orders = []
+    n = 0
+    for o in orders:
+        try:
+            trading.cancel_order_by_id(o.id)
+            n += 1
+        except Exception as e:
+            print("[CANCEL_FAIL]", getattr(o, "id", "?"), repr(e), flush=True)
+    return n
+
+
 def close_position_market(trading: TradingClient, sym: str) -> None:
-    """
-    Close a position immediately using market order (paper).
-    """
-    # Alpaca has close_position method in REST; alpaca-py supports it via trading client:
     trading.close_position(sym)
 
 
-# ===================== strategy core =====================
+# ===================== main =====================
 def main():
     # ---- config ----
     symbols = [s.strip().upper() for s in env("SYMBOLS").split(",") if s.strip()]
@@ -133,9 +133,11 @@ def main():
     stop_loss_usd = env_float("STOP_LOSS_USD", "150")
     daily_target_usd = env_float("DAILY_TARGET_USD", "300")
 
-    # 1 bps = 0.01%. We use small offset so limit has higher chance to fill without “chasing”.
-    limit_offset_bps = env_float("LIMIT_OFFSET_BPS", "1")  # default 1 bps = 0.01%
+    limit_offset_bps = env_float("LIMIT_OFFSET_BPS", "1")  # 1 bps = 0.01%
     offset = limit_offset_bps / 10000.0
+
+    # ✅ خيار 2: بعد الافتتاح بدقيقتين
+    start_delay_sec = env_int("START_DELAY_SEC", "120")
 
     # ---- clients ----
     data_client = StockHistoricalDataClient(
@@ -150,12 +152,18 @@ def main():
 
     # ---- state ----
     trading_day = utc_now().date()
-    daily_realized = 0.0  # realized PnL tracked from fills/closures via positions snapshots (approx)
+    daily_realized = 0.0  # approximate
     last_seen_position_qty: dict[str, float] = {}
-    last_signal_minute: dict[str, str] = {}  # sym -> ISO minute string to prevent double-entry same minute
+    last_signal_minute: dict[str, str] = {}
+
     halted_for_day = False
 
-    # startup message
+    # market-open gating
+    was_open = None
+    open_seen_at: datetime | None = None
+    ready_to_trade = False
+
+    # Startup message
     send_telegram(
         "🚀 BOT STARTED (PAPER TRADING)\n"
         f"📊 Symbols: {', '.join(symbols)}\n"
@@ -164,6 +172,7 @@ def main():
         f"🛑 Stop/Trade: -${stop_loss_usd:,.0f}\n"
         f"🎯 Daily Target: +${daily_target_usd:,.0f}\n"
         f"🧾 Entry: LIMIT (offset {limit_offset_bps} bps)\n"
+        f"⏳ Start after open: {start_delay_sec}s\n"
         f"🕒 UTC: {utc_now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
@@ -171,27 +180,85 @@ def main():
 
     while True:
         try:
-            # reset day at UTC midnight
             now = utc_now()
+
+            # reset day at UTC midnight
             if now.date() != trading_day:
                 trading_day = now.date()
                 daily_realized = 0.0
                 halted_for_day = False
                 last_signal_minute.clear()
+                open_seen_at = None
+                ready_to_trade = False
                 send_telegram(f"🗓 New UTC day: {trading_day} — counters reset. ✅")
                 print("[DAY_RESET]", trading_day, flush=True)
 
-            # fetch positions
+            # ----- market clock -----
+            clock = trading.get_clock()
+            is_open = bool(clock.is_open)
+
+            # On close: cancel any open orders and block trading
+            if was_open is None:
+                was_open = is_open
+
+            if not is_open:
+                if was_open:  # just transitioned open -> closed
+                    send_telegram("🛑 Market is CLOSED now. Canceling open orders.")
+                canceled = cancel_all_open_orders(trading)
+                if canceled > 0:
+                    print(f"[CANCEL] canceled={canceled} (market closed)", flush=True)
+                open_seen_at = None
+                ready_to_trade = False
+                was_open = is_open
+                time.sleep(interval_sec)
+                continue
+
+            # is_open == True here
+            if (was_open is False) and is_open:
+                # just opened
+                open_seen_at = now
+                ready_to_trade = False
+                send_telegram(
+                    "🔔 Market OPEN detected.\n"
+                    f"⏳ Waiting {start_delay_sec}s before placing ANY orders."
+                )
+
+            was_open = is_open
+
+            # If bot started during open and open_seen_at is None, be safe: wait delay from now once
+            if open_seen_at is None:
+                open_seen_at = now
+                ready_to_trade = False
+                send_telegram(
+                    "🔔 Market is already OPEN.\n"
+                    f"⏳ Safety wait {start_delay_sec}s before trading."
+                )
+
+            # Wait 2 minutes after open
+            elapsed = (now - open_seen_at).total_seconds()
+            if elapsed < start_delay_sec:
+                # no orders before delay
+                remaining = int(start_delay_sec - elapsed)
+                print(f"[WAIT_AFTER_OPEN] remaining={remaining}s", flush=True)
+                time.sleep(min(interval_sec, 10))
+                continue
+            else:
+                if not ready_to_trade:
+                    ready_to_trade = True
+                    send_telegram("✅ Trading enabled now (post-open delay passed).")
+
+            # ----- positions -----
             positions = {p.symbol: p for p in trading.get_all_positions()}
-            # compute unrealized total
             unreal_total = 0.0
             for sym, p in positions.items():
-                unreal_total += safe_float(p.unrealized_pl) if not math.isnan(safe_float(p.unrealized_pl)) else 0.0
+                try:
+                    unreal_total += float(p.unrealized_pl)
+                except Exception:
+                    pass
 
-            # daily total (approx): realized + unrealized
             daily_total = daily_realized + unreal_total
 
-            # if daily target reached -> close everything & halt
+            # daily target reached -> close everything & halt
             if (not halted_for_day) and (daily_total >= daily_target_usd):
                 send_telegram(
                     f"🎯 Daily target reached!\n"
@@ -205,11 +272,16 @@ def main():
                     except Exception as e:
                         print("[CLOSE_FAIL]", sym, repr(e), flush=True)
                 halted_for_day = True
+                # also cancel any remaining open orders
+                cancel_all_open_orders(trading)
 
-            # manage per-position stop loss
+            # manage stop loss per position
             for sym, p in positions.items():
-                upl = safe_float(p.unrealized_pl)
-                if not math.isnan(upl) and upl <= -abs(stop_loss_usd):
+                try:
+                    upl = float(p.unrealized_pl)
+                except Exception:
+                    continue
+                if upl <= -abs(stop_loss_usd):
                     send_telegram(
                         f"🛑 STOP HIT {sym}\n"
                         f"Unrealized: ${upl:,.2f}\n"
@@ -220,27 +292,25 @@ def main():
                     except Exception as e:
                         print("[STOP_CLOSE_FAIL]", sym, repr(e), flush=True)
 
-            # approximate realized pnl tracking:
-            # if a symbol was present before and now absent -> assume it was closed, add last unrealized to realized snapshot
-            # (This is a simple approximation; good enough for paper + daily cap behavior)
+            # basic closure notices (best-effort)
             for sym in list(last_seen_position_qty.keys()):
                 prev_qty = last_seen_position_qty.get(sym, 0.0)
-                now_pos = positions.get(sym)
-                if now_pos is None and prev_qty != 0.0:
-                    # we don't know exact realized; keep it conservative: add 0 and rely on daily_total using current positions
-                    # but notify closure
+                if sym not in positions and prev_qty != 0.0:
                     send_telegram(f"✅ Position closed: {sym}")
                     last_seen_position_qty[sym] = 0.0
 
             for sym, p in positions.items():
-                last_seen_position_qty[sym] = safe_float(p.qty)
+                try:
+                    last_seen_position_qty[sym] = float(p.qty)
+                except Exception:
+                    last_seen_position_qty[sym] = 0.0
 
-            # if halted -> do not open new trades
+            # If halted -> do not open new trades
             if halted_for_day:
                 time.sleep(interval_sec)
                 continue
 
-            # entry logic: only if no open position in that symbol
+            # ----- entry logic -----
             for sym in symbols:
                 if sym in positions:
                     continue  # already in trade
@@ -249,7 +319,6 @@ def main():
                 if prev_bar is None or last_bar is None:
                     continue
 
-                # Prevent multiple entries on the same closed minute candle
                 candle_minute_key = last_bar.timestamp.replace(second=0, microsecond=0).isoformat()
                 if last_signal_minute.get(sym) == candle_minute_key:
                     continue
@@ -257,14 +326,11 @@ def main():
                 prev_close = float(prev_bar.close)
                 last_close = float(last_bar.close)
 
-                # basic candle direction confirmation (closed candles)
                 long_signal = last_close > prev_close
                 short_signal = last_close < prev_close
-
                 if not (long_signal or short_signal):
                     continue
 
-                # build limit price with tiny offset
                 if long_signal:
                     side = OrderSide.BUY
                     limit_price = round_price(last_close * (1.0 + offset))
@@ -274,7 +340,6 @@ def main():
                     limit_price = round_price(last_close * (1.0 - offset))
                     direction = "SHORT"
 
-                # place order
                 try:
                     oid = place_limit_notional(
                         trading=trading,
@@ -289,11 +354,10 @@ def main():
                         f"📣 ENTRY {direction} | {sym}\n"
                         f"Limit: {limit_price}\n"
                         f"Candle close: {last_close} vs prev {prev_close}\n"
-                        f"Stop: -${stop_loss_usd:,.0f} (managed by bot)\n"
+                        f"Stop: -${stop_loss_usd:,.0f}\n"
                         f"Daily target: +${daily_target_usd:,.0f}\n"
                         f"Order id: {oid}"
                     )
-
                 except Exception as e:
                     print("[ENTRY_FAIL]", sym, direction, repr(e), flush=True)
 
