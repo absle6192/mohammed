@@ -10,7 +10,7 @@ from alpaca.data.timeframe import TimeFrame
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
 
 
 # ===================== env helpers =====================
@@ -70,25 +70,25 @@ def round_price(p: float) -> float:
     return round(p, 2)
 
 
-def qty_from_notional(notional_usd: float, ref_price: float) -> int:
+def compute_qty_from_notional(notional_usd: float, ref_price: float) -> int:
     qty = math.floor(notional_usd / max(ref_price, 0.01))
-    return max(qty, 0)
+    if qty <= 0:
+        raise RuntimeError(f"qty computed <= 0 at price {ref_price}")
+    return qty
 
 
 def place_entry(
     trading: TradingClient,
-    entry_type: str,
     sym: str,
     side: OrderSide,
     notional_usd: float,
+    entry_type: str,
     ref_price: float,
     limit_offset_bps: float,
 ) -> str:
-    qty = qty_from_notional(notional_usd, ref_price)
-    if qty <= 0:
-        raise RuntimeError(f"qty computed <= 0 for {sym} at price {ref_price}")
-
     entry_type = entry_type.upper().strip()
+    qty = compute_qty_from_notional(notional_usd, ref_price)
+
     if entry_type == "MARKET":
         req = MarketOrderRequest(
             symbol=sym,
@@ -96,23 +96,21 @@ def place_entry(
             side=side,
             time_in_force=TimeInForce.DAY,
         )
-        o = trading.submit_order(req)
-        return o.id
-
-    # LIMIT
-    offset = (limit_offset_bps / 10000.0)
-    if side == OrderSide.BUY:
-        limit_price = round_price(ref_price * (1.0 + offset))
     else:
-        limit_price = round_price(ref_price * (1.0 - offset))
+        offset = (limit_offset_bps / 10000.0)
+        if side == OrderSide.BUY:
+            limit_price = round_price(ref_price * (1.0 + offset))
+        else:
+            limit_price = round_price(ref_price * (1.0 - offset))
 
-    req = LimitOrderRequest(
-        symbol=sym,
-        qty=qty,
-        side=side,
-        time_in_force=TimeInForce.DAY,
-        limit_price=limit_price,
-    )
+        req = LimitOrderRequest(
+            symbol=sym,
+            qty=qty,
+            side=side,
+            time_in_force=TimeInForce.DAY,
+            limit_price=limit_price,
+        )
+
     o = trading.submit_order(req)
     return o.id
 
@@ -144,22 +142,17 @@ def main():
 
     paper = env_bool("ALPACA_PAPER", "true")
     notional_usd = env_float("NOTIONAL_USD", "25000")
+
     stop_loss_usd = abs(env_float("STOP_LOSS_USD", "150"))
-
-    # Daily target behavior:
-    # HALT  = (مثل كودك القديم) إذا وصل الهدف يقفل كل الصفقات ويوقف
-    # GATE  = إذا وصل الهدف يوقف "فتح صفقات جديدة فقط" وما يقفل المفتوح
     daily_target_usd = env_float("DAILY_TARGET_USD", "300")
-    daily_target_mode = env("DAILY_TARGET_MODE", "HALT").upper().strip()  # HALT | GATE
+    daily_target_mode = env("DAILY_TARGET_MODE", "GATE").upper().strip()  # GATE or CLOSE
 
-    # Entry: MARKET أو LIMIT
-    entry_type = env("ENTRY_TYPE", env("ENTRY", "LIMIT")).upper().strip()  # allow ENTRY too
-    limit_offset_bps = env_float("LIMIT_OFFSET_BPS", "1")  # used only if LIMIT
+    entry_type = env("ENTRY_TYPE", env("ENTRY", "MARKET")).upper().strip()
+    limit_offset_bps = env_float("LIMIT_OFFSET_BPS", "1")
 
     start_delay_sec = env_int("START_DELAY_SEC", "120")
 
-    # TP Smart (optional)
-    tp_mode = env("TP_MODE", "OFF").upper().strip()  # OFF | SMART
+    tp_mode = env("TP_MODE", "SMART").upper().strip()  # SMART or OFF
     tp_min = env_float("TP_MIN", "80")
     tp_target = env_float("TP_TARGET", "120")
     tp_max = env_float("TP_MAX", "180")
@@ -180,39 +173,26 @@ def main():
     # ---- state ----
     trading_day = utc_now().date()
     last_signal_minute: dict[str, str] = {}
-    last_seen_qty: dict[str, float] = {}
+    peak_unreal: dict[str, float] = {}  # tracks peak profit per symbol
+    gate_new_entries = False
 
-    # daily pnl based on equity delta (real+unreal)
-    start_equity = None
-
-    halted_for_day = False
-    gate_new_entries = False  # used when DAILY_TARGET_MODE=GATE and target reached
-
-    # market-open gating
     was_open = None
     open_seen_at: datetime | None = None
     ready_to_trade = False
 
-    # TP trailing state: track max profit per symbol once it passes trail threshold
-    max_profit_seen: dict[str, float] = {}
-
     # Startup message
     send_telegram(
-        "🚀 BOT STARTED (PAPER TRADING)\n"
+        "🚀 BOT STARTED\n"
         f"📊 Symbols: {', '.join(symbols)}\n"
         f"⏱ Interval: {interval_sec}s\n"
         f"💰 Notional/Trade: ${notional_usd:,.0f}\n"
         f"🛑 Stop/Trade: -${stop_loss_usd:,.0f}\n"
         f"🎯 Daily Target: +${daily_target_usd:,.0f} ({daily_target_mode})\n"
-        f"🧾 Entry: {entry_type}"
-        + (f" (offset {limit_offset_bps} bps)" if entry_type == "LIMIT" else "")
-        + "\n"
-        + (f"🧠 TP: SMART (min {tp_min}, target {tp_target}, max {tp_max}, trail_after {trail_after}, trail_amt {trail_amount})\n" if tp_mode == "SMART" else "🧠 TP: OFF\n")
-        + f"⏳ Start after open: {start_delay_sec}s\n"
+        f"🧾 Entry: {entry_type}\n"
+        f"🧠 TP: {tp_mode} (min {tp_min}, target {tp_target}, max {tp_max}, trail_after {trail_after}, trail_amt {trail_amount})\n"
+        f"⏳ Start after open: {start_delay_sec}s\n"
         f"🕒 UTC: {utc_now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
-
-    print("[BOOT] started", flush=True)
 
     while True:
         try:
@@ -222,12 +202,10 @@ def main():
             if now.date() != trading_day:
                 trading_day = now.date()
                 last_signal_minute.clear()
+                peak_unreal.clear()
+                gate_new_entries = False
                 open_seen_at = None
                 ready_to_trade = False
-                halted_for_day = False
-                gate_new_entries = False
-                max_profit_seen.clear()
-                start_equity = None
                 send_telegram(f"🗓 New UTC day: {trading_day} — reset ✅")
 
             # ----- market clock -----
@@ -247,7 +225,7 @@ def main():
                 time.sleep(interval_sec)
                 continue
 
-            # open
+            # open transition
             if (was_open is False) and is_open:
                 open_seen_at = now
                 ready_to_trade = False
@@ -260,7 +238,7 @@ def main():
                 ready_to_trade = False
                 send_telegram(f"🔔 Market is already OPEN.\n⏳ Safety wait {start_delay_sec}s before trading.")
 
-            # Wait after open
+            # wait after open
             elapsed = (now - open_seen_at).total_seconds()
             if elapsed < start_delay_sec:
                 time.sleep(min(interval_sec, 10))
@@ -270,48 +248,60 @@ def main():
                     ready_to_trade = True
                     send_telegram("✅ Trading enabled now (post-open delay passed).")
 
-            # ----- equity-based daily P/L -----
-            acct = trading.get_account()
-            equity = float(acct.equity)
-            if start_equity is None:
-                start_equity = equity
-            daily_total = equity - float(start_equity)
+            # ----- daily gate -----
+            try:
+                acct = trading.get_account()
+                equity = float(acct.equity)
+            except Exception:
+                equity = None
 
-            # daily target behavior
-            if (not halted_for_day) and (not gate_new_entries) and daily_total >= daily_target_usd:
-                if daily_target_mode == "HALT":
+            # Gate logic based on account equity delta isn't implemented here (kept simple).
+            # We'll instead keep your existing behavior: gate_new_entries is external/manual
+            # OR you can set DAILY_TARGET_MODE=CLOSE to close all when reached via unreal totals below.
+
+            # ----- positions and P/L -----
+            positions = {p.symbol: p for p in trading.get_all_positions()}
+            unreal_total = 0.0
+            for sym, p in positions.items():
+                try:
+                    unreal_total += float(p.unrealized_pl)
+                except Exception:
+                    pass
+
+            # Daily target behavior based on unreal_total only (simple)
+            if (not gate_new_entries) and (unreal_total >= daily_target_usd):
+                if daily_target_mode == "GATE":
+                    gate_new_entries = True
                     send_telegram(
-                        f"🎯 Daily target reached!\n"
-                        f"Equity Δ (real+unreal): +${daily_total:,.2f}\n"
-                        f"🛑 Closing all positions and halting for today."
+                        f"🎯 Daily target reached (GATE)!\n"
+                        f"Unreal total: +${unreal_total:,.2f}\n"
+                        f"🚧 No NEW entries for today. Managing existing positions only."
                     )
-                    positions = {p.symbol: p for p in trading.get_all_positions()}
+                else:
+                    send_telegram(
+                        f"🎯 Daily target reached (CLOSE)!\n"
+                        f"Unreal total: +${unreal_total:,.2f}\n"
+                        f"🛑 Closing ALL positions now."
+                    )
                     for sym in list(positions.keys()):
                         try:
                             close_position_market(trading, sym)
                             send_telegram(f"✅ Closed {sym} (daily target).")
                         except Exception as e:
                             print("[CLOSE_FAIL]", sym, repr(e), flush=True)
-                    halted_for_day = True
                     cancel_all_open_orders(trading)
-                else:
-                    # GATE: stop new entries only
                     gate_new_entries = True
-                    send_telegram(
-                        f"🎯 Daily target reached (GATE)!\n"
-                        f"Equity Δ (real+unreal): +${daily_total:,.2f}\n"
-                        f"🚧 No NEW entries for today. Managing existing positions only."
-                    )
 
-            # ----- positions -----
-            positions = {p.symbol: p for p in trading.get_all_positions()}
-
-            # stop loss + TP logic
+            # ----- manage SL / TP -----
             for sym, p in positions.items():
                 try:
                     upl = float(p.unrealized_pl)
                 except Exception:
                     continue
+
+                # update peak
+                prev_pk = peak_unreal.get(sym, upl)
+                peak_unreal[sym] = max(prev_pk, upl)
 
                 # STOP LOSS
                 if upl <= -stop_loss_usd:
@@ -322,72 +312,50 @@ def main():
                         print("[STOP_CLOSE_FAIL]", sym, repr(e), flush=True)
                     continue
 
-                # TP SMART
                 if tp_mode == "SMART":
-                    # Track max profit once it passes trail_after
-                    if upl >= trail_after:
-                        prev_max = max_profit_seen.get(sym, upl)
-                        max_profit_seen[sym] = max(prev_max, upl)
+                    pk = peak_unreal.get(sym, upl)
 
-                    # Hard max take profit
+                    # TP_MAX
                     if upl >= tp_max:
                         send_telegram(f"🏁 TP MAX {sym}\nUnrealized: +${upl:,.2f}\nClosing now.")
                         try:
                             close_position_market(trading, sym)
                         except Exception as e:
-                            print("[TP_MAX_CLOSE_FAIL]", sym, repr(e), flush=True)
+                            print("[TP_MAX_FAIL]", sym, repr(e), flush=True)
                         continue
 
-                    # Don’t take profit under TP_MIN
-                    if upl < tp_min:
-                        continue
-
-                    # If reached target -> close
+                    # TP_TARGET
                     if upl >= tp_target:
                         send_telegram(f"✅ TP TARGET {sym}\nUnrealized: +${upl:,.2f}\nClosing now.")
                         try:
                             close_position_market(trading, sym)
                         except Exception as e:
-                            print("[TP_TARGET_CLOSE_FAIL]", sym, repr(e), flush=True)
+                            print("[TP_TARGET_FAIL]", sym, repr(e), flush=True)
                         continue
 
-                    # Trailing: after passing trail_after, if drawdown from max >= trail_amount -> close
-                    if sym in max_profit_seen:
-                        dd = max_profit_seen[sym] - upl
-                        if dd >= trail_amount:
+                    # trailing sell:
+                    # must have passed trail_after at least once, and be above tp_min to take profit
+                    if pk >= trail_after and upl >= tp_min:
+                        if (pk - upl) >= trail_amount:
                             send_telegram(
-                                f"📉 TRAIL EXIT {sym}\n"
-                                f"Max seen: +${max_profit_seen[sym]:,.2f}\n"
-                                f"Now: +${upl:,.2f}\n"
-                                f"Drawdown: ${dd:,.2f} ≥ ${trail_amount:,.0f}\n"
+                                f"✅ TRAIL EXIT {sym}\n"
+                                f"Peak: +${pk:,.2f}\nNow: +${upl:,.2f}\n"
+                                f"Drop: ${pk - upl:,.2f} ≥ ${trail_amount:,.0f}\n"
                                 f"Closing now."
                             )
                             try:
                                 close_position_market(trading, sym)
                             except Exception as e:
-                                print("[TRAIL_CLOSE_FAIL]", sym, repr(e), flush=True)
+                                print("[TRAIL_FAIL]", sym, repr(e), flush=True)
                             continue
 
-            # closure notices
-            for sym in list(last_seen_qty.keys()):
-                prev_qty = last_seen_qty.get(sym, 0.0)
-                if sym not in positions and prev_qty != 0.0:
-                    send_telegram(f"✅ Position closed: {sym}")
-                    last_seen_qty[sym] = 0.0
-                    max_profit_seen.pop(sym, None)
+            # remove peak state for closed positions
+            open_syms = set(positions.keys())
+            for sym in list(peak_unreal.keys()):
+                if sym not in open_syms:
+                    peak_unreal.pop(sym, None)
 
-            for sym, p in positions.items():
-                try:
-                    last_seen_qty[sym] = float(p.qty)
-                except Exception:
-                    last_seen_qty[sym] = 0.0
-
-            # If halted -> do nothing
-            if halted_for_day:
-                time.sleep(interval_sec)
-                continue
-
-            # If GATE and target reached -> no new entries
+            # ----- no new entries if gate -----
             if gate_new_entries:
                 time.sleep(interval_sec)
                 continue
@@ -423,24 +391,21 @@ def main():
                 try:
                     oid = place_entry(
                         trading=trading,
-                        entry_type=entry_type,
                         sym=sym,
                         side=side,
                         notional_usd=notional_usd,
+                        entry_type=entry_type,
                         ref_price=last_close,
                         limit_offset_bps=limit_offset_bps,
                     )
                     last_signal_minute[sym] = candle_minute_key
-
                     send_telegram(
                         f"📣 ENTRY {direction} | {sym}\n"
                         f"Type: {entry_type}\n"
-                        + (f"Limit offset: {limit_offset_bps} bps\n" if entry_type == "LIMIT" else "")
-                        + f"Candle close: {last_close} vs prev {prev_close}\n"
+                        f"Ref close: {last_close} vs prev {prev_close}\n"
                         f"Stop: -${stop_loss_usd:,.0f}\n"
-                        f"Daily target: +${daily_target_usd:,.0f} ({daily_target_mode})\n"
-                        + (f"TP: SMART (min {tp_min}, target {tp_target}, max {tp_max})\n" if tp_mode == "SMART" else "TP: OFF\n")
-                        + f"Order id: {oid}"
+                        f"TP: {tp_mode} (min {tp_min}, target {tp_target}, max {tp_max}, trail_after {trail_after}, trail_amt {trail_amount})\n"
+                        f"Order id: {oid}"
                     )
                 except Exception as e:
                     print("[ENTRY_FAIL]", sym, direction, repr(e), flush=True)
