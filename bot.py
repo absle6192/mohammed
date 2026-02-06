@@ -17,20 +17,20 @@ def env(name, default=None):
 
 
 def send_telegram(msg: str):
+    token = env("TELEGRAM_BOT_TOKEN")
+    chat_id = env("TELEGRAM_CHAT_ID")
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": msg,
+        "disable_web_page_preview": True,
+    }
+
     try:
-        token = env("TELEGRAM_BOT_TOKEN")
-        chat_id = env("TELEGRAM_CHAT_ID")
-
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {
-            "chat_id": chat_id,
-            "text": msg,
-            "disable_web_page_preview": True,
-        }
-
         r = requests.post(url, json=payload, timeout=10)
-        print("TELEGRAM STATUS:", r.status_code, r.text)
-
+        print("TELEGRAM STATUS:", r.status_code)
+        print("TELEGRAM RESPONSE:", r.text)
     except Exception as e:
         print("TELEGRAM ERROR:", e)
 
@@ -40,20 +40,21 @@ def main():
     symbols = env("SYMBOLS").split(",")
     interval = int(os.getenv("INTERVAL_SEC", "15"))
 
+    print("BOT STARTING...")
+    print("SYMBOLS:", symbols)
+    print("INTERVAL:", interval)
+
     client = StockHistoricalDataClient(
         api_key=env("APCA_API_KEY_ID"),
         secret_key=env("APCA_API_SECRET_KEY"),
     )
 
-    # 🔔 رسالة تشغيل البوت
+    # 🔴 رسالة إجبارية عند التشغيل
     send_telegram(
-        "✅ Bot started (ALERTS ONLY)\n"
-        f"📊 Symbols: {', '.join(symbols)}\n"
-        f"⏱ Interval: {interval}s\n"
-        f"🕒 Time: {datetime.now(timezone.utc)}"
+        "✅ Bot started\n"
+        f"📊 Monitoring: {', '.join(symbols)}\n"
+        f"⏱ Interval: {interval}s"
     )
-
-    print("BOT STARTED | symbols:", symbols)
 
     while True:
         try:
@@ -63,7 +64,6 @@ def main():
                     timeframe=TimeFrame.Minute,
                     limit=3
                 )
-
                 bars = client.get_stock_bars(req).data.get(sym, [])
 
                 if len(bars) < 2:
@@ -82,6 +82,7 @@ def main():
             time.sleep(interval)
 
         except Exception as e:
+            print("BOT ERROR:", e)
             send_telegram(f"⚠️ Bot error:\n{e}")
             time.sleep(10)
 
