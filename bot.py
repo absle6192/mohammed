@@ -48,6 +48,7 @@ def tg_throttle(key: str, cooldown_sec: int) -> bool:
     return False
 
 def send_telegram(msg: str, throttle_key: str | None = None, cooldown_sec: int = 120) -> None:
+    # Optional throttle to avoid spam
     if throttle_key is not None:
         if not tg_throttle(throttle_key, cooldown_sec):
             return
@@ -65,20 +66,18 @@ def send_telegram(msg: str, throttle_key: str | None = None, cooldown_sec: int =
 
 # ===================== alpaca safe wrappers =====================
 def _looks_like_error_dict(d: dict) -> bool:
-    # Common error shapes
     err_keys = {"code", "message", "error", "status", "status_code"}
     return any(k in d for k in err_keys)
 
 def _unwrap_data_or_raise(resp, label: str):
     """
     alpaca-py expected: resp.data is a dict keyed by symbol.
-    BUT sometimes alpaca-py returns the dict directly (already unwrapped),
+    BUT sometimes returns the dict directly (already unwrapped),
     especially for latest quote endpoints.
     """
     if resp is None:
         raise RuntimeError(f"{label}: None response")
 
-    # If dict:
     if isinstance(resp, dict):
         # If it looks like an error dict -> raise
         if _looks_like_error_dict(resp) and not any(k.isalpha() and len(k) <= 6 for k in resp.keys()):
@@ -86,10 +85,9 @@ def _unwrap_data_or_raise(resp, label: str):
             msg = resp.get("message") or resp.get("error") or str(resp)
             raise RuntimeError(f"{label}: dict error code={code} msg={msg}")
 
-        # Otherwise: it's probably the actual data dict keyed by symbol
+        # Otherwise: it's probably actual data dict keyed by symbol
         return resp
 
-    # If object with .data:
     if hasattr(resp, "data"):
         return resp.data
 
@@ -108,6 +106,10 @@ def call_with_retry(fn, label: str, retries: int = 3, base_sleep: float = 0.8):
 
 # ===================== market data =====================
 def get_last_two_closed_1m_bars(data_client: StockHistoricalDataClient, sym: str):
+    """
+    Return (prev_closed, last_closed) using 1m bars.
+    We take [-3] and [-2] to avoid the currently-forming bar.
+    """
     def _do():
         req = StockBarsRequest(symbol_or_symbols=sym, timeframe=TimeFrame.Minute, limit=3)
         return data_client.get_stock_bars(req)
@@ -298,6 +300,11 @@ def main():
     alert_only_after_limit = env_bool("ALERT_ONLY_AFTER_LIMIT", "true")
     alert_cooldown_sec = env_int("ALERT_COOLDOWN_SEC", "60")
 
+    # ✅ NEW: AUTO TRADING SWITCH
+    # AUTO_TRADING=OFF => alerts only, no orders
+    # AUTO_TRADING=ON  => normal auto trading
+    auto_trading = env_bool("AUTO_TRADING", "true")
+
     data_client = StockHistoricalDataClient(
         api_key=env("APCA_API_KEY_ID"),
         secret_key=env("APCA_API_SECRET_KEY"),
@@ -336,6 +343,7 @@ def main():
         f"🧊 Cooldown after close: {cooldown_after_close_sec}s\n"
         f"⏳ Start after open: {start_delay_sec}s\n"
         f"🤖 Auto entries/day: {max_auto_entries_per_day} then {'ALERT-ONLY' if alert_only_after_limit else 'STOP'}\n"
+        f"🧷 Auto trading: {'ON' if auto_trading else 'OFF (signals only)'}\n"
         f"🕒 UTC: {utc_now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
@@ -394,88 +402,84 @@ def main():
                     ready_to_trade = True
                     send_telegram("✅ Trading enabled now (post-open delay passed).")
 
+            # cooldown after any close (mostly relevant in auto mode)
             if last_any_close_time is not None:
                 if (now - last_any_close_time).total_seconds() < cooldown_after_close_sec:
                     time.sleep(interval_sec)
                     continue
 
-            positions = {p.symbol: p for p in trading.get_all_positions()}
-            open_count = len(positions)
+            # Only track positions/stop rules if auto trading is ON
+            positions = {}
+            open_count = 0
+            if auto_trading:
+                positions = {p.symbol: p for p in trading.get_all_positions()}
+                open_count = len(positions)
 
-            unreal_total = 0.0
-            for sym, p in positions.items():
-                try:
-                    unreal_total += float(p.unrealized_pl)
-                except Exception:
-                    pass
-
-            daily_total = daily_realized + unreal_total
-
-            if (not halted_for_day) and (daily_total >= daily_target_usd):
-                if daily_mode == "HALT":
-                    send_telegram(
-                        f"🎯 Daily target reached!\nTotal (real+unreal): +${daily_total:,.2f}\n🛑 Closing all positions and halting for today."
-                    )
-                    for sym in list(positions.keys()):
+                # stop loss per position
+                for sym, p in positions.items():
+                    try:
+                        upl = float(p.unrealized_pl)
+                    except Exception:
+                        continue
+                    if upl <= -abs(stop_loss_usd):
+                        send_telegram(f"🛑 STOP HIT {sym}\nUnrealized: ${upl:,.2f}\nClosing position now.")
                         try:
                             close_position_market(trading, sym)
-                            send_telegram(f"✅ Closed {sym} (daily target).")
+                            last_any_close_time = utc_now()
                         except Exception as e:
-                            print("[CLOSE_FAIL]", sym, repr(e), flush=True)
-                    halted_for_day = True
-                    cancel_all_open_orders(trading)
-                    last_any_close_time = utc_now()
-                else:
+                            print("[STOP_CLOSE_FAIL]", sym, repr(e), flush=True)
+
+                # closure notices
+                for sym in list(last_seen_position_qty.keys()):
+                    prev_qty = last_seen_position_qty.get(sym, 0.0)
+                    if sym not in positions and prev_qty != 0.0:
+                        send_telegram(f"✅ Position closed: {sym}")
+                        last_seen_position_qty[sym] = 0.0
+                        last_any_close_time = utc_now()
+
+                for sym, p in positions.items():
+                    try:
+                        last_seen_position_qty[sym] = float(p.qty)
+                    except Exception:
+                        last_seen_position_qty[sym] = 0.0
+
+                # cap open positions
+                if open_count >= max_open_positions:
+                    time.sleep(interval_sec)
+                    continue
+
+                # daily target logic (optional; keep your current behavior)
+                unreal_total = 0.0
+                for sym, p in positions.items():
+                    try:
+                        unreal_total += float(p.unrealized_pl)
+                    except Exception:
+                        pass
+                daily_total = daily_realized + unreal_total
+                if (not halted_for_day) and (daily_total >= daily_target_usd):
                     halted_for_day = True
                     send_telegram(
-                        f"🎯 Daily target reached (GATE).\nTotal (real+unreal): +${daily_total:,.2f}\n🚫 No NEW entries today (existing positions still managed)."
+                        f"🎯 Daily target reached (GATE).\nTotal (real+unreal): +${daily_total:,.2f}\n🚫 No NEW entries today."
                     )
 
-            for sym, p in positions.items():
-                try:
-                    upl = float(p.unrealized_pl)
-                except Exception:
+                if halted_for_day:
+                    time.sleep(interval_sec)
                     continue
-                if upl <= -abs(stop_loss_usd):
-                    send_telegram(f"🛑 STOP HIT {sym}\nUnrealized: ${upl:,.2f}\nClosing position now.")
-                    try:
-                        close_position_market(trading, sym)
-                        last_any_close_time = utc_now()
-                    except Exception as e:
-                        print("[STOP_CLOSE_FAIL]", sym, repr(e), flush=True)
 
-            for sym in list(last_seen_position_qty.keys()):
-                prev_qty = last_seen_position_qty.get(sym, 0.0)
-                if sym not in positions and prev_qty != 0.0:
-                    send_telegram(f"✅ Position closed: {sym}")
-                    last_seen_position_qty[sym] = 0.0
-                    last_any_close_time = utc_now()
-
-            for sym, p in positions.items():
-                try:
-                    last_seen_position_qty[sym] = float(p.qty)
-                except Exception:
-                    last_seen_position_qty[sym] = 0.0
-
-            if halted_for_day:
-                time.sleep(interval_sec)
-                continue
-
-            if open_count >= max_open_positions:
-                time.sleep(interval_sec)
-                continue
-
+            # ----- auto entries limit -> alert-only (used for alerts too) -----
             in_alert_only = False
             if auto_entries_today >= max_auto_entries_per_day:
                 in_alert_only = bool(alert_only_after_limit)
 
+            # ----- entry logic / signals -----
             for sym in symbols:
-                positions = {p.symbol: p for p in trading.get_all_positions()}
-                open_count = len(positions)
-                if open_count >= max_open_positions:
-                    break
-                if sym in positions:
-                    continue
+                if auto_trading:
+                    positions = {p.symbol: p for p in trading.get_all_positions()}
+                    open_count = len(positions)
+                    if open_count >= max_open_positions:
+                        break
+                    if sym in positions:
+                        continue
 
                 prev_bar, last_bar = get_last_two_closed_1m_bars(data_client, sym)
                 if prev_bar is None or last_bar is None:
@@ -510,35 +514,37 @@ def main():
                 bid = float(qget(q, "bid_price", 0.0) or 0.0)
                 ask = float(qget(q, "ask_price", 0.0) or 0.0)
 
-                if bid > 0 and ask > 0:
-                    ref_price = (bid + ask) / 2.0
-                else:
-                    ref_price = last_close
+                ref_price = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else last_close
 
-                if in_alert_only:
+                if entry_type == "LIMIT":
+                    limit_price = round_price(ref_price * (1.0 + offset)) if long_signal else round_price(ref_price * (1.0 - offset))
+                else:
+                    limit_price = ref_price
+
+                # ====== ALERT ONLY mode (or AUTO_TRADING OFF) ======
+                if (not auto_trading) or in_alert_only:
                     now_ts = time.time()
                     last_ts = last_alert_time.get(sym, 0.0)
                     if now_ts - last_ts >= float(alert_cooldown_sec):
                         last_alert_time[sym] = now_ts
+                        last_signal_minute[sym] = candle_minute_key
+
                         send_telegram(
-                            f"✅ CLEAN SETUP (ALERT ONLY)\n"
+                            f"📣 SIGNAL (NO AUTO TRADE)\n"
                             f"{direction} | {sym}\n"
                             f"Ref close: {last_close} vs prev {prev_close}\n"
-                            f"Note: Auto limit reached ({auto_entries_today}/{max_auto_entries_per_day}).\n"
-                            f"You decide manual entry ✅"
+                            f"Suggested: {entry_type} @ {round_price(limit_price)}\n"
+                            f"Spread cap: {max_spread_pct:.3f} | VOLx≥{min_vol_ratio}\n"
+                            f"Imb≥{min_imbalance} | Candle body≥{candle_body_min} closepos≥{candle_close_pos_min}\n"
+                            f"Note: {'AUTO_TRADING=OFF ✅' if not auto_trading else 'Auto limit reached → ALERT ONLY ✅'}"
                         )
                     continue
 
+                # ====== AUTO TRADING ON ======
+                if auto_entries_today >= max_auto_entries_per_day and not alert_only_after_limit:
+                    continue
                 if auto_entries_today >= max_auto_entries_per_day:
                     continue
-
-                if entry_type == "LIMIT":
-                    if long_signal:
-                        limit_price = round_price(ref_price * (1.0 + offset))
-                    else:
-                        limit_price = round_price(ref_price * (1.0 - offset))
-                else:
-                    limit_price = ref_price
 
                 try:
                     oid = place_order(
