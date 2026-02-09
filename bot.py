@@ -48,7 +48,6 @@ def tg_throttle(key: str, cooldown_sec: int) -> bool:
     return False
 
 def send_telegram(msg: str, throttle_key: str | None = None, cooldown_sec: int = 120) -> None:
-    # Optional throttle to avoid spam
     if throttle_key is not None:
         if not tg_throttle(throttle_key, cooldown_sec):
             return
@@ -65,23 +64,36 @@ def send_telegram(msg: str, throttle_key: str | None = None, cooldown_sec: int =
         print("[TELEGRAM_EXCEPTION]", repr(e), flush=True)
 
 # ===================== alpaca safe wrappers =====================
+def _looks_like_error_dict(d: dict) -> bool:
+    # Common error shapes
+    err_keys = {"code", "message", "error", "status", "status_code"}
+    return any(k in d for k in err_keys)
+
 def _unwrap_data_or_raise(resp, label: str):
     """
     alpaca-py expected: resp.data is a dict keyed by symbol.
-    Sometimes failures return dict directly (error JSON).
+    BUT sometimes alpaca-py returns the dict directly (already unwrapped),
+    especially for latest quote endpoints.
     """
     if resp is None:
         raise RuntimeError(f"{label}: None response")
 
+    # If dict:
     if isinstance(resp, dict):
-        code = resp.get("code") or resp.get("status") or resp.get("status_code")
-        msg = resp.get("message") or resp.get("error") or str(resp)
-        raise RuntimeError(f"{label}: dict error code={code} msg={msg}")
+        # If it looks like an error dict -> raise
+        if _looks_like_error_dict(resp) and not any(k.isalpha() and len(k) <= 6 for k in resp.keys()):
+            code = resp.get("code") or resp.get("status") or resp.get("status_code")
+            msg = resp.get("message") or resp.get("error") or str(resp)
+            raise RuntimeError(f"{label}: dict error code={code} msg={msg}")
 
-    if not hasattr(resp, "data"):
-        raise RuntimeError(f"{label}: missing .data (type={type(resp)})")
+        # Otherwise: it's probably the actual data dict keyed by symbol
+        return resp
 
-    return resp.data
+    # If object with .data:
+    if hasattr(resp, "data"):
+        return resp.data
+
+    raise RuntimeError(f"{label}: missing .data (type={type(resp)})")
 
 def call_with_retry(fn, label: str, retries: int = 3, base_sleep: float = 0.8):
     last_err = None
@@ -90,17 +102,12 @@ def call_with_retry(fn, label: str, retries: int = 3, base_sleep: float = 0.8):
             return fn()
         except Exception as e:
             last_err = e
-            # backoff + jitter
             sleep_s = base_sleep * (2 ** i) + random.uniform(0, 0.25)
             time.sleep(sleep_s)
     raise last_err
 
 # ===================== market data =====================
 def get_last_two_closed_1m_bars(data_client: StockHistoricalDataClient, sym: str):
-    """
-    Return (prev_closed, last_closed) using 1m bars.
-    We take [-3] and [-2] to avoid the currently-forming bar.
-    """
     def _do():
         req = StockBarsRequest(symbol_or_symbols=sym, timeframe=TimeFrame.Minute, limit=3)
         return data_client.get_stock_bars(req)
@@ -121,6 +128,14 @@ def get_latest_quote(data_client: StockHistoricalDataClient, sym: str):
     resp = call_with_retry(_do, label=f"quote:{sym}", retries=3, base_sleep=0.6)
     data = _unwrap_data_or_raise(resp, label=f"quote:{sym}")
     return data.get(sym)
+
+# ===================== quote helpers (support dict OR object) =====================
+def qget(q, key: str, default=None):
+    if q is None:
+        return default
+    if isinstance(q, dict):
+        return q.get(key, default)
+    return getattr(q, key, default)
 
 # ===================== trading helpers =====================
 def round_price(p: float) -> float:
@@ -224,10 +239,10 @@ def quote_passes_filters(q, direction: str, max_spread_pct: float, min_imbalance
     if q is None:
         return False, "no_quote"
 
-    bid = float(getattr(q, "bid_price", 0.0) or 0.0)
-    ask = float(getattr(q, "ask_price", 0.0) or 0.0)
-    bid_sz = float(getattr(q, "bid_size", 0.0) or 0.0)
-    ask_sz = float(getattr(q, "ask_size", 0.0) or 0.0)
+    bid = float(qget(q, "bid_price", 0.0) or 0.0)
+    ask = float(qget(q, "ask_price", 0.0) or 0.0)
+    bid_sz = float(qget(q, "bid_size", 0.0) or 0.0)
+    ask_sz = float(qget(q, "ask_size", 0.0) or 0.0)
 
     if bid <= 0 or ask <= 0 or ask <= bid:
         return False, f"bad_bidask bid={bid} ask={ask}"
@@ -253,8 +268,6 @@ def quote_passes_filters(q, direction: str, max_spread_pct: float, min_imbalance
 # ===================== main =====================
 def main():
     symbols = [s.strip().upper() for s in env("SYMBOLS").split(",") if s.strip()]
-
-    # IMPORTANT: الافضل 30 مؤقتًا لتقليل rate limit
     interval_sec = env_int("INTERVAL_SEC", "30")
 
     paper = env_bool("ALPACA_PAPER", "true")
@@ -262,15 +275,14 @@ def main():
     stop_loss_usd = env_float("STOP_LOSS_USD", "150")
     daily_target_usd = env_float("DAILY_TARGET_USD", "300")
 
-    daily_mode = env("DAILY_TARGET_MODE", "GATE").upper().strip()  # GATE or HALT
-    entry_type = env("ENTRY_TYPE", "MARKET").upper().strip()       # MARKET or LIMIT
+    daily_mode = env("DAILY_TARGET_MODE", "GATE").upper().strip()
+    entry_type = env("ENTRY_TYPE", "MARKET").upper().strip()
 
     limit_offset_bps = env_float("LIMIT_OFFSET_BPS", "1")
     offset = limit_offset_bps / 10000.0
 
     start_delay_sec = env_int("START_DELAY_SEC", "120")
 
-    # --- filters ---
     enable_confirm = env_bool("ENABLE_CONFIRM", "true")
     min_vol_ratio = env_float("MIN_VOL_RATIO", "1.2")
     max_spread_pct = env_float("MAX_SPREAD_PCT", "0.002")
@@ -279,14 +291,11 @@ def main():
     candle_close_pos_min = env_float("CANDLE_CLOSE_POS_MIN", "0.7")
     wick_max = env_float("WICK_MAX", "0.35")
 
-    # risk control
     max_open_positions = env_int("MAX_OPEN_POSITIONS", "2")
     cooldown_after_close_sec = env_int("COOLDOWN_AFTER_CLOSE_SEC", "90")
 
-    # NEW: max auto entries per day then alert-only
     max_auto_entries_per_day = env_int("MAX_AUTO_ENTRIES_PER_DAY", "3")
     alert_only_after_limit = env_bool("ALERT_ONLY_AFTER_LIMIT", "true")
-    # NEW: throttle for alert spam per symbol
     alert_cooldown_sec = env_int("ALERT_COOLDOWN_SEC", "60")
 
     data_client = StockHistoricalDataClient(
@@ -303,7 +312,6 @@ def main():
     daily_realized = 0.0
     last_seen_position_qty: dict[str, float] = {}
     last_signal_minute: dict[str, str] = {}
-    last_alert_minute: dict[str, str] = {}
     last_alert_time: dict[str, float] = {}
 
     halted_for_day = False
@@ -337,21 +345,18 @@ def main():
         try:
             now = utc_now()
 
-            # reset day at UTC midnight
             if now.date() != trading_day:
                 trading_day = now.date()
                 daily_realized = 0.0
                 halted_for_day = False
                 auto_entries_today = 0
                 last_signal_minute.clear()
-                last_alert_minute.clear()
                 last_alert_time.clear()
                 open_seen_at = None
                 ready_to_trade = False
                 last_any_close_time = None
                 send_telegram(f"🗓 New UTC day: {trading_day} — counters reset. ✅")
 
-            # market open/close
             clock = trading.get_clock()
             is_open = bool(clock.is_open)
 
@@ -389,13 +394,11 @@ def main():
                     ready_to_trade = True
                     send_telegram("✅ Trading enabled now (post-open delay passed).")
 
-            # cooldown after any close
             if last_any_close_time is not None:
                 if (now - last_any_close_time).total_seconds() < cooldown_after_close_sec:
                     time.sleep(interval_sec)
                     continue
 
-            # ----- positions -----
             positions = {p.symbol: p for p in trading.get_all_positions()}
             open_count = len(positions)
 
@@ -408,7 +411,6 @@ def main():
 
             daily_total = daily_realized + unreal_total
 
-            # daily target gate
             if (not halted_for_day) and (daily_total >= daily_target_usd):
                 if daily_mode == "HALT":
                     send_telegram(
@@ -429,7 +431,6 @@ def main():
                         f"🎯 Daily target reached (GATE).\nTotal (real+unreal): +${daily_total:,.2f}\n🚫 No NEW entries today (existing positions still managed)."
                     )
 
-            # stop loss per position
             for sym, p in positions.items():
                 try:
                     upl = float(p.unrealized_pl)
@@ -443,7 +444,6 @@ def main():
                     except Exception as e:
                         print("[STOP_CLOSE_FAIL]", sym, repr(e), flush=True)
 
-            # closure notices
             for sym in list(last_seen_position_qty.keys()):
                 prev_qty = last_seen_position_qty.get(sym, 0.0)
                 if sym not in positions and prev_qty != 0.0:
@@ -457,29 +457,23 @@ def main():
                 except Exception:
                     last_seen_position_qty[sym] = 0.0
 
-            # If halted (GATE/HALT) -> do not open new trades
             if halted_for_day:
                 time.sleep(interval_sec)
                 continue
 
-            # cap open positions
             if open_count >= max_open_positions:
                 time.sleep(interval_sec)
                 continue
 
-            # auto entries limit -> alert-only
             in_alert_only = False
             if auto_entries_today >= max_auto_entries_per_day:
                 in_alert_only = bool(alert_only_after_limit)
 
-            # ----- entry logic -----
             for sym in symbols:
-                # refresh open positions count each loop
                 positions = {p.symbol: p for p in trading.get_all_positions()}
                 open_count = len(positions)
                 if open_count >= max_open_positions:
                     break
-
                 if sym in positions:
                     continue
 
@@ -488,8 +482,6 @@ def main():
                     continue
 
                 candle_minute_key = last_bar.timestamp.replace(second=0, microsecond=0).isoformat()
-
-                # لا نكرر نفس دقيقة الإشارة
                 if last_signal_minute.get(sym) == candle_minute_key:
                     continue
 
@@ -504,7 +496,6 @@ def main():
                 direction = "LONG" if long_signal else "SHORT"
                 side = OrderSide.BUY if long_signal else OrderSide.SELL
 
-                # ====== CONFIRM FILTERS ======
                 if enable_confirm:
                     if not candle_passes_filters(last_bar, direction, candle_body_min, candle_close_pos_min, wick_max):
                         continue
@@ -515,37 +506,29 @@ def main():
                     if not ok:
                         continue
 
-                # entry price reference
                 q = get_latest_quote(data_client, sym)
-                if q is not None and getattr(q, "bid_price", None) and getattr(q, "ask_price", None):
-                    bid = float(q.bid_price)
-                    ask = float(q.ask_price)
+                bid = float(qget(q, "bid_price", 0.0) or 0.0)
+                ask = float(qget(q, "ask_price", 0.0) or 0.0)
+
+                if bid > 0 and ask > 0:
                     ref_price = (bid + ask) / 2.0
                 else:
                     ref_price = last_close
 
-                # If alert-only now: just notify clean setup (throttled)
                 if in_alert_only:
                     now_ts = time.time()
                     last_ts = last_alert_time.get(sym, 0.0)
                     if now_ts - last_ts >= float(alert_cooldown_sec):
                         last_alert_time[sym] = now_ts
-                        last_alert_minute[sym] = candle_minute_key
                         send_telegram(
                             f"✅ CLEAN SETUP (ALERT ONLY)\n"
                             f"{direction} | {sym}\n"
                             f"Ref close: {last_close} vs prev {prev_close}\n"
-                            f"Confirm: {'ON' if enable_confirm else 'OFF'}\n"
                             f"Note: Auto limit reached ({auto_entries_today}/{max_auto_entries_per_day}).\n"
                             f"You decide manual entry ✅"
                         )
                     continue
 
-                # if reached limit but alert_only disabled -> do nothing
-                if auto_entries_today >= max_auto_entries_per_day and not alert_only_after_limit:
-                    continue
-
-                # Also: if already used 3 entries, no auto orders
                 if auto_entries_today >= max_auto_entries_per_day:
                     continue
 
@@ -578,7 +561,6 @@ def main():
                         f"Order id: {oid}"
                     )
 
-                    # If just hit the limit, tell user we switch to alert-only
                     if auto_entries_today >= max_auto_entries_per_day and alert_only_after_limit:
                         send_telegram(
                             f"🟡 Auto limit reached ({auto_entries_today}/{max_auto_entries_per_day}).\n"
@@ -591,7 +573,6 @@ def main():
                     msg = str(e)
                     print("[ENTRY_FAIL]", sym, direction, repr(e), flush=True)
 
-                    # لو كان Rate limit، هدّئ أكثر
                     if "429" in msg or "too many" in msg.lower():
                         send_telegram(f"⚠️ Alpaca rate limit while placing order.\n{msg}",
                                       throttle_key="rate_limit", cooldown_sec=120)
@@ -606,15 +587,12 @@ def main():
             msg = str(e)
             print("[FATAL_LOOP_ERROR]", repr(e), flush=True)
 
-            # throttle errors so you don't get spammed
             send_telegram(f"⚠️ Bot loop error:\n{msg}", throttle_key="loop_error", cooldown_sec=120)
 
-            # if rate limit, sleep longer
             if "429" in msg or "too many" in msg.lower():
                 time.sleep(30)
             else:
                 time.sleep(10)
-
 
 if __name__ == "__main__":
     main()
