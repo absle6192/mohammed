@@ -267,6 +267,59 @@ def quote_passes_filters(q, direction: str, max_spread_pct: float, min_imbalance
 
     return True, f"ok spread={spread_pct:.4f} imb={imb:.2f}"
 
+# ===================== Arabic formatting helpers =====================
+def fmt_dir_ar(direction: str) -> str:
+    d = direction.upper()
+    return "شراء (LONG)" if d == "LONG" else "شورت (SHORT)"
+
+def fmt_money(x: float) -> str:
+    try:
+        return f"${x:,.2f}"
+    except Exception:
+        return str(x)
+
+def build_signal_msg_ar(
+    direction: str,
+    sym: str,
+    last_close: float,
+    prev_close: float,
+    entry_type: str,
+    suggested_price: float,
+    max_spread_pct: float,
+    min_vol_ratio: float,
+    min_imbalance: float,
+    candle_body_min: float,
+    candle_close_pos_min: float,
+    auto_trading: bool,
+    in_alert_only: bool,
+) -> str:
+    note = "AUTO_TRADING=OFF ✅" if (not auto_trading) else "تم الوصول للحد اليومي → تنبيهات فقط ✅"
+    return (
+        "📣 إشارة (بدون تنفيذ تلقائي)\n"
+        f"🎯 {fmt_dir_ar(direction)} | {sym}\n"
+        f"📌 إغلاق مرجعي: {last_close:.2f} (السابق {prev_close:.2f})\n"
+        f"💡 دخول مقترح: {entry_type} @ {round_price(suggested_price):.2f}\n"
+        f"🧪 شروط السيولة/الفلترة:\n"
+        f"• Spread ≤ {max_spread_pct:.3f}\n"
+        f"• VOLx ≥ {min_vol_ratio}\n"
+        f"• Imbalance ≥ {min_imbalance}\n"
+        f"• جسم الشمعة ≥ {candle_body_min}\n"
+        f"• موضع الإغلاق ≥ {candle_close_pos_min}\n"
+        f"🧷 ملاحظة: {note}"
+    )
+
+def build_entry_msg_ar(direction: str, sym: str, entry_type: str, last_close: float, prev_close: float,
+                      stop_loss_usd: float, auto_entries_today: int, max_auto_entries_per_day: int, oid: str) -> str:
+    return (
+        "✅ تم إرسال أمر دخول\n"
+        f"🎯 {fmt_dir_ar(direction)} | {sym}\n"
+        f"🧾 نوع الأمر: {entry_type}\n"
+        f"📌 إغلاق مرجعي: {last_close:.2f} (السابق {prev_close:.2f})\n"
+        f"🛑 ستوب للصفقة: -{fmt_money(abs(stop_loss_usd))}\n"
+        f"📊 عدد الدخول اليوم: {auto_entries_today}/{max_auto_entries_per_day}\n"
+        f"🆔 Order id: {oid}"
+    )
+
 # ===================== main =====================
 def main():
     symbols = [s.strip().upper() for s in env("SYMBOLS").split(",") if s.strip()]
@@ -300,10 +353,14 @@ def main():
     alert_only_after_limit = env_bool("ALERT_ONLY_AFTER_LIMIT", "true")
     alert_cooldown_sec = env_int("ALERT_COOLDOWN_SEC", "60")
 
-    # ✅ NEW: AUTO TRADING SWITCH
-    # AUTO_TRADING=OFF => alerts only, no orders
-    # AUTO_TRADING=ON  => normal auto trading
+    # ✅ AUTO TRADING SWITCH
     auto_trading = env_bool("AUTO_TRADING", "true")
+
+    # ✅ NEW: HEARTBEAT (طمأنة أنه شغال)
+    heartbeat_sec = env_int("HEARTBEAT_SEC", "300")  # افتراضي 5 دقائق
+    heartbeat_enabled = env_bool("HEARTBEAT_ON", "true")
+    heartbeat_log = env_bool("HEARTBEAT_LOG", "false")  # لو تبي يطبع باللوق
+    scan_log = env_bool("SCAN_LOG", "false")  # لو تبي يطبع كل دورة Scan
 
     data_client = StockHistoricalDataClient(
         api_key=env("APCA_API_KEY_ID"),
@@ -329,21 +386,25 @@ def main():
     ready_to_trade = False
     last_any_close_time: datetime | None = None
 
+    # heartbeat trackers
+    last_heartbeat_ts = 0.0
+    last_any_signal_ts = 0.0
+
     send_telegram(
-        "🚀 BOT STARTED (PAPER TRADING)\n"
-        f"📊 Symbols: {', '.join(symbols)}\n"
-        f"⏱ Interval: {interval_sec}s\n"
-        f"💰 Notional/Trade: ${notional_usd:,.0f}\n"
-        f"🛑 Stop/Trade: -${stop_loss_usd:,.0f}\n"
-        f"🎯 Daily Target: +${daily_target_usd:,.0f} ({daily_mode})\n"
-        f"🧾 Entry: {entry_type}{'' if entry_type=='MARKET' else f' (offset {limit_offset_bps} bps)'}\n"
-        f"🧠 Confirm: {'ON' if enable_confirm else 'OFF'} "
+        "🚀 تشغيل البوت (تجريبي PAPER)\n"
+        f"📊 الأسهم: {', '.join(symbols)}\n"
+        f"⏱ الفاصل: {interval_sec} ثانية\n"
+        f"💰 مبلغ الصفقة: ${notional_usd:,.0f}\n"
+        f"🛑 ستوب/صفقة: -${abs(stop_loss_usd):,.0f}\n"
+        f"🎯 هدف يومي: +${daily_target_usd:,.0f} ({daily_mode})\n"
+        f"🧾 نوع الدخول: {entry_type}{'' if entry_type=='MARKET' else f' (إزاحة {limit_offset_bps} bps)'}\n"
+        f"🧠 فلترة: {'مفعلة' if enable_confirm else 'متوقفة'} "
         f"(VOLx≥{min_vol_ratio}, spread≤{max_spread_pct:.3f}, imb≥{min_imbalance}, body≥{candle_body_min}, closepos≥{candle_close_pos_min})\n"
-        f"🔒 Max open positions: {max_open_positions}\n"
-        f"🧊 Cooldown after close: {cooldown_after_close_sec}s\n"
-        f"⏳ Start after open: {start_delay_sec}s\n"
-        f"🤖 Auto entries/day: {max_auto_entries_per_day} then {'ALERT-ONLY' if alert_only_after_limit else 'STOP'}\n"
-        f"🧷 Auto trading: {'ON' if auto_trading else 'OFF (signals only)'}\n"
+        f"🔒 أقصى مراكز مفتوحة: {max_open_positions}\n"
+        f"🧊 تهدئة بعد الإغلاق: {cooldown_after_close_sec}s\n"
+        f"⏳ بدء بعد الافتتاح: {start_delay_sec}s\n"
+        f"🤖 حد الدخول/اليوم: {max_auto_entries_per_day} ثم {'تنبيهات فقط' if alert_only_after_limit else 'توقف'}\n"
+        f"🧷 التداول التلقائي: {'ON' if auto_trading else 'OFF (تنبيهات فقط)'}\n"
         f"🕒 UTC: {utc_now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
@@ -363,7 +424,9 @@ def main():
                 open_seen_at = None
                 ready_to_trade = False
                 last_any_close_time = None
-                send_telegram(f"🗓 New UTC day: {trading_day} — counters reset. ✅")
+                last_heartbeat_ts = 0.0
+                last_any_signal_ts = 0.0
+                send_telegram(f"🗓 يوم جديد (UTC): {trading_day} — تم تصفير العدادات ✅")
 
             clock = trading.get_clock()
             is_open = bool(clock.is_open)
@@ -373,7 +436,7 @@ def main():
 
             if not is_open:
                 if was_open:
-                    send_telegram("🛑 Market is CLOSED now. Canceling open orders.")
+                    send_telegram("🛑 السوق أغلق الآن. جاري إلغاء الأوامر المفتوحة…")
                 cancel_all_open_orders(trading)
                 open_seen_at = None
                 ready_to_trade = False
@@ -384,14 +447,14 @@ def main():
             if (was_open is False) and is_open:
                 open_seen_at = now
                 ready_to_trade = False
-                send_telegram(f"🔔 Market OPEN detected.\n⏳ Waiting {start_delay_sec}s before placing ANY orders.")
+                send_telegram(f"🔔 تم رصد افتتاح السوق.\n⏳ انتظار {start_delay_sec} ثانية قبل أي دخول.")
 
             was_open = is_open
 
             if open_seen_at is None:
                 open_seen_at = now
                 ready_to_trade = False
-                send_telegram(f"🔔 Market is already OPEN.\n⏳ Safety wait {start_delay_sec}s before trading.")
+                send_telegram(f"🔔 السوق مفتوح مسبقًا.\n⏳ انتظار أمان {start_delay_sec} ثانية قبل التداول.")
 
             elapsed = (now - open_seen_at).total_seconds()
             if elapsed < start_delay_sec:
@@ -400,7 +463,7 @@ def main():
             else:
                 if not ready_to_trade:
                     ready_to_trade = True
-                    send_telegram("✅ Trading enabled now (post-open delay passed).")
+                    send_telegram("✅ تم تفعيل التداول الآن (انتهى تأخير ما بعد الافتتاح).")
 
             # cooldown after any close (mostly relevant in auto mode)
             if last_any_close_time is not None:
@@ -422,7 +485,7 @@ def main():
                     except Exception:
                         continue
                     if upl <= -abs(stop_loss_usd):
-                        send_telegram(f"🛑 STOP HIT {sym}\nUnrealized: ${upl:,.2f}\nClosing position now.")
+                        send_telegram(f"🛑 ضرب الستوب: {sym}\nالخسارة غير المحققة: {fmt_money(upl)}\nجاري إغلاق المركز الآن…")
                         try:
                             close_position_market(trading, sym)
                             last_any_close_time = utc_now()
@@ -433,7 +496,7 @@ def main():
                 for sym in list(last_seen_position_qty.keys()):
                     prev_qty = last_seen_position_qty.get(sym, 0.0)
                     if sym not in positions and prev_qty != 0.0:
-                        send_telegram(f"✅ Position closed: {sym}")
+                        send_telegram(f"✅ تم إغلاق المركز: {sym}")
                         last_seen_position_qty[sym] = 0.0
                         last_any_close_time = utc_now()
 
@@ -459,7 +522,7 @@ def main():
                 if (not halted_for_day) and (daily_total >= daily_target_usd):
                     halted_for_day = True
                     send_telegram(
-                        f"🎯 Daily target reached (GATE).\nTotal (real+unreal): +${daily_total:,.2f}\n🚫 No NEW entries today."
+                        f"🎯 تحقق الهدف اليومي (GATE).\nالإجمالي (محقق+غير محقق): +{fmt_money(daily_total)}\n🚫 لن يتم فتح صفقات جديدة اليوم."
                     )
 
                 if halted_for_day:
@@ -470,6 +533,12 @@ def main():
             in_alert_only = False
             if auto_entries_today >= max_auto_entries_per_day:
                 in_alert_only = bool(alert_only_after_limit)
+
+            # ====== دورة مسح (Scan) ======
+            any_signal_this_cycle = False
+
+            if scan_log:
+                print(f"[SCAN] {utc_now().strftime('%H:%M:%S')} symbols={len(symbols)} auto={auto_trading} entries={auto_entries_today}/{max_auto_entries_per_day}", flush=True)
 
             # ----- entry logic / signals -----
             for sym in symbols:
@@ -528,15 +597,25 @@ def main():
                     if now_ts - last_ts >= float(alert_cooldown_sec):
                         last_alert_time[sym] = now_ts
                         last_signal_minute[sym] = candle_minute_key
+                        any_signal_this_cycle = True
+                        last_any_signal_ts = now_ts
 
                         send_telegram(
-                            f"📣 SIGNAL (NO AUTO TRADE)\n"
-                            f"{direction} | {sym}\n"
-                            f"Ref close: {last_close} vs prev {prev_close}\n"
-                            f"Suggested: {entry_type} @ {round_price(limit_price)}\n"
-                            f"Spread cap: {max_spread_pct:.3f} | VOLx≥{min_vol_ratio}\n"
-                            f"Imb≥{min_imbalance} | Candle body≥{candle_body_min} closepos≥{candle_close_pos_min}\n"
-                            f"Note: {'AUTO_TRADING=OFF ✅' if not auto_trading else 'Auto limit reached → ALERT ONLY ✅'}"
+                            build_signal_msg_ar(
+                                direction=direction,
+                                sym=sym,
+                                last_close=last_close,
+                                prev_close=prev_close,
+                                entry_type=entry_type,
+                                suggested_price=limit_price,
+                                max_spread_pct=max_spread_pct,
+                                min_vol_ratio=min_vol_ratio,
+                                min_imbalance=min_imbalance,
+                                candle_body_min=candle_body_min,
+                                candle_close_pos_min=candle_close_pos_min,
+                                auto_trading=auto_trading,
+                                in_alert_only=in_alert_only,
+                            )
                         )
                     continue
 
@@ -557,20 +636,26 @@ def main():
                     )
                     auto_entries_today += 1
                     last_signal_minute[sym] = candle_minute_key
+                    any_signal_this_cycle = True
+                    last_any_signal_ts = time.time()
 
                     send_telegram(
-                        f"📣 ENTRY {direction} | {sym}\n"
-                        f"Type: {entry_type}\n"
-                        f"Ref close: {last_close} vs prev {prev_close}\n"
-                        f"Stop: -${stop_loss_usd:,.0f}\n"
-                        f"Auto entries today: {auto_entries_today}/{max_auto_entries_per_day}\n"
-                        f"Order id: {oid}"
+                        build_entry_msg_ar(
+                            direction=direction,
+                            sym=sym,
+                            entry_type=entry_type,
+                            last_close=last_close,
+                            prev_close=prev_close,
+                            stop_loss_usd=stop_loss_usd,
+                            auto_entries_today=auto_entries_today,
+                            max_auto_entries_per_day=max_auto_entries_per_day,
+                            oid=oid,
+                        )
                     )
 
                     if auto_entries_today >= max_auto_entries_per_day and alert_only_after_limit:
                         send_telegram(
-                            f"🟡 Auto limit reached ({auto_entries_today}/{max_auto_entries_per_day}).\n"
-                            f"From now: ALERT-ONLY setups ✅",
+                            f"🟡 تم الوصول للحد اليومي ({auto_entries_today}/{max_auto_entries_per_day}).\nمن الآن: تنبيهات فقط ✅",
                             throttle_key="auto_limit_notice",
                             cooldown_sec=300
                         )
@@ -580,12 +665,32 @@ def main():
                     print("[ENTRY_FAIL]", sym, direction, repr(e), flush=True)
 
                     if "429" in msg or "too many" in msg.lower():
-                        send_telegram(f"⚠️ Alpaca rate limit while placing order.\n{msg}",
+                        send_telegram("⚠️ تم تقييد الطلبات مؤقتًا من Alpaca (Rate limit).\n"
+                                      f"{msg}",
                                       throttle_key="rate_limit", cooldown_sec=120)
                         time.sleep(30)
                     else:
-                        send_telegram(f"⚠️ Entry failed {sym} {direction}\n{msg}",
+                        send_telegram("⚠️ فشل تنفيذ الدخول\n"
+                                      f"السهم: {sym}\n"
+                                      f"الاتجاه: {fmt_dir_ar(direction)}\n"
+                                      f"السبب: {msg}",
                                       throttle_key=f"entry_fail_{sym}", cooldown_sec=90)
+
+            # ====== HEARTBEAT: إذا ما فيه فرص ======
+            if heartbeat_enabled and ready_to_trade:
+                now_ts = time.time()
+                if not any_signal_this_cycle:
+                    if now_ts - last_heartbeat_ts >= float(heartbeat_sec):
+                        last_heartbeat_ts = now_ts
+                        msg = (
+                            "🤖 أنا شغّال الآن ✅\n"
+                            "🔍 أبحث عن فرص… ما لقيت شروط دخول مناسبة حاليًا.\n"
+                            f"📊 اليوم: دخول تلقائي {auto_entries_today}/{max_auto_entries_per_day}\n"
+                            f"🧷 وضع: {'تنبيهات فقط' if (not auto_trading) else ('تنبيهات فقط' if in_alert_only else 'تداول تلقائي')}"
+                        )
+                        send_telegram(msg, throttle_key="heartbeat", cooldown_sec=int(max(60, heartbeat_sec - 1)))
+                        if heartbeat_log:
+                            print(f"[HEARTBEAT] sent at {utc_now().strftime('%H:%M:%S')}", flush=True)
 
             time.sleep(interval_sec)
 
@@ -593,7 +698,7 @@ def main():
             msg = str(e)
             print("[FATAL_LOOP_ERROR]", repr(e), flush=True)
 
-            send_telegram(f"⚠️ Bot loop error:\n{msg}", throttle_key="loop_error", cooldown_sec=120)
+            send_telegram(f"⚠️ خطأ داخل حلقة البوت:\n{msg}", throttle_key="loop_error", cooldown_sec=120)
 
             if "429" in msg or "too many" in msg.lower():
                 time.sleep(30)
