@@ -4,7 +4,7 @@ import requests
 from datetime import datetime, timezone, timedelta
 
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
 
 
@@ -54,6 +54,101 @@ def strength_label(vol_ratio: float) -> str:
     return "⚠️ ضعيفة (Weak)"
 
 
+# ----------------- NEW: Early micro-confirm helpers -----------------
+def bps_to_pct(bps: float) -> float:
+    return bps / 10000.0
+
+
+def strength_rank(vol_ratio: float) -> int:
+    # 0 Weak, 1 OK, 2 Strong, 3 Strong+, 4 Very Strong
+    if vol_ratio >= 3.0:
+        return 4
+    if vol_ratio >= 2.5:
+        return 3
+    if vol_ratio >= 2.0:
+        return 2
+    if vol_ratio >= 1.3:
+        return 1
+    return 0
+
+
+def min_strength_rank(name: str) -> int:
+    name = (name or "OK").strip().upper()
+    mapping = {
+        "WEAK": 0,
+        "OK": 1,
+        "STRONG": 2,
+        "STRONG+": 3,
+        "VERY_STRONG": 4,
+        "VERY": 4,
+    }
+    return mapping.get(name, 1)
+
+
+def get_mid_and_spread_pct(client: StockHistoricalDataClient, symbol: str) -> tuple[float, float]:
+    q = client.get_stock_latest_quote(
+        StockLatestQuoteRequest(symbol_or_symbols=[symbol])
+    ).quotes[symbol]
+
+    bid = float(q.bid_price)
+    ask = float(q.ask_price)
+
+    # robust mid
+    if bid > 0 and ask > 0:
+        mid = (bid + ask) / 2.0
+        spread_pct = (ask - bid) / mid if mid > 0 else 1.0
+        return mid, spread_pct
+
+    # fallback if one side missing
+    px = float(q.ask_price or q.bid_price or 0.0)
+    return px, 1.0
+
+
+def micro_confirm_early(
+    client: StockHistoricalDataClient,
+    symbol: str,
+    side: str,  # "LONG" or "SHORT"
+    last_close_completed: float,  # price_now من الشمعة المكتملة
+    early_trigger_bps: float,
+    micro_confirm_sec: int,
+    micro_confirm_bps: float,
+    early_max_spread_pct: float,
+) -> bool:
+    # Snapshot 1
+    mid1, sp1 = get_mid_and_spread_pct(client, symbol)
+    if sp1 > early_max_spread_pct:
+        return False
+
+    trig = bps_to_pct(early_trigger_bps)
+    move1 = (mid1 - last_close_completed) / last_close_completed
+
+    # must actually move a bit in the signal direction before we confirm
+    if side == "LONG":
+        if move1 < trig:
+            return False
+    else:  # SHORT
+        if move1 > -trig:
+            return False
+
+    # Wait tiny confirmation window
+    time.sleep(max(1, int(micro_confirm_sec)))
+
+    # Snapshot 2
+    mid2, sp2 = get_mid_and_spread_pct(client, symbol)
+    if sp2 > early_max_spread_pct:
+        return False
+
+    move2 = (mid2 - last_close_completed) / last_close_completed
+    rev = bps_to_pct(micro_confirm_bps)
+
+    # reject fast reversal against direction
+    if side == "LONG":
+        return move2 >= (trig - rev)
+    else:
+        return move2 <= (-trig + rev)
+
+
+# ----------------- Candle filter -----------------
 def candle_filter_light_completed(df_all, side: str, close_pos_min: float = 0.65) -> bool:
     """
     فلتر شموع خفيف لكن على شموع مكتملة:
@@ -181,6 +276,14 @@ def main():
     candle_filter_mode = env("CANDLE_FILTER", "LIGHT").upper()  # LIGHT / OFF
     candle_close_pos_min = float(env("CANDLE_CLOSE_POS_MIN", "0.65"))
 
+    # ----------------- NEW: read EARLY micro-confirm env -----------------
+    early_mode_on = env("EARLY_MODE", "OFF").strip().upper() in ("ON", "TRUE", "1", "YES")
+    early_trigger_bps = float(env("EARLY_TRIGGER_BPS", "8"))
+    micro_confirm_sec = int(env("MICRO_CONFIRM_SEC", "3"))
+    micro_confirm_bps = float(env("MICRO_CONFIRM_BPS", "4"))
+    early_max_spread_pct = float(env("EARLY_MAX_SPREAD_PCT", env("MAX_SPREAD_PCT", "0.004")))
+    early_min_strength = min_strength_rank(env("EARLY_MIN_STRENGTH", "OK"))
+
     client = StockHistoricalDataClient(key_id, secret)
 
     last_signal_time: dict[str, datetime] = {}
@@ -195,6 +298,9 @@ def main():
         f"🔥 Volume Mult: x{volume_mult} | Min Vol Ratio: x{min_vol_ratio}\n"
         f"🧠 Late-Entry Filter: abs(move {recent_window_min}m) <= {max_recent_move_pct*100:.2f}%\n"
         f"🕯️ Candle Filter: {candle_filter_mode} | ClosePosMin: {candle_close_pos_min}\n"
+        f"⚡ Early MicroConfirm: {'ON' if early_mode_on else 'OFF'} "
+        f"| Trigger: {early_trigger_bps}bps | Confirm: {micro_confirm_sec}s/{micro_confirm_bps}bps "
+        f"| SpreadMax: {early_max_spread_pct} | MinStrength: {env('EARLY_MIN_STRENGTH','OK')}\n"
         f"🕒 Timezone: UTC\n"
         f"🕯️ Using COMPLETED candles (-2/-3)"
     )
@@ -253,7 +359,11 @@ def main():
 
                 # ===== volume baseline (completed candle) =====
                 vol_last = float(df_lb["volume"].iloc[-2])  # completed candle volume
-                vol_base = float(df_lb["volume"].iloc[:-2].mean()) if len(df_lb) > 4 else float(df_lb["volume"].mean())
+                vol_base = (
+                    float(df_lb["volume"].iloc[:-2].mean())
+                    if len(df_lb) > 4
+                    else float(df_lb["volume"].mean())
+                )
                 vol_ratio = (vol_last / vol_base) if vol_base else 0.0
 
                 vol_ok = (vol_base > 0) and (vol_last >= vol_base * volume_mult) and (vol_ratio >= min_vol_ratio)
@@ -288,6 +398,23 @@ def main():
                         candle_ok = candle_filter_light_completed(df_all, side, close_pos_min=candle_close_pos_min)
                         if not candle_ok:
                             continue
+
+                    # ----------------- NEW: micro-confirm for EARLY -----------------
+                    if early_mode_on and "EARLY" in mode_tag:
+                        # apply only if strength >= minimum
+                        if strength_rank(vol_ratio) >= early_min_strength:
+                            ok = micro_confirm_early(
+                                client=client,
+                                symbol=sym,
+                                side=side,
+                                last_close_completed=price_now,
+                                early_trigger_bps=early_trigger_bps,
+                                micro_confirm_sec=micro_confirm_sec,
+                                micro_confirm_bps=micro_confirm_bps,
+                                early_max_spread_pct=early_max_spread_pct,
+                            )
+                            if not ok:
+                                continue
 
                     key = f"{mode_tag}_{side}"
 
