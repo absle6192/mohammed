@@ -85,13 +85,26 @@ def min_strength_rank(name: str) -> int:
     return mapping.get(name, 1)
 
 
+# ✅ FIXED: supports dict OR object response across Alpaca versions
 def get_mid_and_spread_pct(client: StockHistoricalDataClient, symbol: str) -> tuple[float, float]:
-    q = client.get_stock_latest_quote(
+    resp = client.get_stock_latest_quote(
         StockLatestQuoteRequest(symbol_or_symbols=[symbol])
-    ).quotes[symbol]
+    )
 
-    bid = float(q.bid_price)
-    ask = float(q.ask_price)
+    # Some SDK versions return dict { "SYM": Quote }
+    if isinstance(resp, dict):
+        q = resp.get(symbol)
+    else:
+        # Others return object with .quotes dict
+        quotes = getattr(resp, "quotes", None)
+        q = quotes.get(symbol) if isinstance(quotes, dict) else None
+
+    if q is None:
+        return 0.0, 1.0
+
+    # q is a Quote-like object (has bid_price/ask_price)
+    bid = float(getattr(q, "bid_price", 0.0) or 0.0)
+    ask = float(getattr(q, "ask_price", 0.0) or 0.0)
 
     # robust mid
     if bid > 0 and ask > 0:
@@ -100,7 +113,7 @@ def get_mid_and_spread_pct(client: StockHistoricalDataClient, symbol: str) -> tu
         return mid, spread_pct
 
     # fallback if one side missing
-    px = float(q.ask_price or q.bid_price or 0.0)
+    px = float((getattr(q, "ask_price", 0.0) or getattr(q, "bid_price", 0.0) or 0.0))
     return px, 1.0
 
 
@@ -117,6 +130,9 @@ def micro_confirm_early(
     # Snapshot 1
     mid1, sp1 = get_mid_and_spread_pct(client, symbol)
     if sp1 > early_max_spread_pct:
+        return False
+
+    if last_close_completed <= 0:
         return False
 
     trig = bps_to_pct(early_trigger_bps)
