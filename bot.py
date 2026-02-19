@@ -5,8 +5,8 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import LimitOrderRequest 
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+from alpaca.trading.requests import LimitOrderRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -14,15 +14,15 @@ from alpaca.data.timeframe import TimeFrame
 # إعداد السجلات
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# ===================== إعدادات بوت القنوع (المتوازن) =====================
-TRADE_AMOUNT = 15000.0       # مبلغ معقول لكل صفقة
-MAX_POSITIONS = 3            # بحد أقصى 3 صفقات لزيادة الفرص دون مخاطرة عالية
-STOP_LOSS_PCT = 0.010        # وقف خسارة 1% (يحميك من التقلبات المفاجئة)
-TAKE_PROFIT_PCT = 0.015      # هدف ربح 1.5% (هدف واقعي يسهل تحقيقه)
+# ===================== إعدادات بوت القنوع (نظام السهمين) =====================
+TRADE_AMOUNT = 15000.0       
+MAX_POSITIONS = 2            # التزام بحد أقصى سهمين فقط
+STOP_LOSS_PCT = 0.010        # وقف خسارة 1%
+TAKE_PROFIT_PCT = 0.015      # هدف ربح 1.5%
 
-# فلاتر الدخول (الفرص الحقيقية فقط)
-MIN_PRICE_DIFF = 0.001       # 0.1% اختراق سعري
-MIN_VOL_RATIO = 1.5          # سيولة أعلى من المتوسط بـ 50%
+# فلاتر الدخول
+MIN_PRICE_DIFF = 0.001       
+MIN_VOL_RATIO = 1.5          
 
 def send_tg_msg(token, chat_id, text):
     if not token or not chat_id: return
@@ -41,8 +41,8 @@ def main():
     trader = TradingClient(API_KEY, SECRET_KEY, paper=IS_PAPER)
     data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
-    logging.info("⚖️ تشغيل بوت القنوع: تداول آلي مستمر بأهداف واقعية")
-    send_tg_msg(TG_TOKEN, TG_CHAT_ID, "⚖️ تم تشغيل (بوت القنوع): أهداف واقعية 1.5% وحماية 1% - تداول آلي مستمر")
+    logging.info("⚖️ تشغيل بوت القنوع (نظام السهمين كحد أقصى)")
+    send_tg_msg(TG_TOKEN, TG_CHAT_ID, "⚖️ تحديث: البوت سيلتزم بسهمين فقط. لن يفتح صفقات جديدة حتى تتقفل الحالية.")
 
     while True:
         try:
@@ -51,8 +51,21 @@ def main():
                 time.sleep(60)
                 continue
 
+            # --- فحص دقيق للمراكز المفتوحة والأوامر المعلقة ---
             positions = trader.get_all_positions()
-            
+            orders_request = GetOrdersRequest(status=QueryOrderStatus.OPEN, side=OrderSide.BUY)
+            pending_buy_orders = trader.get_orders(filter=orders_request)
+
+            # الحسبة الإجمالية: الصفقات المفتوحة + الأوامر التي بانتظار التنفيذ
+            total_active_slots = len(positions) + len(pending_buy_orders)
+
+            # إذا وصلنا للحد الأقصى (سهمين)، انتظر حتى تتقفل إحداها
+            if total_active_slots >= MAX_POSITIONS:
+                logging.info(f"⏳ الانتظار: {len(positions)} صفقات مفتوحة و {len(pending_buy_orders)} أوامر معلقة.")
+                time.sleep(40)
+                continue
+
+            # --- البحث عن فرص لسد الفراغ (Slots) المتبقي ---
             now = datetime.now(timezone.utc)
             bars_df = data_client.get_stock_bars(StockBarsRequest(
                 symbol_or_symbols=TICKERS, timeframe=TimeFrame.Minute,
@@ -64,6 +77,10 @@ def main():
                 continue
 
             for sym in TICKERS:
+                # التحقق من أن السهم ليس مفتوحاً حالياً أو معلقاً
+                if any(p.symbol == sym for p in positions) or any(o.symbol == sym for o in pending_buy_orders):
+                    continue
+
                 if sym not in bars_df.index: continue
                 df = bars_df.xs(sym).sort_index().ffill()
                 if len(df) < 10: continue
@@ -76,32 +93,28 @@ def main():
                 vol_avg = df["volume"].iloc[-10:-1].mean()
                 vol_ratio = vol_now / vol_avg
 
-                # تنفيذ استراتيجية القنوع
-                if len(positions) < MAX_POSITIONS:
-                    if any(p.symbol == sym for p in positions): continue
+                # تنفيذ الشراء إذا تحققت الشروط
+                if price_diff >= MIN_PRICE_DIFF and vol_ratio >= MIN_VOL_RATIO:
+                    qty = int(TRADE_AMOUNT / price_now)
+                    if qty <= 0: continue
 
-                    # شرط الدخول: اختراق سعري مع سيولة جيدة
-                    if price_diff >= MIN_PRICE_DIFF and vol_ratio >= MIN_VOL_RATIO:
-                        qty = int(TRADE_AMOUNT / price_now)
-                        if qty <= 0: continue
+                    limit_entry = round(price_now, 2) 
+                    tp_price = round(limit_entry * (1 + TAKE_PROFIT_PCT), 2)
+                    sl_price = round(limit_entry * (1 - STOP_LOSS_PCT), 2)
 
-                        # حساب الأسعار بدقة
-                        limit_entry = round(price_now, 2) 
-                        tp_price = round(limit_entry * (1 + TAKE_PROFIT_PCT), 2)
-                        sl_price = round(limit_entry * (1 - STOP_LOSS_PCT), 2)
-
-                        # إرسال الأمر الآلي
-                        trader.submit_order(LimitOrderRequest(
-                            symbol=sym, qty=qty, side=OrderSide.BUY,
-                            limit_price=limit_entry,
-                            time_in_force=TimeInForce.DAY, order_class=OrderClass.BRACKET,
-                            take_profit={'limit_price': tp_price}, 
-                            stop_loss={'stop_price': sl_price}
-                        ))
-                        
-                        msg = f"✅ دخول آلي (قنوع): {sym}\nالسعر: {limit_entry}\nالهدف: {tp_price}\nالحماية: {sl_price}"
-                        send_tg_msg(TG_TOKEN, TG_CHAT_ID, msg)
-                        logging.info(msg)
+                    trader.submit_order(LimitOrderRequest(
+                        symbol=sym, qty=qty, side=OrderSide.BUY,
+                        limit_price=limit_entry,
+                        time_in_force=TimeInForce.DAY, order_class=OrderClass.BRACKET,
+                        take_profit={'limit_price': tp_price}, 
+                        stop_loss={'stop_price': sl_price}
+                    ))
+                    
+                    msg = f"✅ دخول (قنوع): {sym}\nلن يفتح سهم جديد حتى تقفل هذه الصفقة أو زميلتها."
+                    send_tg_msg(TG_TOKEN, TG_CHAT_ID, msg)
+                    
+                    # نخرج من الحلقة بعد فتح عملية واحدة لضمان إعادة الفحص في الدورة القادمة
+                    break 
 
         except Exception as e:
             logging.error(f"Error: {e}")
