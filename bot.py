@@ -2,6 +2,7 @@ import os
 import time
 import requests
 import logging
+import pandas_ta as ta  # تأكد من تثبيت مكتبة pandas_ta
 from datetime import datetime, timezone, timedelta
 
 from alpaca.trading.client import TradingClient
@@ -14,15 +15,16 @@ from alpaca.data.timeframe import TimeFrame
 # إعداد السجلات
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# ===================== إعدادات بوت القنوع (نظام السهمين) =====================
+# ===================== إعدادات بوت القنوع المطور (RSI + سهمين) =====================
 TRADE_AMOUNT = 15000.0       
-MAX_POSITIONS = 2            # التزام بحد أقصى سهمين فقط
-STOP_LOSS_PCT = 0.010        # وقف خسارة 1%
-TAKE_PROFIT_PCT = 0.015      # هدف ربح 1.5%
+MAX_POSITIONS = 2            # حد أقصى سهمين فقط
+STOP_LOSS_PCT = 0.012        # وقف خسارة 1.2% (مساحة أمان جيدة)
+TAKE_PROFIT_PCT = 0.018      # هدف ربح 1.8% (واقعي وقنوع)
 
-# فلاتر الدخول
-MIN_PRICE_DIFF = 0.001       
-MIN_VOL_RATIO = 1.5          
+# فلاتر الدخول الذكية
+RSI_PERIOD = 14
+RSI_MAX = 68                 # لا يشتري إذا كان السهم متضخماً (أعلى من 68)
+MIN_VOL_RATIO = 1.5          # سيولة قوية
 
 def send_tg_msg(token, chat_id, text):
     if not token or not chat_id: return
@@ -41,8 +43,8 @@ def main():
     trader = TradingClient(API_KEY, SECRET_KEY, paper=IS_PAPER)
     data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
-    logging.info("⚖️ تشغيل بوت القنوع (نظام السهمين كحد أقصى)")
-    send_tg_msg(TG_TOKEN, TG_CHAT_ID, "⚖️ تحديث: البوت سيلتزم بسهمين فقط. لن يفتح صفقات جديدة حتى تتقفل الحالية.")
+    logging.info("🛡️ تشغيل البوت المطور (RSI + Limit + 2 Positions)")
+    send_tg_msg(TG_TOKEN, TG_CHAT_ID, "🛡️ تم التحديث: إضافة فلتر RSI لمنع الشراء عند القمم + الالتزام بسهمين فقط.")
 
     while True:
         try:
@@ -51,25 +53,19 @@ def main():
                 time.sleep(60)
                 continue
 
-            # --- فحص دقيق للمراكز المفتوحة والأوامر المعلقة ---
+            # فحص الصفقات والأوامر المعلقة
             positions = trader.get_all_positions()
             orders_request = GetOrdersRequest(status=QueryOrderStatus.OPEN, side=OrderSide.BUY)
             pending_buy_orders = trader.get_orders(filter=orders_request)
 
-            # الحسبة الإجمالية: الصفقات المفتوحة + الأوامر التي بانتظار التنفيذ
-            total_active_slots = len(positions) + len(pending_buy_orders)
-
-            # إذا وصلنا للحد الأقصى (سهمين)، انتظر حتى تتقفل إحداها
-            if total_active_slots >= MAX_POSITIONS:
-                logging.info(f"⏳ الانتظار: {len(positions)} صفقات مفتوحة و {len(pending_buy_orders)} أوامر معلقة.")
-                time.sleep(40)
+            if len(positions) + len(pending_buy_orders) >= MAX_POSITIONS:
+                time.sleep(30)
                 continue
 
-            # --- البحث عن فرص لسد الفراغ (Slots) المتبقي ---
             now = datetime.now(timezone.utc)
             bars_df = data_client.get_stock_bars(StockBarsRequest(
                 symbol_or_symbols=TICKERS, timeframe=TimeFrame.Minute,
-                start=now - timedelta(minutes=30), end=now, feed="iex"
+                start=now - timedelta(minutes=60), end=now, feed="iex"
             )).df
 
             if bars_df is None or bars_df.empty:
@@ -77,28 +73,31 @@ def main():
                 continue
 
             for sym in TICKERS:
-                # التحقق من أن السهم ليس مفتوحاً حالياً أو معلقاً
-                if any(p.symbol == sym for p in positions) or any(o.symbol == sym for o in pending_buy_orders):
-                    continue
-
+                if any(p.symbol == sym for p in positions): continue
                 if sym not in bars_df.index: continue
-                df = bars_df.xs(sym).sort_index().ffill()
-                if len(df) < 10: continue
-
-                price_now = float(df["close"].iloc[-1])
-                ma_price = df["close"].iloc[-10:-1].mean()
-                price_diff = (price_now - ma_price) / ma_price
                 
-                vol_now = float(df["volume"].iloc[-1])
-                vol_avg = df["volume"].iloc[-10:-1].mean()
-                vol_ratio = vol_now / vol_avg
+                df = bars_df.xs(sym).sort_index().ffill()
+                if len(df) < 20: continue
 
-                # تنفيذ الشراء إذا تحققت الشروط
-                if price_diff >= MIN_PRICE_DIFF and vol_ratio >= MIN_VOL_RATIO:
+                # --- حساب المؤشرات الفنية ---
+                # حساب RSI باستخدام pandas_ta
+                df['RSI'] = ta.rsi(df['close'], length=RSI_PERIOD)
+                current_rsi = df['RSI'].iloc[-1]
+                
+                price_now = float(df["close"].iloc[-1])
+                ma_price = df["close"].iloc[-15:-1].mean()
+                vol_now = float(df["volume"].iloc[-1])
+                vol_avg = df["volume"].iloc[-15:-1].mean()
+
+                # شرط الدخول المطور:
+                # 1. السعر فوق المتوسط (اتجاه صاعد)
+                # 2. RSI تحت الـ 68 (ليس متضخماً)
+                # 3. وجود سيولة قوية
+                if price_now > ma_price and current_rsi < RSI_MAX and (vol_now / vol_avg) >= MIN_VOL_RATIO:
                     qty = int(TRADE_AMOUNT / price_now)
                     if qty <= 0: continue
 
-                    limit_entry = round(price_now, 2) 
+                    limit_entry = round(price_now, 2)
                     tp_price = round(limit_entry * (1 + TAKE_PROFIT_PCT), 2)
                     sl_price = round(limit_entry * (1 - STOP_LOSS_PCT), 2)
 
@@ -110,15 +109,13 @@ def main():
                         stop_loss={'stop_price': sl_price}
                     ))
                     
-                    msg = f"✅ دخول (قنوع): {sym}\nلن يفتح سهم جديد حتى تقفل هذه الصفقة أو زميلتها."
+                    msg = f"🎯 قنص ذكي (RSI): {sym}\nRSI: {current_rsi:.2f}\nالسعر: {limit_entry}\nالهدف: {tp_price}"
                     send_tg_msg(TG_TOKEN, TG_CHAT_ID, msg)
-                    
-                    # نخرج من الحلقة بعد فتح عملية واحدة لضمان إعادة الفحص في الدورة القادمة
                     break 
 
         except Exception as e:
             logging.error(f"Error: {e}")
-            time.sleep(30)
+            time.sleep(20)
         time.sleep(20)
 
 if __name__ == "__main__":
