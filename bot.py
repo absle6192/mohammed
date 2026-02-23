@@ -4,186 +4,118 @@ import requests
 import logging
 import pandas as pd
 from datetime import datetime, timezone, timedelta
-
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
+from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# ================== إعدادات سكالب ثابتة ==================
-LOOKBACK_MIN = 40
-LOOP_SEC = 8
-ALERT_COOLDOWN_SEC = 150   # 2.5 دقيقة
+# --- إعدادات التنبيهات الفنية ---
+RSI_MAX_LONG = 68   # للدخول شراء (تجنب التضخم)
+RSI_MIN_SHORT = 35  # للدخول شورت (تجنب القاع السحيق)
+MA_WINDOW = 20      # متوسط 20 دقيقة
 
-MAX_SPREAD_PCT = 0.0022    # صارم
-MIN_VOL_RATIO = 1.25       # نشاط واضح
-MOMENTUM_BPS = 7           # زخم حقيقي
-MOMENTUM_LOOKBACK = 3
-
-RSI_MAX_LONG = 66
-RSI_MIN_SHORT = 38
-MA_WINDOW = 20
-
-# فلتر ذيل الشمعة (يمنع الانعكاس السريع)
-MAX_WICK_RATIO = 0.45
-
-
-# ================== Telegram ==================
-def send_tg(token, chat_id, text):
+def send_tg_msg(token, chat_id, text):
     if not token or not chat_id:
         return
     try:
         requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
-            timeout=10,
+            timeout=10
         )
     except Exception as e:
-        logging.error(f"Telegram error: {e}")
+        logging.error(f"Telegram Error: {e}")
 
-
-# ================== RSI ==================
-def rsi(close, window=14):
-    delta = close.diff()
-    gain = delta.clip(lower=0).rolling(window).mean()
-    loss = (-delta.clip(upper=0)).rolling(window).mean()
+def calculate_rsi(data, window=14):
+    delta = data.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-
-# ================== MAIN ==================
 def main():
     API_KEY = os.getenv("APCA_API_KEY_ID")
     SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
     TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+    TICKERS = [t.strip().upper() for t in os.getenv("TICKERS", "TSLA,AAPL,NVDA,AMD,GOOGL,MSFT,META").split(",")]
 
-    TICKERS = ["TSLA","AAPL","NVDA","AMD","GOOGL","MSFT","META"]
+    data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
-    client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+    send_tg_msg(TG_TOKEN, TG_CHAT_ID, "📡 *رادار السوق يعمل الآن*\nسأرسل تنبيهات لفرص الـ Long والـ Short.")
 
-    send_tg(TG_TOKEN, TG_CHAT_ID,
-            "🚀 سكالب رادار شغال\n"
-            "هدف: 7$–12$ خروج سريع\n"
-            "⚠️ صلاحية الإشارة 30 ثانية")
-
-    last_alert = {t: datetime.min.replace(tzinfo=timezone.utc) for t in TICKERS}
+    # سجل التنبيهات لمنع التكرار المزعج (15 دقيقة لكل سهم)
+    last_alert_time = {ticker: datetime.min.replace(tzinfo=timezone.utc) for ticker in TICKERS}
 
     while True:
         try:
             now = datetime.now(timezone.utc)
-            start = now - timedelta(minutes=LOOKBACK_MIN)
-
-            bars = client.get_stock_bars(
+            bars_df = data_client.get_stock_bars(
                 StockBarsRequest(
                     symbol_or_symbols=TICKERS,
                     timeframe=TimeFrame.Minute,
-                    start=start,
+                    start=now - timedelta(minutes=60),
                     end=now,
                     feed="iex"
                 )
             ).df
 
-            quotes = client.get_stock_latest_quote(
-                StockLatestQuoteRequest(symbol_or_symbols=TICKERS, feed="iex")
-            )
+            if bars_df is None or len(bars_df) == 0:
+                time.sleep(60)
+                continue
 
-            available = set(bars.index.get_level_values(0).unique())
+            # ✅ إصلاح مهم: bars_df غالبًا MultiIndex (symbol, timestamp)
+            available_syms = set(bars_df.index.get_level_values(0).unique().tolist())
 
             for sym in TICKERS:
-                if sym not in available:
+                if sym not in available_syms:
                     continue
 
-                df = bars.xs(sym).sort_index()
-                if len(df) < 25:
+                df = bars_df.xs(sym).sort_index()
+                if len(df) < 20:
                     continue
 
-                last = df.iloc[-1]
-                prev = df.iloc[-(MOMENTUM_LOOKBACK+1)]
+                df['rsi'] = calculate_rsi(df['close'])
 
-                price = float(last["close"])
-                prev_price = float(prev["close"])
+                # ✅ التعديل الخفيف: استخدم آخر شمعة مكتملة بدل الشمعة الحالية
+                price_now = float(df["close"].iloc[-2])
+                current_rsi = float(df['rsi'].iloc[-2])
 
-                # سبريد
-                q = quotes.get(sym)
-                if not q or not q.bid_price or not q.ask_price:
-                    continue
+                # ✅ المتوسط محسوب بدون الشمعة الحالية
+                ma_price = df["close"].iloc[-(MA_WINDOW + 2):-2].mean()
 
-                bid = float(q.bid_price)
-                ask = float(q.ask_price)
-                mid = (bid + ask) / 2
-                spread_pct = (ask - bid) / mid
+                alert_triggered = False
+                msg = ""
 
-                if spread_pct > MAX_SPREAD_PCT:
-                    continue
+                # 1. شرط الصعود (Long)
+                if price_now > ma_price and current_rsi < RSI_MAX_LONG:
+                    msg = (f"🚀 *فرصة LONG (شراء): {sym}*\n"
+                           f"💰 السعر (إغلاق آخر شمعة): {price_now:.2f}\n"
+                           f"📊 RSI: {current_rsi:.2f}\n"
+                           f"📈 الاتجاه: فوق المتوسط (صاعد)")
+                    alert_triggered = True
 
-                # حجم
-                vol_now = float(last["volume"])
-                vol_avg = float(df["volume"].iloc[-20:-1].mean())
-                if vol_avg == 0:
-                    continue
+                # 2. شرط الهبوط (Short)
+                elif price_now < ma_price and current_rsi > RSI_MIN_SHORT:
+                    msg = (f"📉 *فرصة SHORT (بيع): {sym}*\n"
+                           f"💰 السعر (إغلاق آخر شمعة): {price_now:.2f}\n"
+                           f"📊 RSI: {current_rsi:.2f}\n"
+                           f"📉 الاتجاه: تحت المتوسط (هابط)")
+                    alert_triggered = True
 
-                vol_ratio = vol_now / vol_avg
-                if vol_ratio < MIN_VOL_RATIO:
-                    continue
-
-                # زخم
-                mom_bps = ((price - prev_price) / prev_price) * 10000
-                if abs(mom_bps) < MOMENTUM_BPS:
-                    continue
-
-                # RSI + MA
-                df["rsi"] = rsi(df["close"])
-                rsi_now = df["rsi"].iloc[-1]
-                ma = df["close"].iloc[-MA_WINDOW:-1].mean()
-
-                # فلتر ذيل الشمعة
-                candle_body = abs(last["close"] - last["open"])
-                candle_range = last["high"] - last["low"]
-                if candle_range == 0:
-                    continue
-
-                wick_ratio = (candle_range - candle_body) / candle_range
-                if wick_ratio > MAX_WICK_RATIO:
-                    continue
-
-                direction = None
-
-                if price > ma and mom_bps > 0 and rsi_now < RSI_MAX_LONG:
-                    direction = "LONG"
-                elif price < ma and mom_bps < 0 and rsi_now > RSI_MIN_SHORT:
-                    direction = "SHORT"
-
-                if not direction:
-                    continue
-
-                if (now - last_alert[sym]).total_seconds() < ALERT_COOLDOWN_SEC:
-                    continue
-
-                strength = "⭐ قوية" if abs(mom_bps) > 10 else "⚡ متوسطة"
-
-                msg = (
-                    f"{'🚀' if direction=='LONG' else '📉'} *{direction} سكالب: {sym}*\n"
-                    f"💰 السعر: {price:.2f}\n"
-                    f"⚡ زخم: {mom_bps:.1f} bps\n"
-                    f"📦 حجم: x{vol_ratio:.2f}\n"
-                    f"↔️ سبريد: {spread_pct*100:.2f}%\n"
-                    f"{strength}\n\n"
-                    f"🎯 هدفك: +7$ إلى +12$\n"
-                    f"⏳ صلاحية: 30 ثانية"
-                )
-
-                send_tg(TG_TOKEN, TG_CHAT_ID, msg)
-                last_alert[sym] = now
-                logging.info(f"Sent {direction} {sym}")
+                # إرسال التنبيه إذا تحقق الشرط ولم يتم الإرسال مؤخراً
+                if alert_triggered:
+                    if (now - last_alert_time[sym]).total_seconds() > 900:
+                        send_tg_msg(TG_TOKEN, TG_CHAT_ID, msg)
+                        last_alert_time[sym] = now
+                        logging.info(f"Alert sent for {sym}")
 
         except Exception as e:
             logging.error(f"Error: {e}")
-            time.sleep(15)
+            time.sleep(30)
 
-        time.sleep(LOOP_SEC)
-
+        time.sleep(60)
 
 if __name__ == "__main__":
     main()
