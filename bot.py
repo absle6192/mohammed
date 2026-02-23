@@ -11,9 +11,9 @@ from alpaca.data.timeframe import TimeFrame
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- إعدادات التنبيهات الفنية ---
-RSI_MAX_LONG = 68   # للدخول شراء (تجنب التضخم)
-RSI_MIN_SHORT = 35  # للدخول شورت (تجنب القاع السحيق)
-MA_WINDOW = 20      # متوسط 20 دقيقة
+RSI_MAX_LONG = 68   
+RSI_MIN_SHORT = 35  
+MA_WINDOW = 20      
 
 def send_tg_msg(token, chat_id, text):
     if not token or not chat_id: return
@@ -40,9 +40,8 @@ def main():
 
     data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
-    send_tg_msg(TG_TOKEN, TG_CHAT_ID, "📡 *رادار السوق يعمل الآن*\nسأرسل تنبيهات لفرص الـ Long والـ Short.")
+    send_tg_msg(TG_TOKEN, TG_CHAT_ID, "📡 *رادار الأسهم المطور يعمل الآن*")
 
-    # سجل التنبيهات لمنع التكرار المزعج (15 دقيقة لكل سهم)
     last_alert_time = {ticker: datetime.min for ticker in TICKERS}
 
     while True:
@@ -57,33 +56,35 @@ def main():
                 if sym not in bars_df.index: continue
                 
                 df = bars_df.xs(sym).sort_index()
-                if len(df) < 20: continue
+                if len(df) < 21: continue # نحتاج شمعة إضافية للمقارنة
 
                 df['rsi'] = calculate_rsi(df['close'])
+                
+                # القيم الحالية
                 current_rsi = df['rsi'].iloc[-1]
+                prev_rsi = df['rsi'].iloc[-2] # قيمة RSI السابقة
                 price_now = float(df["close"].iloc[-1])
                 ma_price = df["close"].iloc[-MA_WINDOW:-1].mean()
 
                 alert_triggered = False
                 msg = ""
 
-                # 1. شرط الصعود (Long)
-                if price_now > ma_price and current_rsi < RSI_MAX_LONG:
-                    msg = (f"🚀 *فرصة LONG (شراء): {sym}*\n"
+                # 1. شرط الصعود (Long) - تعديل إيجابي: أضفنا شرط أن RSI الحالي أكبر من السابق
+                if price_now > ma_price and current_rsi < RSI_MAX_LONG and current_rsi > prev_rsi:
+                    msg = (f"🚀 *إشارة إيجابية (LONG): {sym}*\n"
                            f"💰 السعر: {price_now:.2f}\n"
-                           f"📊 RSI: {current_rsi:.2f}\n"
-                           f"📈 الاتجاه: فوق المتوسط (صاعد)")
+                           f"📊 RSI: {current_rsi:.2f} (متصاعد 📈)\n"
+                           f"📈 الاتجاه: فوق المتوسط")
                     alert_triggered = True
 
-                # 2. شرط الهبوط (Short)
-                elif price_now < ma_price and current_rsi > RSI_MIN_SHORT:
-                    msg = (f"📉 *فرصة SHORT (بيع): {sym}*\n"
+                # 2. شرط الهبوط (Short) - تعديل: RSI ينخفض
+                elif price_now < ma_price and current_rsi > RSI_MIN_SHORT and current_rsi < prev_rsi:
+                    msg = (f"📉 *إشارة سلبية (SHORT): {sym}*\n"
                            f"💰 السعر: {price_now:.2f}\n"
-                           f"📊 RSI: {current_rsi:.2f}\n"
-                           f"📉 الاتجاه: تحت المتوسط (هابط)")
+                           f"📊 RSI: {current_rsi:.2f} (منخفض 📉)\n"
+                           f"📉 الاتجاه: تحت المتوسط")
                     alert_triggered = True
 
-                # إرسال التنبيه إذا تحقق الشرط ولم يتم الإرسال مؤخراً
                 if alert_triggered:
                     if (datetime.now() - last_alert_time[sym]).total_seconds() > 900: 
                         send_tg_msg(TG_TOKEN, TG_CHAT_ID, msg)
