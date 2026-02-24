@@ -24,7 +24,7 @@ MA_WINDOW = 20
 MIN_TREND_PCT = 0.20
 MIN_RSI_BUFFER = 4.0
 
-# --- إعدادات تداول الأسهم (كما هي) ---
+# --- إعدادات تداول الأسهم ---
 OPEN_NOTIONAL_USD = 30000
 OPEN_TRADE_COUNT = 3
 TAKE_PROFIT_PCT = 0.30
@@ -32,11 +32,9 @@ STOP_LOSS_PCT   = 0.20
 MAX_HOLD_MINUTES = 15
 NY_TZ = ZoneInfo("America/New_York")
 
-# --- إعدادات العملات الرقمية (جديد) ---
+# --- إعدادات العملات الرقمية ---
 CRYPTO_TICKERS = ["BTC/USD", "ETH/USD", "SOL/USD", "LINK/USD", "LTC/USD", "DOGE/USD"]
-CRYPTO_ORDER_AMOUNT = 500  # مبلغ الدخول لكل صفقة كريبتو
-CRYPTO_TP_PCT = 2.5        # هدف الربح للكريبتو
-CRYPTO_SL_PCT = 1.5        # وقف الخسارة للكريبتو
+CRYPTO_ORDER_AMOUNT = 500  # مبلغ الدخول لكل صفقة كريبتو بالدولار
 
 
 def send_tg_msg(token, chat_id, text):
@@ -96,6 +94,7 @@ def pick_best_3_for_open(bars_df: pd.DataFrame, tickers: list[str]) -> list[dict
 
 
 def place_bracket_order(trading_client, symbol, notional, side, last_price):
+    """خاص بالأسهم فقط"""
     if side == "LONG":
         order_side = OrderSide.BUY
         tp_price = round(last_price * (1.0 + TAKE_PROFIT_PCT / 100.0), 2)
@@ -127,7 +126,7 @@ def close_position_market(trading_client: TradingClient, symbol: str):
     except Exception as e:
         logging.error(f"Close position error {symbol}: {e}")
 
-# --- دالة محرك الكريبتو (الجديدة) ---
+# --- دالة محرك الكريبتو (المصححة بدون Bracket) ---
 def run_crypto_engine(crypto_client, trading_client, TG_TOKEN, TG_CHAT_ID, last_alerts):
     now = datetime.now(timezone.utc)
     try:
@@ -140,17 +139,22 @@ def run_crypto_engine(crypto_client, trading_client, TG_TOKEN, TG_CHAT_ID, last_
             price_now = float(df["close"].iloc[-1])
             rsi_now = float(df["rsi"].iloc[-1])
             ma_price = float(df["close"].iloc[-MA_WINDOW:-1].mean())
+            
+            # شرط الشراء A-Grade
             if price_now > ma_price and rsi_now < RSI_MAX_LONG:
                 if (datetime.now() - last_alerts.get(sym, datetime.min)).total_seconds() > 1800:
-                    tp = round(price_now * (1 + CRYPTO_TP_PCT/100), 2)
-                    sl = round(price_now * (1 - CRYPTO_SL_PCT/100), 2)
-                    order = MarketOrderRequest(symbol=sym, notional=CRYPTO_ORDER_AMOUNT, side=OrderSide.BUY, 
-                                               time_in_force=TimeInForce.GTC, order_class=OrderClass.BRACKET,
-                                               take_profit={"limit_price": tp}, stop_loss={"stop_price": sl})
+                    # تم إزالة Bracket Order هنا لحل مشكلة الرفض في الكريبتو
+                    order = MarketOrderRequest(
+                        symbol=sym, 
+                        notional=CRYPTO_ORDER_AMOUNT, 
+                        side=OrderSide.BUY, 
+                        time_in_force=TimeInForce.GTC
+                    )
                     trading_client.submit_order(order)
-                    send_tg_msg(TG_TOKEN, TG_CHAT_ID, f"🪙 *تداول كريبتو تلقائي*\n✅ شراء: {sym}\n💰 السعر: {price_now:.2f}")
+                    send_tg_msg(TG_TOKEN, TG_CHAT_ID, f"🪙 *تم شراء عملة تلقائياً*\n✅ العملة: {sym}\n💰 السعر: {price_now:.2f}")
                     last_alerts[sym] = datetime.now()
-    except Exception as e: logging.error(f"Crypto Error: {e}")
+    except Exception as e: 
+        logging.error(f"Crypto Error: {e}")
 
 
 def main():
@@ -164,11 +168,11 @@ def main():
         raise RuntimeError("Missing Alpaca keys")
 
     data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
-    crypto_data_client = CryptoHistoricalDataClient(API_KEY, SECRET_KEY) # عميل الكريبتو
+    crypto_data_client = CryptoHistoricalDataClient(API_KEY, SECRET_KEY)
     paper = os.getenv("APCA_PAPER", "true").lower() != "false"
     trading_client = TradingClient(API_KEY, SECRET_KEY, paper=paper)
 
-    send_tg_msg(TG_TOKEN, TG_CHAT_ID, "🚀 *رادار الهجين بدأ العمل (أسهم + كريبتو)*")
+    send_tg_msg(TG_TOKEN, TG_CHAT_ID, "🚀 *بوت الهجين يعمل الآن*\nيراقب الأسهم (وقت الافتتاح) والعملات (24/7)")
 
     last_alert_time = {ticker: datetime.min for ticker in TICKERS + CRYPTO_TICKERS}
     open_trades_done_for_date = None
@@ -180,10 +184,10 @@ def main():
         try:
             now_utc = datetime.now(timezone.utc)
             
-            # --- أ) تشغيل الكريبتو (24/7) ---
+            # 1) تشغيل الكريبتو (24/7)
             run_crypto_engine(crypto_data_client, trading_client, TG_TOKEN, TG_CHAT_ID, last_alert_time)
 
-            # --- ب) منطق الأسهم (كما هو بدون تغيير) ---
+            # 2) منطق الأسهم (كما هو)
             today_ny = now_utc.astimezone(NY_TZ).date()
             if is_market_open_window(now_utc) and open_trades_done_for_date != today_ny:
                 bars_df = data_client.get_stock_bars(StockBarsRequest(symbol_or_symbols=TICKERS, timeframe=TimeFrame.Minute, start=now_utc - timedelta(minutes=90), end=now_utc, feed="iex")).df
@@ -195,7 +199,7 @@ def main():
                         place_bracket_order(trading_client, p["symbol"], OPEN_NOTIONAL_USD, p["side"], p["price"])
                     send_tg_msg(TG_TOKEN, TG_CHAT_ID, "⚡️ *تم تنفيذ صفقات افتتاح الأسهم*")
 
-            # تقرير الإغلاق (الأسهم)
+            # متابعة الأسهم
             if open_trades_done_for_date == today_ny and open_trade_items and report_sent_for_date != today_ny:
                 open_positions = get_open_positions_symbols(trading_client)
                 if MAX_HOLD_MINUTES and open_trade_start_utc:
@@ -203,7 +207,7 @@ def main():
                         for item in open_trade_items:
                             if item["symbol"] in open_positions: close_position_market(trading_client, item["symbol"])
                 if len([i for i in open_trade_items if i["symbol"] in open_positions]) == 0:
-                    send_tg_msg(TG_TOKEN, TG_CHAT_ID, "📣 *تقرير صفقات الافتتاح تم بنجاح*")
+                    send_tg_msg(TG_TOKEN, TG_CHAT_ID, "📣 *تقرير الأسهم: تم إغلاق جميع صفقات الافتتاح*")
                     report_sent_for_date = today_ny
 
             # رادار الأسهم اليدوي
@@ -213,11 +217,11 @@ def main():
                 df = bars_df_manual.xs(sym).sort_index()
                 if len(df) < 25: continue
                 df["rsi"] = calculate_rsi(df["close"])
-                price_now, current_rsi = float(df["close"].iloc[-1]), float(df["rsi"].iloc[-1])
-                ma_price = float(df["close"].iloc[-MA_WINDOW:-1].mean())
-                if (price_now > ma_price and current_rsi < RSI_MAX_LONG) or (price_now < ma_price and current_rsi > RSI_MIN_SHORT):
+                price_now, rsi_val = float(df["close"].iloc[-1]), float(df["rsi"].iloc[-1])
+                ma_val = float(df["close"].iloc[-MA_WINDOW:-1].mean())
+                if (price_now > ma_val and rsi_val < RSI_MAX_LONG) or (price_now < ma_val and rsi_val > RSI_MIN_SHORT):
                     if (datetime.now() - last_alert_time[sym]).total_seconds() > 900:
-                        send_tg_msg(TG_TOKEN, TG_CHAT_ID, f"🚀 *إشارة A-Grade سهم*: {sym} @ {price_now}")
+                        send_tg_msg(TG_TOKEN, TG_CHAT_ID, f"🚀 *إشارة سهم*: {sym} @ {price_now}")
                         last_alert_time[sym] = datetime.now()
 
         except Exception as e:
