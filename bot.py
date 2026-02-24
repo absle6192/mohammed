@@ -4,8 +4,9 @@ import requests
 import logging
 import pandas as pd
 from datetime import datetime, timezone, timedelta
+
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -15,8 +16,10 @@ RSI_MAX_LONG = 68   # للدخول شراء (تجنب التضخم)
 RSI_MIN_SHORT = 35  # للدخول شورت (تجنب القاع السحيق)
 MA_WINDOW = 20      # متوسط 20 دقيقة
 
+
 def send_tg_msg(token, chat_id, text):
-    if not token or not chat_id: return
+    if not token or not chat_id:
+        return
     try:
         requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
@@ -26,12 +29,62 @@ def send_tg_msg(token, chat_id, text):
     except Exception as e:
         logging.error(f"Telegram Error: {e}")
 
+
 def calculate_rsi(data, window=14):
     delta = data.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
     rs = gain / loss
     return 100 - (100 / (1 + rs))
+
+
+def _get_quote_price_now(data_client: StockHistoricalDataClient, sym: str, feed: str = "iex") -> float | None:
+    """
+    يرجّع سعر لحظي أقرب للآن (Mid بين Bid/Ask) من Latest Quote.
+    إذا ما توفر bid/ask يرجّع None.
+    """
+    try:
+        q = data_client.get_stock_latest_quote(
+            StockLatestQuoteRequest(symbol_or_symbols=sym, feed=feed)
+        )
+
+        # بعض إصدارات alpaca-py ترجع dict: q["AAPL"] -> Quote
+        # وبعضها ترجع object فيه .quote أو .quotes
+        quote = None
+        if isinstance(q, dict) and sym in q:
+            quote = q[sym]
+        elif hasattr(q, "quotes") and isinstance(q.quotes, dict) and sym in q.quotes:
+            quote = q.quotes[sym]
+        elif hasattr(q, sym):
+            quote = getattr(q, sym)
+
+        if quote is None:
+            return None
+
+        # quote ممكن يكون dict أو object
+        bid = None
+        ask = None
+
+        if isinstance(quote, dict):
+            bid = quote.get("bid_price")
+            ask = quote.get("ask_price")
+        else:
+            bid = getattr(quote, "bid_price", None)
+            ask = getattr(quote, "ask_price", None)
+
+        if bid is None or ask is None:
+            return None
+
+        bid = float(bid)
+        ask = float(ask)
+
+        # Mid price (متوسط) مناسب للعرض في التنبيه
+        return (bid + ask) / 2.0
+
+    except Exception as e:
+        logging.error(f"Quote fetch error for {sym}: {e}")
+        return None
+
 
 def main():
     API_KEY = os.getenv("APCA_API_KEY_ID")
@@ -56,7 +109,7 @@ def main():
                     timeframe=TimeFrame.Minute,
                     start=now - timedelta(minutes=60),
                     end=now,
-                    feed="iex",
+                    feed="iex"
                 )
             ).df
 
@@ -70,7 +123,15 @@ def main():
 
                 df["rsi"] = calculate_rsi(df["close"])
                 current_rsi = df["rsi"].iloc[-1]
-                price_now = float(df["close"].iloc[-1])
+
+                # ✅ السعر اللحظي من Latest Quote (بدل close آخر شمعة)
+                quote_price = _get_quote_price_now(data_client, sym, feed="iex")
+                if quote_price is None:
+                    # fallback: إذا ما قدر يجيب Quote لأي سبب، يرجع لطريقة الشمعة
+                    price_now = float(df["close"].iloc[-1])
+                else:
+                    price_now = float(quote_price)
+
                 ma_price = df["close"].iloc[-MA_WINDOW:-1].mean()
 
                 alert_triggered = False
@@ -108,6 +169,7 @@ def main():
             time.sleep(30)
 
         time.sleep(60)
+
 
 if __name__ == "__main__":
     main()
