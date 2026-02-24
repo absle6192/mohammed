@@ -1,175 +1,111 @@
 import os
 import time
-import requests
 import logging
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 
+# مكتبات Alpaca الجديدة للداول
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
 
+# --- إعدادات القناص (تعديلك المباشر) ---
+CASH_PER_TRADE = 30000     # دخول بـ 30 ألف دولار
+TARGET_PROFIT = 10.0       # الخروج عند ربح 10 دولار
+STOP_LOSS = -20.0          # وقف خسارة عند 20 دولار (لحماية السيولة)
+MAX_DAILY_TRADES = 50      # هدفك: 50 صفقة يومياً
+TICKERS = ["NVDA", "TSLA", "AAPL", "AMD"] # الأسهم المقترحة لسيولة عالية
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- إعدادات التنبيهات الفنية ---
-RSI_MAX_LONG = 68   # للدخول شراء (تجنب التضخم)
-RSI_MIN_SHORT = 35  # للدخول شورت (تجنب القاع السحيق)
-MA_WINDOW = 20      # متوسط 20 دقيقة
+class SniperBot:
+    def __init__(self):
+        self.api_key = os.getenv("APCA_API_KEY_ID")
+        self.secret_key = os.getenv("APCA_API_SECRET_KEY")
+        
+        # عملاء Alpaca (البيانات والتداول)
+        self.trading_client = TradingClient(self.api_key, self.secret_key, paper=True) # اجعله False للحقيقي
+        self.data_client = StockHistoricalDataClient(self.api_key, self.secret_key)
+        
+        self.trades_count = 0
 
-
-def send_tg_msg(token, chat_id, text):
-    if not token or not chat_id:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
-            timeout=10
-        )
-    except Exception as e:
-        logging.error(f"Telegram Error: {e}")
-
-
-def calculate_rsi(data, window=14):
-    delta = data.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
-
-def _get_quote_price_now(data_client: StockHistoricalDataClient, sym: str, feed: str = "iex") -> float | None:
-    """
-    يرجّع سعر لحظي أقرب للآن (Mid بين Bid/Ask) من Latest Quote.
-    إذا ما توفر bid/ask يرجّع None.
-    """
-    try:
-        q = data_client.get_stock_latest_quote(
-            StockLatestQuoteRequest(symbol_or_symbols=sym, feed=feed)
-        )
-
-        # بعض إصدارات alpaca-py ترجع dict: q["AAPL"] -> Quote
-        # وبعضها ترجع object فيه .quote أو .quotes
-        quote = None
-        if isinstance(q, dict) and sym in q:
-            quote = q[sym]
-        elif hasattr(q, "quotes") and isinstance(q.quotes, dict) and sym in q.quotes:
-            quote = q.quotes[sym]
-        elif hasattr(q, sym):
-            quote = getattr(q, sym)
-
-        if quote is None:
-            return None
-
-        # quote ممكن يكون dict أو object
-        bid = None
-        ask = None
-
-        if isinstance(quote, dict):
-            bid = quote.get("bid_price")
-            ask = quote.get("ask_price")
-        else:
-            bid = getattr(quote, "bid_price", None)
-            ask = getattr(quote, "ask_price", None)
-
-        if bid is None or ask is None:
-            return None
-
-        bid = float(bid)
-        ask = float(ask)
-
-        # Mid price (متوسط) مناسب للعرض في التنبيه
-        return (bid + ask) / 2.0
-
-    except Exception as e:
-        logging.error(f"Quote fetch error for {sym}: {e}")
+    def get_signal(self, sym):
+        # نفس منطق كودك "الممتاز" للتحليل
+        now = datetime.now(timezone.utc)
+        bars = self.data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=sym, timeframe=TimeFrame.Minute,
+            start=now - timedelta(minutes=60), end=now, feed="iex"
+        )).df
+        
+        df = bars.xs(sym).sort_index()
+        if len(df) < 20: return None
+        
+        # حساب المؤشرات
+        ma_price = df["close"].iloc[-20:-1].mean()
+        price_now = float(df["close"].iloc[-1])
+        
+        if price_now > ma_price: return "LONG"
+        if price_now < ma_price: return "SHORT"
         return None
 
+    def execute_and_monitor(self, sym, side_str):
+        # 1. حساب الكمية بناءً على 30 ألف دولار
+        quote = self.data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=sym, feed="iex"))
+        current_price = (quote[sym].bid_price + quote[sym].ask_price) / 2
+        qty = int(CASH_PER_TRADE / current_price)
 
-def main():
-    API_KEY = os.getenv("APCA_API_KEY_ID")
-    SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
-    TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-    TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-    TICKERS = [t.strip().upper() for t in os.getenv("TICKERS", "TSLA,AAPL,NVDA,AMD,GOOGL,MSFT,META").split(",")]
+        # 2. دخول ماركت فوري
+        side = OrderSide.BUY if side_str == "LONG" else OrderSide.SELL
+        print(f"🚀 تنفيذ صفقة {side_str} لـ {sym} | الكمية: {qty} سهم")
+        
+        order_data = MarketOrderRequest(symbol=sym, qty=qty, side=side, time_in_force=TimeInForce.GTC)
+        self.trading_client.submit_order(order_data)
+        
+        entry_price = current_price
+        
+        # 3. حلقة مراقبة الربح (EXIT STRATEGY)
+        while True:
+            time.sleep(0.5) # فحص فائق السرعة
+            q_now = self.data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=sym, feed="iex"))
+            price_now = (q_now[sym].bid_price + q_now[sym].ask_price) / 2
+            
+            # حساب الربح/الخسارة بالدولار
+            if side_str == "LONG":
+                pnl = (price_now - entry_price) * qty
+            else:
+                pnl = (entry_price - price_now) * qty
 
-    data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+            # شروط الخروج الفوري
+            if pnl >= TARGET_PROFIT or pnl <= STOP_LOSS:
+                exit_side = OrderSide.SELL if side_str == "LONG" else OrderSide.BUY
+                exit_order = MarketOrderRequest(symbol=sym, qty=qty, side=exit_side, time_in_force=TimeInForce.GTC)
+                self.trading_client.submit_order(exit_order)
+                print(f"💰 تم الخروج! الربح/الخسارة: {pnl:.2f}$")
+                break
 
-    send_tg_msg(TG_TOKEN, TG_CHAT_ID, "📡 *رادار السوق يعمل الآن*\nسأرسل تنبيهات لفرص الـ Long والـ Short.")
-
-    # سجل التنبيهات لمنع التكرار المزعج (15 دقيقة لكل سهم)
-    last_alert_time = {ticker: datetime.min for ticker in TICKERS}
-
-    while True:
-        try:
-            now = datetime.now(timezone.utc)
-            bars_df = data_client.get_stock_bars(
-                StockBarsRequest(
-                    symbol_or_symbols=TICKERS,
-                    timeframe=TimeFrame.Minute,
-                    start=now - timedelta(minutes=60),
-                    end=now,
-                    feed="iex"
-                )
-            ).df
+    def run(self):
+        print("🎯 البوت بدأ العمل لتحقيق 50 صفقة...")
+        while self.trades_count < MAX_DAILY_TRADES:
+            # شرط الوقت (قبل الإغلاق بـ 30 دقيقة)
+            now_est = datetime.now(timezone(timedelta(hours=-5))) # توقيت نيويورك تقريبي
+            if now_est.hour == 15 and now_est.minute >= 30:
+                print("🛑 اقترب إغلاق السوق، توقف القناص.")
+                break
 
             for sym in TICKERS:
-                if sym not in bars_df.index:
-                    continue
-
-                df = bars_df.xs(sym).sort_index()
-                if len(df) < 20:
-                    continue
-
-                df["rsi"] = calculate_rsi(df["close"])
-                current_rsi = df["rsi"].iloc[-1]
-
-                # ✅ السعر اللحظي من Latest Quote (بدل close آخر شمعة)
-                quote_price = _get_quote_price_now(data_client, sym, feed="iex")
-                if quote_price is None:
-                    # fallback: إذا ما قدر يجيب Quote لأي سبب، يرجع لطريقة الشمعة
-                    price_now = float(df["close"].iloc[-1])
-                else:
-                    price_now = float(quote_price)
-
-                ma_price = df["close"].iloc[-MA_WINDOW:-1].mean()
-
-                alert_triggered = False
-                msg = ""
-
-                # 1. شرط الصعود (Long)
-                if price_now > ma_price and current_rsi < RSI_MAX_LONG:
-                    msg = (
-                        f"🚀 *فرصة LONG (شراء): {sym}*\n"
-                        f"💰 السعر: {price_now:.2f}\n"
-                        f"📊 RSI: {current_rsi:.2f}\n"
-                        f"📈 الاتجاه: فوق المتوسط (صاعد)"
-                    )
-                    alert_triggered = True
-
-                # 2. شرط الهبوط (Short)
-                elif price_now < ma_price and current_rsi > RSI_MIN_SHORT:
-                    msg = (
-                        f"📉 *فرصة SHORT (بيع): {sym}*\n"
-                        f"💰 السعر: {price_now:.2f}\n"
-                        f"📊 RSI: {current_rsi:.2f}\n"
-                        f"📉 الاتجاه: تحت المتوسط (هابط)"
-                    )
-                    alert_triggered = True
-
-                # إرسال التنبيه إذا تحقق الشرط ولم يتم الإرسال مؤخراً
-                if alert_triggered:
-                    if (datetime.now() - last_alert_time[sym]).total_seconds() > 900:
-                        send_tg_msg(TG_TOKEN, TG_CHAT_ID, msg)
-                        last_alert_time[sym] = datetime.now()
-                        logging.info(f"Alert sent for {sym}")
-
-        except Exception as e:
-            logging.error(f"Error: {e}")
-            time.sleep(30)
-
-        time.sleep(60)
-
+                signal = self.get_signal(sym)
+                if signal:
+                    self.execute_and_monitor(sym, signal)
+                    self.trades_count += 1
+                    print(f"📊 إجمالي الصفقات اليوم: {self.trades_count}/50")
+                    
+                    if self.trades_count >= MAX_DAILY_TRADES: break
+                
+            time.sleep(10) # انتظار فرصة جديدة
 
 if __name__ == "__main__":
-    main()
+    bot = SniperBot()
+    bot.run()
