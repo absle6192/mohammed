@@ -6,7 +6,6 @@ from collections import deque
 from datetime import datetime, timezone
 
 import pandas as pd
-
 from alpaca.data.live import StockDataStream
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -70,11 +69,14 @@ async def main():
     TICKERS = [t.strip().upper() for t in env("TICKERS", "TSLA,AAPL,NVDA,AMD,GOOGL,MSFT,META").split(",")]
     FEED = env("DATA_FEED", "iex").lower()  # iex غالباً للحسابات المجانية
 
-    # --- لحظي 30 ثانية ---
+    # --- لحظي ---
     PRICE_WINDOW_SEC = env_int("PRICE_WINDOW_SEC", "30")     # آخر كم ثانية نبني عليها RSI/MA
     RSI_WINDOW = env_int("RSI_WINDOW", "14")                 # عدد نقاط RSI (على سلسلة لحظية)
-    MA_POINTS = env_int("MA_POINTS", "10")                   # MA على آخر كم نقطة (تقريبًا آخر ~10 تحديثات)
+    MA_POINTS = env_int("MA_POINTS", "10")                   # MA على آخر كم نقطة
     MIN_POINTS = env_int("MIN_POINTS", "20")                 # أقل نقاط قبل إرسال إشارات
+
+    # --- تبكير الإشارة (تأكيد بسيط) ---
+    CONFIRM_SEC = env_int("CONFIRM_SEC", "2")                # يثبت الشرط كم ثانية قبل الإرسال (تبكير + تقليل سبام)
 
     # --- شروطك ---
     RSI_MAX_LONG = env_float("RSI_MAX_LONG", "68")
@@ -84,9 +86,9 @@ async def main():
     MAX_SPREAD_PCT = env_float("MAX_SPREAD_PCT", "0.004")    # 0.4% افتراضيًا
 
     # --- منع تكرار ---
-    COOLDOWN_SEC = env_int("COOLDOWN_SEC", "120")            # افتراضي 2 دقيقة (غيّره لو تبي)
+    COOLDOWN_SEC = env_int("COOLDOWN_SEC", "120")            # افتراضي 2 دقيقة
 
-    # تخزين الأسعار اللحظية (آخر 30 ثانية) لكل سهم
+    # تخزين الأسعار اللحظية (آخر PRICE_WINDOW_SEC) لكل سهم
     price_buf: dict[str, deque] = {sym: deque() for sym in TICKERS}  # (ts_epoch, price)
 
     # آخر Quote لكل سهم (عشان spread)
@@ -94,6 +96,9 @@ async def main():
 
     # آخر وقت تنبيه لكل سهم
     last_alert_ts: dict[str, float] = {sym: 0.0 for sym in TICKERS}
+
+    # وقت بداية تحقق الشرط (للتأكيد CONFIRM_SEC)
+    pending_since: dict[str, float | None] = {sym: None for sym in TICKERS}
 
     stream = StockDataStream(API_KEY, SECRET_KEY, feed=FEED)
 
@@ -110,8 +115,40 @@ async def main():
         dq = price_buf[sym]
         if len(dq) == 0:
             return None
-        # فقط الأسعار بالترتيب
         return pd.Series([p for _, p in dq], dtype="float64")
+
+    def compute_signal(sym: str, ts: float) -> tuple[str | None, float | None, float | None, float | None]:
+        """
+        يرجع:
+        - signal: "LONG" or "SHORT" or None
+        - price_now, rsi, ma, spread_pct
+        """
+        # لازم نقاط كفاية
+        if len(price_buf[sym]) < MIN_POINTS:
+            return None, None, None, None, None
+
+        # فلتر سبريد
+        sp = last_quote[sym]["spread_pct"]
+        if sp is not None and sp > MAX_SPREAD_PCT:
+            return None, None, None, None, sp
+
+        s = series_from_buf(sym)
+        if s is None:
+            return None, None, None, None, sp
+
+        rsi = calculate_rsi(s, RSI_WINDOW)
+        ma = mean_last_n(s, MA_POINTS)
+        if rsi is None or ma is None:
+            return None, None, rsi, ma, sp
+
+        price_now = float(s.iloc[-1])
+
+        if price_now > ma and rsi < RSI_MAX_LONG:
+            return "LONG", price_now, rsi, ma, sp
+        if price_now < ma and rsi > RSI_MIN_SHORT:
+            return "SHORT", price_now, rsi, ma, sp
+
+        return None, price_now, rsi, ma, sp
 
     async def on_quote(q):
         sym = q.symbol
@@ -119,99 +156,93 @@ async def main():
         ask = getattr(q, "ask_price", None)
         if bid is None or ask is None:
             return
+
         bid = float(bid)
         ask = float(ask)
         if bid <= 0 or ask <= 0:
             return
 
         mid = (bid + ask) / 2.0
-        spread_pct = (ask - bid) / mid if mid > 0 else None
+        sp = (ask - bid) / mid if mid > 0 else None
 
-        last_quote[sym] = {
-            "bid": bid,
-            "ask": ask,
-            "mid": mid,
-            "spread_pct": spread_pct
-        }
+        last_quote[sym] = {"bid": bid, "ask": ask, "mid": mid, "spread_pct": sp}
+
+        ts = now_epoch()
+
+        # عبّي البفر بسعر الـ mid (الأسرع)
+        price_buf[sym].append((ts, float(mid)))
+        prune(sym, ts)
+
+        # منع التكرار
+        if ts - last_alert_ts[sym] < COOLDOWN_SEC:
+            pending_since[sym] = None
+            return
+
+        signal, price_now, rsi, ma, spread_pct = compute_signal(sym, ts)
+        if signal is None:
+            pending_since[sym] = None
+            return
+
+        # تأكيد بسيط CONFIRM_SEC للتقليل من إشارات أول تكة
+        if pending_since[sym] is None:
+            pending_since[sym] = ts
+            return
+        if ts - pending_since[sym] < CONFIRM_SEC:
+            return
+
+        # إرسال
+        if signal == "LONG":
+            msg = (
+                f"🚀 *إشارة LONG مبكرة: {sym}*\n"
+                f"💰 السعر: {price_now:.2f}\n"
+                f"📊 RSI({PRICE_WINDOW_SEC}s): {rsi:.2f}\n"
+                f"📈 MA(آخر {MA_POINTS}): {ma:.2f}\n"
+                + (f"🧾 Spread: {(spread_pct*100):.2f}%\n" if spread_pct is not None else "")
+                + f"⚡ تأكيد: {CONFIRM_SEC}s"
+            )
+        else:
+            msg = (
+                f"📉 *إشارة SHORT مبكرة: {sym}*\n"
+                f"💰 السعر: {price_now:.2f}\n"
+                f"📊 RSI({PRICE_WINDOW_SEC}s): {rsi:.2f}\n"
+                f"📉 MA(آخر {MA_POINTS}): {ma:.2f}\n"
+                + (f"🧾 Spread: {(spread_pct*100):.2f}%\n" if spread_pct is not None else "")
+                + f"⚡ تأكيد: {CONFIRM_SEC}s"
+            )
+
+        send_tg_msg(TG_TOKEN, TG_CHAT_ID, msg)
+        last_alert_ts[sym] = ts
+        pending_since[sym] = None
+        logging.info(f"Early alert sent for {sym} | signal={signal} price={price_now:.2f} rsi={rsi:.2f} ma={ma:.2f}")
 
     async def on_trade(t):
+        """
+        ما نرسل من trades (عشان التبكير صار من quotes)
+        لكن نخليه يعبّي البيانات لو احتجنا نقاط إضافية.
+        """
         sym = t.symbol
-        # نفضل mid من quote (أسرع للسكالب) وإذا ما توفر نستخدم trade price
         mid = last_quote[sym]["mid"]
         price = float(mid) if mid is not None else float(getattr(t, "price", None) or 0.0)
         if price <= 0:
             return
 
         ts = now_epoch()
-        # حدث البفر
-        price_buf[sym].append((ts, price))
+        price_buf[sym].append((ts, float(price)))
         prune(sym, ts)
 
-        # فلتر: لازم نقاط كفاية
-        if len(price_buf[sym]) < MIN_POINTS:
-            return
-
-        # فلتر سبريد
-        sp = last_quote[sym]["spread_pct"]
-        if sp is not None and sp > MAX_SPREAD_PCT:
-            return
-
-        # حساب RSI و MA لحظي
-        s = series_from_buf(sym)
-        if s is None:
-            return
-
-        rsi = calculate_rsi(s, RSI_WINDOW)
-        ma = mean_last_n(s, MA_POINTS)
-        if rsi is None or ma is None:
-            return
-
-        price_now = float(s.iloc[-1])
-
-        # منع التكرار
-        if ts - last_alert_ts[sym] < COOLDOWN_SEC:
-            return
-
-        msg = None
-
-        # LONG: السعر فوق MA و RSI أقل من الحد
-        if price_now > ma and rsi < RSI_MAX_LONG:
-            msg = (
-                f"🚀 *إشارة LONG لحظية: {sym}*\n"
-                f"💰 السعر: {price_now:.2f}\n"
-                f"📊 RSI({PRICE_WINDOW_SEC}s): {rsi:.2f}\n"
-                f"📈 MA(آخر {MA_POINTS} نقاط): {ma:.2f}\n"
-                + (f"🧾 Spread: {(sp*100):.2f}%\n" if sp is not None else "")
-                + "⚡ تنبيه لحظي (سكالب)"
-            )
-
-        # SHORT: السعر تحت MA و RSI أعلى من الحد
-        elif price_now < ma and rsi > RSI_MIN_SHORT:
-            msg = (
-                f"📉 *إشارة SHORT لحظية: {sym}*\n"
-                f"💰 السعر: {price_now:.2f}\n"
-                f"📊 RSI({PRICE_WINDOW_SEC}s): {rsi:.2f}\n"
-                f"📉 MA(آخر {MA_POINTS} نقاط): {ma:.2f}\n"
-                + (f"🧾 Spread: {(sp*100):.2f}%\n" if sp is not None else "")
-                + "⚡ تنبيه لحظي (سكالب)"
-            )
-
-        if msg:
-            send_tg_msg(TG_TOKEN, TG_CHAT_ID, msg)
-            last_alert_ts[sym] = ts
-            logging.info(f"Alert sent for {sym} | price={price_now:.2f} rsi={rsi:.2f} ma={ma:.2f}")
-
-    # اشترك: Quotes + Trades
+    # اشترك: Quotes (الأساسي) + Trades (تعزيز بيانات فقط)
     stream.subscribe_quotes(on_quote, *TICKERS)
     stream.subscribe_trades(on_trade, *TICKERS)
 
     send_tg_msg(
         TG_TOKEN, TG_CHAT_ID,
-        f"📡 *WebSocket لحظي شغال*\n"
+        f"📡 *WebSocket شغال (تبكير إشارات)*\n"
         f"• نافذة الأسعار: {PRICE_WINDOW_SEC}s\n"
         f"• RSI: {RSI_WINDOW} نقاط\n"
         f"• MA: آخر {MA_POINTS} نقاط\n"
+        f"• Min Points: {MIN_POINTS}\n"
         f"• Max Spread: {MAX_SPREAD_PCT*100:.2f}%\n"
+        f"• Confirm: {CONFIRM_SEC}s\n"
         f"• Cooldown: {COOLDOWN_SEC}s"
     )
 
