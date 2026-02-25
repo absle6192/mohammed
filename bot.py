@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 from alpaca.data.live import StockDataStream
+from alpaca.data.enums import DataFeed  # ✅ التعديل المهم
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -100,7 +101,9 @@ async def main():
     # وقت بداية تحقق الشرط (للتأكيد CONFIRM_SEC)
     pending_since: dict[str, float | None] = {sym: None for sym in TICKERS}
 
-    stream = StockDataStream(API_KEY, SECRET_KEY, feed=FEED)
+    # ✅ التعديل الصحيح: لازم DataFeed enum
+    feed_enum = DataFeed.IEX if FEED == "iex" else DataFeed.SIP
+    stream = StockDataStream(API_KEY, SECRET_KEY, feed=feed_enum)
 
     def now_epoch() -> float:
         return datetime.now(timezone.utc).timestamp()
@@ -117,7 +120,7 @@ async def main():
             return None
         return pd.Series([p for _, p in dq], dtype="float64")
 
-    def compute_signal(sym: str, ts: float) -> tuple[str | None, float | None, float | None, float | None]:
+    def compute_signal(sym: str, ts: float) -> tuple[str | None, float | None, float | None, float | None, float | None]:
         """
         يرجع:
         - signal: "LONG" or "SHORT" or None
@@ -237,6 +240,7 @@ async def main():
     send_tg_msg(
         TG_TOKEN, TG_CHAT_ID,
         f"📡 *WebSocket شغال (تبكير إشارات)*\n"
+        f"• Feed: {FEED}\n"
         f"• نافذة الأسعار: {PRICE_WINDOW_SEC}s\n"
         f"• RSI: {RSI_WINDOW} نقاط\n"
         f"• MA: آخر {MA_POINTS} نقاط\n"
