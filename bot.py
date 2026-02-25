@@ -36,7 +36,7 @@ NY_TZ = ZoneInfo("America/New_York")
 
 # --- العملات الرقمية ---
 CRYPTO_TICKERS = ["BTC/USD", "ETH/USD", "SOL/USD", "LINK/USD", "LTC/USD", "DOGE/USD"]
-CRYPTO_ORDER_AMOUNT = 500 
+CRYPTO_ORDER_AMOUNT = 5000
 
 
 def send_tg_msg(token, chat_id, text):
