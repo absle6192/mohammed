@@ -67,26 +67,20 @@ def main():
     TICKERS = [t.strip().upper() for t in env("TICKERS", "TSLA,AAPL,NVDA,AMD,GOOGL,MSFT,META").split(",")]
     FEED = env("DATA_FEED", "iex").lower()
 
-    # --- لحظي ---
     PRICE_WINDOW_SEC = env_int("PRICE_WINDOW_SEC", "30")
     RSI_WINDOW = env_int("RSI_WINDOW", "14")
     MA_POINTS = env_int("MA_POINTS", "10")
     MIN_POINTS = env_int("MIN_POINTS", "20")
 
-    # --- تبكير الإشارة (تأكيد بسيط) ---
     CONFIRM_SEC = env_int("CONFIRM_SEC", "2")
 
-    # --- شروطك ---
     RSI_MAX_LONG = env_float("RSI_MAX_LONG", "68")
     RSI_MIN_SHORT = env_float("RSI_MIN_SHORT", "35")
 
-    # --- فلتر سبريد ---
     MAX_SPREAD_PCT = env_float("MAX_SPREAD_PCT", "0.004")
-
-    # --- منع تكرار ---
     COOLDOWN_SEC = env_int("COOLDOWN_SEC", "120")
 
-    price_buf: dict[str, deque] = {sym: deque() for sym in TICKERS}
+    price_buf: dict[str, deque] = {sym: deque() for sym in TICKERS}  # (ts_epoch, price)
     last_quote: dict[str, dict] = {sym: {"bid": None, "ask": None, "mid": None, "spread_pct": None} for sym in TICKERS}
     last_alert_ts: dict[str, float] = {sym: 0.0 for sym in TICKERS}
     pending_since: dict[str, float | None] = {sym: None for sym in TICKERS}
@@ -104,11 +98,11 @@ def main():
 
     def series_from_buf(sym: str) -> pd.Series | None:
         dq = price_buf[sym]
-        if not dq:
+        if len(dq) == 0:
             return None
         return pd.Series([p for _, p in dq], dtype="float64")
 
-    def compute_signal(sym: str) -> tuple[str | None, float | None, float | None, float | None, float | None]:
+    def compute_signal(sym: str, ts: float):
         if len(price_buf[sym]) < MIN_POINTS:
             return None, None, None, None, None
 
@@ -158,7 +152,7 @@ def main():
             pending_since[sym] = None
             return
 
-        signal, price_now, rsi, ma, spread_pct = compute_signal(sym)
+        signal, price_now, rsi, ma, spread_pct = compute_signal(sym, ts)
         if signal is None:
             pending_since[sym] = None
             return
@@ -173,7 +167,7 @@ def main():
             msg = (
                 f"🚀 *إشارة LONG مبكرة: {sym}*\n"
                 f"💰 السعر: {price_now:.2f}\n"
-                f"📊 RSI: {rsi:.2f}\n"
+                f"📊 RSI({PRICE_WINDOW_SEC}s): {rsi:.2f}\n"
                 f"📈 MA(آخر {MA_POINTS}): {ma:.2f}\n"
                 + (f"🧾 Spread: {(spread_pct*100):.2f}%\n" if spread_pct is not None else "")
                 + f"⚡ تأكيد: {CONFIRM_SEC}s"
@@ -182,7 +176,7 @@ def main():
             msg = (
                 f"📉 *إشارة SHORT مبكرة: {sym}*\n"
                 f"💰 السعر: {price_now:.2f}\n"
-                f"📊 RSI: {rsi:.2f}\n"
+                f"📊 RSI({PRICE_WINDOW_SEC}s): {rsi:.2f}\n"
                 f"📉 MA(آخر {MA_POINTS}): {ma:.2f}\n"
                 + (f"🧾 Spread: {(spread_pct*100):.2f}%\n" if spread_pct is not None else "")
                 + f"⚡ تأكيد: {CONFIRM_SEC}s"
@@ -199,7 +193,6 @@ def main():
         price = float(mid) if mid is not None else float(getattr(t, "price", None) or 0.0)
         if price <= 0:
             return
-
         ts = now_epoch()
         price_buf[sym].append((ts, float(price)))
         prune(sym, ts)
@@ -220,7 +213,7 @@ def main():
         f"• Cooldown: {COOLDOWN_SEC}s"
     )
 
-    # ✅ تشغيل صحيح بدون asyncio.run / await
+    # ✅ هذا هو التعديل الحاسم
     stream.run()
 
 if __name__ == "__main__":
