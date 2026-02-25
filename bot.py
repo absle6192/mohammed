@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 from alpaca.data.live import StockDataStream
+from alpaca.data.enums import DataFeed  # ✅ مهم
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -65,7 +66,16 @@ def main():
     TG_CHAT_ID = env("TELEGRAM_CHAT_ID")
 
     TICKERS = [t.strip().upper() for t in env("TICKERS", "TSLA,AAPL,NVDA,AMD,GOOGL,MSFT,META").split(",")]
-    FEED = env("DATA_FEED", "iex").lower()
+
+    # ✅ FIX: feed لازم يكون DataFeed مو نص
+    feed_str = env("DATA_FEED", "iex").strip().lower()
+    if feed_str == "iex":
+        FEED = DataFeed.IEX
+    elif feed_str == "sip":
+        FEED = DataFeed.SIP
+    else:
+        FEED = DataFeed.IEX  # fallback
+        feed_str = "iex"
 
     PRICE_WINDOW_SEC = env_int("PRICE_WINDOW_SEC", "30")
     RSI_WINDOW = env_int("RSI_WINDOW", "14")
@@ -142,6 +152,8 @@ def main():
 
         mid = (bid + ask) / 2.0
         sp = (ask - bid) / mid if mid > 0 else None
+        if sym not in last_quote:
+            return
         last_quote[sym] = {"bid": bid, "ask": ask, "mid": mid, "spread_pct": sp}
 
         ts = now_epoch()
@@ -167,7 +179,7 @@ def main():
             msg = (
                 f"🚀 *إشارة LONG مبكرة: {sym}*\n"
                 f"💰 السعر: {price_now:.2f}\n"
-                f"📊 RSI({PRICE_WINDOW_SEC}s): {rsi:.2f}\n"
+                f"📊 RSI({RSI_WINDOW}): {rsi:.2f}\n"
                 f"📈 MA(آخر {MA_POINTS}): {ma:.2f}\n"
                 + (f"🧾 Spread: {(spread_pct*100):.2f}%\n" if spread_pct is not None else "")
                 + f"⚡ تأكيد: {CONFIRM_SEC}s"
@@ -176,7 +188,7 @@ def main():
             msg = (
                 f"📉 *إشارة SHORT مبكرة: {sym}*\n"
                 f"💰 السعر: {price_now:.2f}\n"
-                f"📊 RSI({PRICE_WINDOW_SEC}s): {rsi:.2f}\n"
+                f"📊 RSI({RSI_WINDOW}): {rsi:.2f}\n"
                 f"📉 MA(آخر {MA_POINTS}): {ma:.2f}\n"
                 + (f"🧾 Spread: {(spread_pct*100):.2f}%\n" if spread_pct is not None else "")
                 + f"⚡ تأكيد: {CONFIRM_SEC}s"
@@ -189,6 +201,8 @@ def main():
 
     async def on_trade(t):
         sym = t.symbol
+        if sym not in price_buf:
+            return
         mid = last_quote[sym]["mid"]
         price = float(mid) if mid is not None else float(getattr(t, "price", None) or 0.0)
         if price <= 0:
@@ -203,7 +217,7 @@ def main():
     send_tg_msg(
         TG_TOKEN, TG_CHAT_ID,
         f"📡 *WebSocket شغال (تبكير إشارات)*\n"
-        f"• Feed: {FEED}\n"
+        f"• Feed: {feed_str}\n"
         f"• نافذة الأسعار: {PRICE_WINDOW_SEC}s\n"
         f"• RSI: {RSI_WINDOW} نقاط\n"
         f"• MA: آخر {MA_POINTS} نقاط\n"
@@ -213,7 +227,7 @@ def main():
         f"• Cooldown: {COOLDOWN_SEC}s"
     )
 
-    # ✅ هذا هو التعديل الحاسم
+    # ✅ تشغيل صحيح بدون await
     stream.run()
 
 if __name__ == "__main__":
