@@ -67,10 +67,9 @@ ALLOW_SHORT = env_bool("ALLOW_SHORT", "true")
 FEED_NAME = env("DATA_FEED", "iex").lower()
 FEED = DataFeed.IEX if FEED_NAME == "iex" else DataFeed.SIP
 
-API_KEY = env("ALPACA_API_KEY")
-API_SECRET = env("ALPACA_SECRET_KEY")
-PAPER = env_bool("ALPACA_PAPER", "true")
-
+API_KEY = env("APCA_API_KEY_ID")
+API_SECRET = env("APCA_API_SECRET_KEY")
+PAPER = env_bool("ALPACA_PAPER", "true")  # خله مثل ما هو (واضح عندك موجود)
 
 @dataclass
 class SymState:
