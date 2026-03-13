@@ -7,7 +7,8 @@ from collections import deque
 TRADOVATE_URL = "https://demo.tradovateapi.com/v1"
 APP_ID = "MyBot"
 API_SECRET = "29841443-34e8-4660-8488-87425f18c213"
-USERNAME = "MFFUmFjXfihEG"
+# تم تصحيح اليوزر بزيادة حرف u بناءً على صورة البريد
+USERNAME = "MFFUmFjuXfihEG" 
 PASSWORD = "V+TT1?8wSnqrv" 
 
 # --- إعدادات تليجرام ---
@@ -28,40 +29,50 @@ def send_tg(text):
 
 def get_token():
     url = f"{TRADOVATE_URL}/auth/accesstokenrequest"
-    payload = {"name": USERNAME, "password": PASSWORD, "appId": APP_ID, "appVersion": "1.0", "cid": 0, "sec": API_SECRET}
+    payload = {
+        "name": USERNAME, 
+        "password": PASSWORD, 
+        "appId": APP_ID, 
+        "appVersion": "1.0", 
+        "cid": 0, 
+        "sec": API_SECRET
+    }
     try:
         res = requests.post(url, json=payload, timeout=15)
         if res.status_code == 200:
             logging.info("✅ تم تسجيل الدخول بنجاح")
             return res.json().get('accessToken')
+        else:
+            logging.error(f"❌ فشل تسجيل الدخول: {res.text}")
+            return None
+    except Exception as e:
+        logging.error(f"❌ خطأ اتصال: {e}")
         return None
-    except: return None
 
 def start_bot():
-    token = get_token()
-    if not token:
-        logging.error("❌ فشل تسجيل الدخول عند البداية")
-        return
-
-    send_tg("🚀 البوت بدأ العمل الآن بنظام المراقبة الدائمة...")
-    prices = {s: deque(maxlen=20) for s in SYMBOLS}
-    
-    # حلقة لانهائية لضمان عدم إغلاق السيرفر
+    # حلقة خارجية لضمان بقاء السيرفر يعمل حتى لو حدث خطأ
     while True:
-        try:
-            for s in SYMBOLS:
-                headers = {"Authorization": f"Bearer {token}"}
-                res = requests.get(f"{TRADOVATE_URL}/md/getquotes?symbols={s}", headers=headers, timeout=5)
-                if res.status_code == 200 and res.json():
-                    mid = (res.json()[0]['bidPrice'] + res.json()[0]['askPrice']) / 2
-                    prices[s].append(mid)
-                    logging.info(f"مراقبة {s}: السعر الحالي {mid}")
+        token = get_token()
+        if token:
+            send_tg("🚀 تم الاتصال بنجاح! البوت بدأ بمراقبة السوق الآن...")
+            prices = {s: deque(maxlen=20) for s in SYMBOLS}
             
-            time.sleep(10) # فحص كل 10 ثواني
-        except Exception as e:
-            logging.error(f"خطأ في الحلقة: {e}")
-            token = get_token() # تجديد التوكن عند الخطأ
-            time.sleep(5)
+            while True: # حلقة المراقبة
+                try:
+                    for s in SYMBOLS:
+                        headers = {"Authorization": f"Bearer {token}"}
+                        res = requests.get(f"{TRADOVATE_URL}/md/getquotes?symbols={s}", headers=headers, timeout=5)
+                        if res.status_code == 200 and res.json():
+                            mid = (res.json()[0]['bidPrice'] + res.json()[0]['askPrice']) / 2
+                            prices[s].append(mid)
+                            logging.info(f"مراقبة {s}: السعر الحالي {mid}")
+                    time.sleep(10)
+                except Exception as e:
+                    logging.error(f"حدث خطأ أثناء المراقبة: {e}")
+                    break # ارجع للحلقة الخارجية لتجديد التوكن
+        else:
+            logging.error("❌ فشل تسجيل الدخول.. سأحاول مرة أخرى بعد 30 ثانية")
+            time.sleep(30)
 
 if __name__ == "__main__":
     start_bot()
