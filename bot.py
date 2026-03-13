@@ -28,39 +28,30 @@ def get_token():
         res = requests.post(url, json=payload, timeout=15)
         if res.status_code == 200:
             return res.json().get('accessToken')
-        logging.error(f"❌ فشل الدخول: {res.text}")
         return None
-    except Exception as e:
-        logging.error(f"🔌 خطأ اتصال: {e}")
-        return None
+    except: return None
 
 def start_bot():
-    logging.info("🚀 بدء تشغيل البوت...")
-    send_tg("✅ البوت يحاول الاتصال الآن بعد معالجة خطأ WebSocket.")
+    send_tg("🤖 نبض البوت: أنا شغال الآن وبدأت أول محاولة اتصال...")
     
     while True:
         token = get_token()
         if token:
-            logging.info("🔑 تم تجديد التوكن بنجاح")
             headers = {"Authorization": f"Bearer {token}"}
-            
-            # محاولة جلب السعر بهدوء
-            for _ in range(20): # محاولة لـ 20 مرة قبل تجديد التوكن
+            # جربنا الرموز الأكثر شيوعاً لعقد الـ S&P 500
+            for sym in ["ESM6", "ESH6", "ESZ5"]: 
                 try:
-                    # نستخدم رمز ESM6 أو ESH6 حسب المتاح في حسابك
-                    res = requests.get(f"{TRADOVATE_URL}/md/getquotes?symbols=ESM6", headers=headers, timeout=10)
+                    res = requests.get(f"{TRADOVATE_URL}/md/getquotes?symbols={sym}", headers=headers, timeout=10)
                     if res.status_code == 200 and res.json():
                         price = res.json()[0].get('lastPrice')
                         if price:
-                            logging.info(f"📈 السعر الحالي: {price}")
-                    
-                    time.sleep(45) # انتظار 45 ثانية لضمان عدم الحظر (مهم جداً)
-                except Exception as e:
-                    logging.warning(f"⚠️ محاولة فاشلة: {e}")
-                    time.sleep(30)
-        else:
-            logging.info("⏳ انتظار دقيقتين للمحاولة مرة أخرى...")
-            time.sleep(120)
+                            send_tg(f"📈 سعر {sym} الحالي هو: {price}")
+                            break
+                except: continue
+        
+        # رسالة طمأنينة كل 5 دقائق في حال عدم وجود سعر
+        time.sleep(300) 
+        send_tg("🔄 البوت لا يزال يعمل في الخلفية ويحاول جلب البيانات...")
 
 if __name__ == "__main__":
     start_bot()
