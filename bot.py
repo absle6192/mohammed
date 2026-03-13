@@ -1,24 +1,41 @@
 import requests
 import time
+import sys
 
-# بياناتك كما هي
-TG_TOKEN = "7045330364:AAEm660v5y3RCGT7WsssqoCMEdDE7qjxDNwo" 
+# البيانات المؤكدة من صورك الأخيرة
+TG_TOKEN = "8057957727:AAF970v5y3RCGT7WsssqoCMEdDE7qjxDNwo"
 TG_CHAT_ID = "1682557412"
 
-def send_test():
+def send_final():
+    # استخدام رابط مباشر مع مكتبة requests بشكل مبسط جداً
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TG_CHAT_ID, 
-        "text": "🚀 يا إياد، إذا وصلت هذه الرسالة فالاتصال سليم 100% والسيرفر الأمريكي شغال!"
+    data = {
+        "chat_id": TG_CHAT_ID,
+        "text": "🛡️ المحاولة الأخيرة: الربط شغال والسيرفر الأمريكي استجاب يا إياد!"
     }
+    
     try:
-        res = requests.post(url, json=payload)
-        print(f"Response: {res.status_code}, {res.text}")
+        # إرسال الطلب مع مهلة زمنية 15 ثانية
+        response = requests.post(url, data=data, timeout=15)
+        # طباعة النتيجة فوراً في سجلات Koyeb لتعرف ماذا حدث
+        print(f"--- RESULT ---")
+        print(f"Status Code: {response.status_code}")
+        print(f"Response Body: {response.text}")
+        print(f"--------------")
+        return response.status_code == 200
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"⚠️ Error: {str(e)}")
+        return False
 
 if __name__ == "__main__":
-    send_test()
-    # حلقة بسيطة ليبقى السيرفر Healthy
+    print("🚀 بدء تشغيل البوت...")
+    success = send_final()
+    
+    if success:
+        print("✅ تم إرسال الرسالة بنجاح!")
+    else:
+        print("❌ فشل الإرسال، راجع السجلات أعلاه.")
+    
+    # حلقة بسيطة ليبقى السيرفر Healthy ولا يتوقف
     while True:
         time.sleep(60)
