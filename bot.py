@@ -16,7 +16,7 @@ TG_CHAT_ID = "1682557412"
 
 # --- إعدادات الاستراتيجية ---
 SYMBOLS = ["ESH6", "NQH6"] 
-MIN_MOVE_PCT = 0.0001 # نسبة حركة بسيطة جداً للتأكد من عمل البوت
+MIN_MOVE_PCT = 0.0001 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
@@ -28,69 +28,40 @@ def send_tg(text):
 
 def get_token():
     url = f"{TRADOVATE_URL}/auth/accesstokenrequest"
-    payload = {
-        "name": USERNAME, 
-        "password": PASSWORD, 
-        "appId": APP_ID, 
-        "appVersion": "1.0", 
-        "cid": 0, 
-        "sec": API_SECRET
-    }
+    payload = {"name": USERNAME, "password": PASSWORD, "appId": APP_ID, "appVersion": "1.0", "cid": 0, "sec": API_SECRET}
     try:
         res = requests.post(url, json=payload, timeout=15)
         if res.status_code == 200:
             logging.info("✅ تم تسجيل الدخول بنجاح")
             return res.json().get('accessToken')
-        else:
-            logging.error(f"❌ فشل تسجيل الدخول: {res.text}")
-            return None
-    except Exception as e:
-        logging.error(f"❌ خطأ اتصال: {e}")
         return None
-
-def place_order(token, symbol, action):
-    headers = {"Authorization": f"Bearer {token}"}
-    try:
-        acc_res = requests.get(f"{TRADOVATE_URL}/account/list", headers=headers, timeout=10)
-        acc_id = acc_res.json()[0]['id']
-        payload = {
-            "accountSpec": USERNAME, 
-            "accountId": acc_id, 
-            "action": action, 
-            "symbol": symbol, 
-            "orderStrategyTypeId": 1, 
-            "orderQty": 1, 
-            "orderType": "Market", 
-            "isAutomated": True
-        }
-        requests.post(f"{TRADOVATE_URL}/order/placeorder", json=payload, headers=headers, timeout=10)
-        send_tg(f"✅ تم تنفيذ أمر {action} على {symbol}")
-    except: pass
+    except: return None
 
 def start_bot():
     token = get_token()
-    if not token: return
+    if not token:
+        logging.error("❌ فشل تسجيل الدخول عند البداية")
+        return
 
-    send_tg("🚀 البوت بدأ العمل الآن وسيراقب السوق...")
+    send_tg("🚀 البوت بدأ العمل الآن بنظام المراقبة الدائمة...")
     prices = {s: deque(maxlen=20) for s in SYMBOLS}
     
+    # حلقة لانهائية لضمان عدم إغلاق السيرفر
     while True:
-        for s in SYMBOLS:
-            try:
+        try:
+            for s in SYMBOLS:
                 headers = {"Authorization": f"Bearer {token}"}
                 res = requests.get(f"{TRADOVATE_URL}/md/getquotes?symbols={s}", headers=headers, timeout=5)
                 if res.status_code == 200 and res.json():
                     mid = (res.json()[0]['bidPrice'] + res.json()[0]['askPrice']) / 2
                     prices[s].append(mid)
-                    
-                    if len(prices[s]) >= 10:
-                        move = (prices[s][-1] - prices[s][0]) / prices[s][0]
-                        if abs(move) >= MIN_MOVE_PCT:
-                            place_order(token, s, "Buy" if move > 0 else "Sell")
-                            prices[s].clear() 
-            except: 
-                token = get_token() # إعادة الاتصال عند الضرورة
-        time.sleep(2)
+                    logging.info(f"مراقبة {s}: السعر الحالي {mid}")
+            
+            time.sleep(10) # فحص كل 10 ثواني
+        except Exception as e:
+            logging.error(f"خطأ في الحلقة: {e}")
+            token = get_token() # تجديد التوكن عند الخطأ
+            time.sleep(5)
 
 if __name__ == "__main__":
     start_bot()
