@@ -2,15 +2,14 @@ import requests
 import time
 import logging
 
-# --- بيانات الوصول ---
+# --- إعدادات الحساب ---
 TRADOVATE_URL = "https://demo.tradovateapi.com/v1"
 APP_ID = "MyBot"
 API_SECRET = "29841443-34e8-4660-8488-87425f18c213"
 USERNAME = "MFFUmFjuXfihEG" 
 PASSWORD = "V+TT1?8wSnqrv" 
-ACCOUNT_SPEC = "MFFUEVRPD553939001"
 
-# --- تليجرام ---
+# --- إعدادات تليجرام ---
 TG_TOKEN = "7045330364:AAEm660v5y3RCGT7WsssqoCMEdDE7qjxDNwo" 
 TG_CHAT_ID = "1682557412"
 
@@ -29,40 +28,39 @@ def get_token():
         res = requests.post(url, json=payload, timeout=15)
         if res.status_code == 200:
             return res.json().get('accessToken')
+        logging.error(f"❌ فشل الدخول: {res.text}")
         return None
-    except: return None
+    except Exception as e:
+        logging.error(f"🔌 خطأ اتصال: {e}")
+        return None
 
 def start_bot():
+    logging.info("🚀 بدء تشغيل البوت...")
+    send_tg("✅ البوت يحاول الاتصال الآن بعد معالجة خطأ WebSocket.")
+    
     while True:
         token = get_token()
         if token:
-            logging.info("✅ تم الاتصال.. جاري جلب الأسعار")
-            send_tg("✅ البوت متصل الآن. جاري محاولة سحب أسعار السوق...")
+            logging.info("🔑 تم تجديد التوكن بنجاح")
             headers = {"Authorization": f"Bearer {token}"}
             
-            # محاولة جلب السعر بأكثر من تنسيق للرمز
-            symbols = ["ESH6", "ES", "ESM6"] 
-            
-            while True:
-                success = False
-                for sym in symbols:
-                    try:
-                        res = requests.get(f"{TRADOVATE_URL}/md/getquotes?symbols={sym}", headers=headers, timeout=10)
-                        if res.status_code == 200 and res.json():
-                            data = res.json()[0]
-                            price = data.get('lastPrice') or data.get('bidPrice')
-                            if price:
-                                logging.info(f"📊 {sym}: {price}")
-                                success = True
-                                break
-                    except: continue
-                
-                if not success:
-                    logging.warning("⚠️ لم يتم العثور على سعر، سأحاول مجدداً بعد قليل")
-                
-                time.sleep(30) # انتظار نصف دقيقة بين المحاولات
+            # محاولة جلب السعر بهدوء
+            for _ in range(20): # محاولة لـ 20 مرة قبل تجديد التوكن
+                try:
+                    # نستخدم رمز ESM6 أو ESH6 حسب المتاح في حسابك
+                    res = requests.get(f"{TRADOVATE_URL}/md/getquotes?symbols=ESM6", headers=headers, timeout=10)
+                    if res.status_code == 200 and res.json():
+                        price = res.json()[0].get('lastPrice')
+                        if price:
+                            logging.info(f"📈 السعر الحالي: {price}")
+                    
+                    time.sleep(45) # انتظار 45 ثانية لضمان عدم الحظر (مهم جداً)
+                except Exception as e:
+                    logging.warning(f"⚠️ محاولة فاشلة: {e}")
+                    time.sleep(30)
         else:
-            time.sleep(60)
+            logging.info("⏳ انتظار دقيقتين للمحاولة مرة أخرى...")
+            time.sleep(120)
 
 if __name__ == "__main__":
     start_bot()
