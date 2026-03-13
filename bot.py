@@ -7,12 +7,14 @@ from collections import deque
 TRADOVATE_URL = "https://demo.tradovateapi.com/v1"
 APP_ID = "MyBot"
 API_SECRET = "29841443-34e8-4660-8488-87425f18c213"
-# تم تصحيح اليوزر بناءً على صورة البريد (إضافة حرف u)
 USERNAME = "MFFUmFjuXfihEG" 
 PASSWORD = "V+TT1?8wSnqrv" 
+# تم إضافة رقم الحساب التجريبي الخاص بك هنا
+ACCOUNT_ID_NUMBER = 553939001 
+ACCOUNT_SPEC = "MFFUEVRPD553939001"
 
 # --- إعدادات تليجرام ---
-TG_TOKEN = "0v5y3RCGT7WsssqoCMEdDE7qjxDNwo" 
+TG_TOKEN = "7045330364:AAEm660v5y3RCGT7WsssqoCMEdDE7qjxDNwo" 
 TG_CHAT_ID = "1682557412"
 
 # --- إعدادات الاستراتيجية ---
@@ -52,15 +54,9 @@ def get_token():
 def place_order(token, symbol, action):
     headers = {"Authorization": f"Bearer {token}"}
     try:
-        # جلب رقم الحساب تلقائياً
-        acc_res = requests.get(f"{TRADOVATE_URL}/account/list", headers=headers, timeout=10)
-        accounts = acc_res.json()
-        if not accounts: return
-        acc_id = accounts[0]['id']
-        
         payload = {
-            "accountSpec": USERNAME,
-            "accountId": acc_id,
+            "accountSpec": ACCOUNT_SPEC,
+            "accountId": ACCOUNT_ID_NUMBER,
             "action": action,
             "symbol": symbol,
             "orderStrategyTypeId": 1,
@@ -70,17 +66,19 @@ def place_order(token, symbol, action):
         }
         res = requests.post(f"{TRADOVATE_URL}/order/placeorder", json=payload, headers=headers, timeout=10)
         if res.status_code == 200:
-            msg = f"🔔 أمر {action} نفذ على {symbol}!"
+            msg = f"🔔 تم تنفيذ أمر {action} على رمز {symbol} في الحساب التجريبي!"
             logging.info(msg)
             send_tg(msg)
+        else:
+            logging.error(f"❌ فشل تنفيذ الأمر: {res.text}")
     except Exception as e:
-        logging.error(f"❌ خطأ في تنفيذ الأمر: {e}")
+        logging.error(f"❌ خطأ فني في تنفيذ الأمر: {e}")
 
 def start_bot():
     while True:
         token = get_token()
         if token:
-            send_tg("🚀 البوت متصل الآن ويراقب السوق...")
+            send_tg(f"🚀 البوت متصل الآن ويراقب الحساب: {ACCOUNT_SPEC}")
             prices = {s: deque(maxlen=20) for s in SYMBOLS}
             
             while True:
@@ -90,6 +88,7 @@ def start_bot():
                         res = requests.get(f"{TRADOVATE_URL}/md/getquotes?symbols={s}", headers=headers, timeout=5)
                         if res.status_code == 200 and res.json():
                             data = res.json()[0]
+                            # حساب متوسط السعر
                             mid = (data['bidPrice'] + data['askPrice']) / 2
                             prices[s].append(mid)
                             logging.info(f"مراقبة {s}: {mid}")
@@ -99,10 +98,10 @@ def start_bot():
                                 if abs(move) >= MIN_MOVE_PCT:
                                     action = "Buy" if move > 0 else "Sell"
                                     place_order(token, s, action)
-                                    prices[s].clear() # تصفير الذاكرة بعد الصفقة
+                                    prices[s].clear() 
                     time.sleep(10)
                 except Exception as e:
-                    logging.error(f"⚠️ تنبيه: {e}")
+                    logging.error(f"⚠️ تنبيه (سيتم إعادة المحاولة): {e}")
                     break 
         else:
             logging.error("❌ فشل الدخول.. محاولة جديدة بعد 30 ثانية")
