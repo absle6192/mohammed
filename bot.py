@@ -2,17 +2,15 @@ import requests
 import time
 import logging
 
-# --- بيانات الوصول (تم تحديثها بناءً على صورك) ---
+# --- بيانات الوصول ---
 TRADOVATE_URL = "https://demo.tradovateapi.com/v1"
 APP_ID = "MyBot"
 API_SECRET = "29841443-34e8-4660-8488-87425f18c213"
 USERNAME = "MFFUmFjuXfihEG" 
 PASSWORD = "V+TT1?8wSnqrv" 
-# رقم الحساب المباشر من لقطة الشاشة الخاصة بك
-ACCOUNT_ID_NUMBER = 553939001 
 ACCOUNT_SPEC = "MFFUEVRPD553939001"
 
-# --- إعدادات تليجرام ---
+# --- تليجرام ---
 TG_TOKEN = "7045330364:AAEm660v5y3RCGT7WsssqoCMEdDE7qjxDNwo" 
 TG_CHAT_ID = "1682557412"
 
@@ -38,27 +36,33 @@ def start_bot():
     while True:
         token = get_token()
         if token:
-            logging.info("✅ متصل بنجاح")
-            send_tg(f"🚀 تم تشغيل البوت وربطه بالمحفظة: {ACCOUNT_SPEC}")
+            logging.info("✅ تم الاتصال.. جاري جلب الأسعار")
+            send_tg("✅ البوت متصل الآن. جاري محاولة سحب أسعار السوق...")
             headers = {"Authorization": f"Bearer {token}"}
             
+            # محاولة جلب السعر بأكثر من تنسيق للرمز
+            symbols = ["ESH6", "ES", "ESM6"] 
+            
             while True:
-                try:
-                    # طلب السعر لعقد الـ S&P 500 (تأكد من الرمز الحالي ESH6 أو NQH6)
-                    res = requests.get(f"{TRADOVATE_URL}/md/getquotes?symbols=ESH6", headers=headers, timeout=10)
-                    if res.status_code == 200 and res.json():
-                        price = res.json()[0].get('lastPrice')
-                        logging.info(f"📊 السعر الحالي: {price}")
-                    elif res.status_code == 401: 
-                        break # تجديد التوكن
-                    
-                    time.sleep(20) # فترة انتظار لتجنب الحظر
-                except Exception as e:
-                    logging.error(f"⚠️ خطأ مؤقت: {e}")
-                    time.sleep(10)
-                    break 
+                success = False
+                for sym in symbols:
+                    try:
+                        res = requests.get(f"{TRADOVATE_URL}/md/getquotes?symbols={sym}", headers=headers, timeout=10)
+                        if res.status_code == 200 and res.json():
+                            data = res.json()[0]
+                            price = data.get('lastPrice') or data.get('bidPrice')
+                            if price:
+                                logging.info(f"📊 {sym}: {price}")
+                                success = True
+                                break
+                    except: continue
+                
+                if not success:
+                    logging.warning("⚠️ لم يتم العثور على سعر، سأحاول مجدداً بعد قليل")
+                
+                time.sleep(30) # انتظار نصف دقيقة بين المحاولات
         else:
-            time.sleep(60) # انتظار دقيقة في حال فشل الدخول
+            time.sleep(60)
 
 if __name__ == "__main__":
     start_bot()
