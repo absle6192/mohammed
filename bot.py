@@ -8,7 +8,7 @@ def login():
     url = "https://demo.tradovateapi.com/v1/auth/accesstokenrequest"
 
     payload = {
-        "name": USERNAME,
+        "username": USERNAME,
         "password": PASSWORD,
         "appId": "Sample App",
         "appVersion": "1.0",
