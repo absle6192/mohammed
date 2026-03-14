@@ -48,13 +48,17 @@ def login_tradovate():
         "password": PASSWORD,
         "cid": CID,
         "sec": SECRET,
-        "deviceId": "bot123",
-        "orgName": "MyFundedFutures"
+        "deviceId": "bot123"
     }
 
     try:
         r = requests.post(url, json=data)
         j = r.json()
+
+        if "accessToken" not in j:
+            print("LOGIN RESPONSE:", j)
+            send_telegram("❌ Tradovate login failed")
+            return None
 
         token = j["accessToken"]
 
@@ -65,7 +69,7 @@ def login_tradovate():
 
     except Exception as e:
 
-        print("LOGIN FAILED", e)
+        print("LOGIN FAILED:", e)
         send_telegram("❌ Could not login to Tradovate")
 
         return None
