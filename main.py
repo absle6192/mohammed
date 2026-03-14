@@ -4,6 +4,7 @@ import os
 import requests
 import time
 
+# جلب الإعدادات من Koyeb
 USER = os.getenv('RITHMIC_USER')
 PASS = os.getenv('RITHMIC_PASS')
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -20,28 +21,43 @@ def on_message(ws, message):
     print(f"📥 رسالة من ريثميك: {message}")
     try:
         data = json.loads(message)
+        # التحقق من قبول الاتصال
         if "status" in data and data["status"] == "connection_accepted":
             send_telegram("✅ تم الاتصال بنجاح بسيرفر ريثميك!")
+            print("✅ تم الاتصال وتسجيل الدخول!")
     except:
         pass
 
 def on_open(ws):
-    print("🚀 جاري تسجيل الدخول...")
-    auth_data = {"user": USER, "password": PASS, "system": "NinjaTrader Continuum", "app_id": "DEMA", "version": "1.0"}
+    print("🚀 جاري محاولة تسجيل الدخول إلى السيرفر العالمي...")
+    auth_data = {
+        "user": USER,
+        "password": PASS,
+        "system": "NinjaTrader Continuum",
+        "app_id": "DEMA",
+        "version": "1.0"
+    }
     ws.send(json.dumps(auth_data))
 
 def on_error(ws, error):
-    print(f"❌ خطأ: {error}")
+    print(f"❌ خطأ في الاتصال: {error}")
 
 def on_close(ws, close_status_code, close_msg):
-    print("🔌 انقطع الاتصال، سأحاول مجدداً...")
+    print("🔌 انقطع الاتصال، سأحاول مجدداً بعد 5 ثواني...")
     time.sleep(5)
 
 if __name__ == "__main__":
+    # هذا الرابط هو الرابط العالمي الأقوى (ws.rithmic.com) لتجنب أخطاء الشبكة
     uri = "wss://ws.rithmic.com:443"
+    
     while True:
         try:
-            ws = websocket.WebSocketApp(uri, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
+            ws = websocket.WebSocketApp(uri, 
+                                      on_open=on_open, 
+                                      on_message=on_message, 
+                                      on_error=on_error, 
+                                      on_close=on_close)
             ws.run_forever()
-        except:
+        except Exception as e:
+            print(f"Restarting... {e}")
             time.sleep(5)
