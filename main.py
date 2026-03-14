@@ -4,7 +4,7 @@ import os
 import requests
 import time
 
-# جلب الإعدادات
+# جلب الإعدادات من Koyeb (تأكد من إضافتها في Environment Variables)
 USER = os.getenv('RITHMIC_USER')
 PASS = os.getenv('RITHMIC_PASS')
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -18,37 +18,37 @@ def send_telegram(message):
         print(f"Telegram Error: {e}")
 
 def on_message(ws, message):
-    print(f"📥 رسالة جديدة: {message}")
-    # إذا كانت الرسالة نصية وليست JSON، قد نحتاج لمعالجتها بشكل مختلف
+    print(f"📥 رسالة من ريثميك: {message}")
     try:
         data = json.loads(message)
+        # التحقق من نجاح الاتصال
         if "status" in data and data["status"] == "connection_accepted":
-            send_telegram("✅ تم الاتصال بنجاح بـ Rithmic!")
+            send_telegram("✅ تم الاتصال بنجاح بسيرفر NinjaTrader Continuum!")
     except:
         pass
 
 def on_open(ws):
-    print("🚀 جاري إرسال بيانات الدخول...")
+    print("🚀 جاري محاولة تسجيل الدخول إلى NinjaTrader Continuum...")
     auth_data = {
         "user": USER,
         "password": PASS,
-        "system": "Rithmic Paper Trading",
+        "system": "NinjaTrader Continuum",  # التعديل الذهبي لحسابات نينجا تريدر
         "app_id": "DEMA",
         "version": "1.0"
     }
     ws.send(json.dumps(auth_data))
 
 def on_error(ws, error):
-    print(f"❌ خطأ: {error}")
+    print(f"❌ خطأ في الاتصال: {error}")
 
 def on_close(ws, close_status_code, close_msg):
-    print("🔌 تم إغلاق الاتصال، سأحاول مجدداً بعد 5 ثواني...")
+    print("🔌 انقطع الاتصال، سأحاول مجدداً بعد 5 ثواني...")
     time.sleep(5)
 
 if __name__ == "__main__":
+    # هذا الرابط مخصص لسيرفرات Paper Trading
     uri = "wss://paper-trading.rithmic.com:443"
     
-    # حلقة لا نهائية عشان السيرفر ما يقفل أبداً
     while True:
         try:
             ws = websocket.WebSocketApp(uri, 
@@ -58,5 +58,5 @@ if __name__ == "__main__":
                                       on_close=on_close)
             ws.run_forever()
         except Exception as e:
-            print(f"Restarting due to error: {e}")
+            print(f"Restarting... {e}")
             time.sleep(5)
