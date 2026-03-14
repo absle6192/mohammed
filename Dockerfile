@@ -1,7 +1,12 @@
 FROM python:3.11
+
 WORKDIR /app
-# هذي النقطة هي التغيير (نسخ كل شي داخل المجلد)
+
+# نسخ كل الملفات (اللي هي أصلاً صارت منظورة للبوت)
 COPY . .
-RUN pip install --no-cache-dir -r mohammed/requirements.txt
-# هنا المسار الجديد للملف
-CMD ["python", "mohammed/main.py"]
+
+# تثبيت المكتبات (بدون كتابة اسم المجلد)
+RUN pip install --no-cache-dir -r requirements.txt
+
+# تشغيل البوت مباشرة
+CMD ["python", "main.py"]
