@@ -1,47 +1,36 @@
+import os
 import requests
+import time
 
-def login():
+# جلب التوكن من Environment Variables
+TOKEN = os.getenv("TRADOVATE_TOKEN")
 
-    url = "https://demo.tradovateapi.com/v1/auth/accesstokenrequest"
+# رابط API للتجريبي
+BASE_URL = "https://demo.tradovateapi.com/v1"
 
-    payload = {
-        "name": "MFFUmFjuXfihEG",
-        "password": "V+TT1?8wSnqrv",
-        "appId": "Tradovate",
-        "appVersion": "1.0",
-        "deviceId": "test-device"
-    }
+headers = {
+    "Authorization": f"Bearer {TOKEN}",
+    "Content-Type": "application/json"
+}
 
-    headers = {
-        "Content-Type": "application/json"
-    }
+def check_connection():
+    url = f"{BASE_URL}/user/list"
+    r = requests.get(url, headers=headers)
 
-    r = requests.post(url, json=payload, headers=headers)
-
-    data = r.json()
-
-    print("Status Code:", r.status_code)
-    print("Response:", data)
-
-    if "accessToken" in data:
-        token = data["accessToken"]
-        print("LOGIN SUCCESS ✅")
-        return token
+    if r.status_code == 200:
+        print("✅ Connected to Tradovate")
+        print(r.json())
     else:
-        print("LOGIN FAILED ❌")
-        return None
-
+        print("❌ Connection failed")
+        print(r.text)
 
 def main():
+    print("Starting bot...")
+    check_connection()
 
-    token = login()
-
-    if token:
-        print("Token:", token)
-        print("Bot connected successfully 🚀")
-    else:
-        print("Could not login to Tradovate ❌")
-
+    while True:
+        print("Bot running...")
+        time.sleep(60)
 
 if __name__ == "__main__":
     main()
