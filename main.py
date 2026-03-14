@@ -23,7 +23,6 @@ def get_price():
 
 while True:
     try:
-        global last_price
 
         price = get_price()
 
