@@ -7,8 +7,7 @@ payload = {
     "password": "V+TT1?8wSnqrv",
     "appId": "TestApp",
     "appVersion": "1.0",
-    "deviceId": "test-device",
-    "cid": 7
+    "deviceId": "test-device"
 }
 
 headers = {
