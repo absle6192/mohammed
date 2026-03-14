@@ -7,7 +7,7 @@ def login():
     payload = {
         "name": "MFFUmFjuXfihEG",
         "password": "V+TT1?8wSnqrv",
-        "appId": "SampleApp",
+        "appId": "Tradovate",
         "appVersion": "1.0",
         "deviceId": "test-device"
     }
