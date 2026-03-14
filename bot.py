@@ -5,13 +5,15 @@ USERNAME = os.getenv("TRADOVATE_USERNAME")
 PASSWORD = os.getenv("TRADOVATE_PASSWORD")
 
 def login():
+
     url = "https://demo.tradovateapi.com/v1/auth/accesstokenrequest"
 
     payload = {
-        "username": USERNAME,
+        "name": USERNAME,
         "password": PASSWORD,
         "appId": "Sample App",
         "appVersion": "1.0",
+        "deviceId": "123456789",
         "cid": 0
     }
 
@@ -26,18 +28,24 @@ def login():
 
     data = r.json()
 
-    if "accessToken" not in data:
+    if "accessToken" in data:
+        token = data["accessToken"]
+        print("Login success ✅")
+        print("Token:", token)
+        return token
+
+    elif "p-ticket" in data:
         print("Login failed ❌")
+        print("Server returned p-ticket instead of token")
         return None
 
-    token = data["accessToken"]
-    print("Login success ✅")
-    print("Token:", token)
-
-    return token
+    else:
+        print("Unknown response:", data)
+        return None
 
 
 def main():
+
     print("Starting bot...")
 
     token = login()
