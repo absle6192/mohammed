@@ -4,7 +4,7 @@ import os
 import requests
 import time
 
-# جلب الإعدادات من Koyeb (تأكد من إضافتها في Environment Variables)
+# جلب الإعدادات من Koyeb
 USER = os.getenv('RITHMIC_USER')
 PASS = os.getenv('RITHMIC_PASS')
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -21,18 +21,17 @@ def on_message(ws, message):
     print(f"📥 رسالة من ريثميك: {message}")
     try:
         data = json.loads(message)
-        # التحقق من نجاح الاتصال
         if "status" in data and data["status"] == "connection_accepted":
             send_telegram("✅ تم الاتصال بنجاح بسيرفر NinjaTrader Continuum!")
     except:
         pass
 
 def on_open(ws):
-    print("🚀 جاري محاولة تسجيل الدخول إلى NinjaTrader Continuum...")
+    print("🚀 جاري محاولة تسجيل الدخول...")
     auth_data = {
         "user": USER,
         "password": PASS,
-        "system": "NinjaTrader Continuum",  # التعديل الذهبي لحسابات نينجا تريدر
+        "system": "NinjaTrader Continuum",
         "app_id": "DEMA",
         "version": "1.0"
     }
@@ -46,8 +45,8 @@ def on_close(ws, close_status_code, close_msg):
     time.sleep(5)
 
 if __name__ == "__main__":
-    # هذا الرابط مخصص لسيرفرات Paper Trading
-    uri = "wss://paper-trading.rithmic.com:443"
+    # تم تغيير الرابط هنا للرابط العالمي الأقوى ليتخطى مشكلة الـ DNS
+    uri = "wss://ws.rithmic.com:443"
     
     while True:
         try:
