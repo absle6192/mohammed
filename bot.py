@@ -5,7 +5,7 @@ url = "https://demo.tradovateapi.com/v1/auth/accesstokenrequest"
 payload = {
     "name": "MFFUmFjuXfihEG",
     "password": "V+TT1?8wSnqrv",
-    "appId": "TestApp",
+    "appId": "SampleApp",
     "appVersion": "1.0",
     "deviceId": "test-device"
 }
