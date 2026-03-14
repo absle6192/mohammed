@@ -1,20 +1,47 @@
 import requests
 
-url = "https://demo.tradovateapi.com/v1/auth/accesstokenrequest"
+def login():
 
-payload = {
-    "name": "MFFUmFjuXfihEG",
-    "password": "V+TT1?8wSnqrv",
-    "appId": "SampleApp",
-    "appVersion": "1.0",
-    "deviceId": "test-device"
-}
+    url = "https://demo.tradovateapi.com/v1/auth/accesstokenrequest"
 
-headers = {
-    "Content-Type": "application/json"
-}
+    payload = {
+        "name": "MFFUmFjuXfihEG",
+        "password": "V+TT1?8wSnqrv",
+        "appId": "SampleApp",
+        "appVersion": "1.0",
+        "deviceId": "test-device"
+    }
 
-r = requests.post(url, json=payload, headers=headers)
+    headers = {
+        "Content-Type": "application/json"
+    }
 
-print("Status Code:", r.status_code)
-print("Response:", r.text)
+    r = requests.post(url, json=payload, headers=headers)
+
+    data = r.json()
+
+    print("Status Code:", r.status_code)
+    print("Response:", data)
+
+    if "accessToken" in data:
+        token = data["accessToken"]
+        print("LOGIN SUCCESS ✅")
+        return token
+    else:
+        print("LOGIN FAILED ❌")
+        return None
+
+
+def main():
+
+    token = login()
+
+    if token:
+        print("Token:", token)
+        print("Bot connected successfully 🚀")
+    else:
+        print("Could not login to Tradovate ❌")
+
+
+if __name__ == "__main__":
+    main()
