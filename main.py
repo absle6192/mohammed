@@ -7,6 +7,7 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 last_price = None
 
+
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     data = {
@@ -15,16 +16,31 @@ def send_telegram(message):
     }
     requests.post(url, json=data)
 
+
 def get_price():
     url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols=NQ=F"
-    data = requests.get(url).json()
-    price = data["quoteResponse"]["result"][0]["regularMarketPrice"]
-    return price
+    response = requests.get(url)
+    data = response.json()
+
+    result = data["quoteResponse"]["result"]
+
+    if len(result) == 0:
+        return None
+
+    return result[0]["regularMarketPrice"]
+
 
 while True:
     try:
 
         price = get_price()
+
+        if price is None:
+            print("No price received")
+            time.sleep(60)
+            continue
+
+        print("Current price:", price)
 
         if last_price is not None:
 
