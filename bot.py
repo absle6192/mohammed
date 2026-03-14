@@ -1,98 +1,44 @@
+import websocket
+import ssl
+import json
 import os
-import requests
-import time
 
-# =========================
-# TELEGRAM
-# =========================
+# بيانات الدخول (يفضل وضعها في Environment Variables بسيرفر Koyeb)
+USER = os.getenv('RITHMIC_USER', 'nffn00@gmail.com')
+PASS = os.getenv('RITHMIC_PASS', 'كلمة_المرور_الخاصة_بك')
+SYSTEM = 'Rithmic Paper Trading' # نظام الحساب التجريبي
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+def on_message(ws, message):
+    print(f"--- رسالة من Rithmic: {message}")
 
-def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+def on_error(ws, error):
+    print(f"--- خطأ في الاتصال: {error}")
 
-    data = {
-        "chat_id": CHAT_ID,
-        "text": msg
+def on_close(ws, close_status_code, close_msg):
+    print("--- تم إغلاق الاتصال بالسيرفر ---")
+
+def on_open(ws):
+    print("--- جاري محاولة تسجيل الدخول... ---")
+    # هذا هو "طلب المصافحة" لإثبات هويتك للسيرفر
+    auth_request = {
+        "user": USER,
+        "password": PASS,
+        "system": SYSTEM,
+        "app_id": "DEMA", # معرف تجريبي للمبرمجين
+        "version": "1.0"
     }
-
-    try:
-        requests.post(url, data=data)
-    except:
-        print("Telegram error")
-
-
-# =========================
-# TRADOVATE SETTINGS
-# =========================
-
-USERNAME = os.getenv("TRADOVATE_USERNAME")
-PASSWORD = os.getenv("TRADOVATE_PASSWORD")
-CID = os.getenv("TRADOVATE_CID")
-SECRET = os.getenv("TRADOVATE_SECRET")
-
-BASE_URL = "https://demo.tradovateapi.com"
-
-
-# =========================
-# LOGIN
-# =========================
-
-def login_tradovate():
-
-    url = f"{BASE_URL}/v1/auth/accesstokenrequest"
-
-    data = {
-        "name": USERNAME,
-        "password": PASSWORD,
-        "cid": CID,
-        "sec": SECRET,
-        "deviceId": "bot123"
-    }
-
-    try:
-        r = requests.post(url, json=data)
-        j = r.json()
-
-        if "accessToken" not in j:
-            print("LOGIN RESPONSE:", j)
-            send_telegram("❌ Tradovate login failed")
-            return None
-
-        token = j["accessToken"]
-
-        send_telegram("✅ Connected to Tradovate")
-        print("Login success")
-
-        return token
-
-    except Exception as e:
-
-        print("LOGIN FAILED:", e)
-        send_telegram("❌ Could not login to Tradovate")
-
-        return None
-
-
-# =========================
-# MAIN
-# =========================
-
-def main():
-
-    send_telegram("🚀 Bot started")
-
-    token = login_tradovate()
-
-    if token is None:
-        return
-
-    while True:
-
-        print("Bot running...")
-        time.sleep(60)
-
+    ws.send(json.dumps(auth_request))
 
 if __name__ == "__main__":
-    main()
+    # رابط سيرفر Rithmic للـ API (تجريبي)
+    # ملاحظة: العناوين الفعلية قد تختلف حسب المنطقة، سنبدأ بهذا العنوان العام:
+    uri = "wss://paper-trading.rithmic.com:443" 
+
+    ws = websocket.WebSocketApp(uri,
+                              on_open=on_open,
+                              on_message=on_message,
+                              on_error=on_error,
+                              on_close=on_close)
+
+    # تشغيل الاتصال مع تخطي فحص الـ SSL إذا لزم الأمر للتجربة
+    ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
