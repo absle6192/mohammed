@@ -70,7 +70,7 @@ SL: {sl}
 
         last_price = price
 
-        time.sleep(60)
+        time.sleep(10)
 
     except Exception as e:
         print("Error:", e)
