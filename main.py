@@ -16,55 +16,55 @@ def send_telegram(message):
 
 def get_price():
     url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols=NQ=F"
-    data = requests.get(url).json()
-    price = data["quoteResponse"]["result"][0]["regularMarketPrice"]
-    return price
+    r = requests.get(url, timeout=10)
+    data = r.json()
+    return data["quoteResponse"]["result"][0]["regularMarketPrice"]
 
 
 send_telegram("🚀 NQ Trading Bot Started")
 
 while True:
-
     try:
 
         price = get_price()
 
         send_telegram(f"💰 NQ Price: {price}")
 
+        global last_price
+
         if last_price is not None:
 
-            # LONG
             if price > last_price:
 
-                tp = price + 20
-                sl = price - 10
+                tp = round(price + 20, 2)
+                sl = round(price - 10, 2)
 
-                send_telegram(f"""
-📈 LONG NQ
+                send_telegram(
+f"""📈 LONG NQ
 
 Entry: {price}
 TP: {tp}
-SL: {sl}
-""")
+SL: {sl}"""
+                )
 
-            # SHORT
             elif price < last_price:
 
-                tp = price - 20
-                sl = price + 10
+                tp = round(price - 20, 2)
+                sl = round(price + 10, 2)
 
-                send_telegram(f"""
-📉 SHORT NQ
+                send_telegram(
+f"""📉 SHORT NQ
 
 Entry: {price}
 TP: {tp}
-SL: {sl}
-""")
+SL: {sl}"""
+                )
 
         last_price = price
 
         time.sleep(60)
 
     except Exception as e:
-        print(e)
-        time.sleep(10)
+
+        send_telegram(f"⚠️ Error: {e}")
+        time.sleep(20)
