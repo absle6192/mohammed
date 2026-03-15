@@ -8,7 +8,6 @@ API_KEY = os.getenv("TWELVE_API_KEY")
 SYMBOL = os.getenv("SYMBOL")
 
 last_price = None
-last_signal = None
 
 
 def send_telegram(message):
@@ -53,32 +52,35 @@ while True:
 
         print("Current price:", price)
 
-        if last_price is not None:
-
-            if price > last_price and last_signal != "LONG":
-
-                last_signal = "LONG"
-
-                send_telegram(f"""
-📈 LONG SIGNAL
+        # رسالة اختبار كل دقيقة
+        send_telegram(f"""
+🧪 BOT TEST
 
 Symbol: {SYMBOL}
-Entry: {price}
-Take Profit: {price + 20}
-Stop Loss: {price - 10}
+Current Price: {price}
+
+Bot Status: RUNNING
 """)
 
-            elif price < last_price and last_signal != "SHORT":
+        # مقارنة السعر السابق
+        if last_price is not None:
 
-                last_signal = "SHORT"
+            if price > last_price:
 
                 send_telegram(f"""
-📉 SHORT SIGNAL
+📈 TEST LONG SIGNAL
 
 Symbol: {SYMBOL}
 Entry: {price}
-Take Profit: {price - 20}
-Stop Loss: {price + 10}
+""")
+
+            elif price < last_price:
+
+                send_telegram(f"""
+📉 TEST SHORT SIGNAL
+
+Symbol: {SYMBOL}
+Entry: {price}
 """)
 
         last_price = price
