@@ -24,22 +24,46 @@ def get_price():
     return price
 
 
-# 🔔 رسالة عند تشغيل البوت
-send_telegram("🚀 Bot started and running")
+send_telegram("🚀 NQ Bot Started")
 
 
 while True:
+
     try:
 
         price = get_price()
 
         if last_price is not None:
 
+            # LONG
             if price > last_price:
-                send_telegram(f"📈 BUY NQ\nEntry: {price}")
 
+                tp = round(price + 20, 2)
+                sl = round(price - 20, 2)
+
+                send_telegram(
+f"""📈 LONG NQ
+
+Entry: {price}
+TP: {tp}
+SL: {sl}
+"""
+)
+
+            # SHORT
             elif price < last_price:
-                send_telegram(f"📉 SELL NQ\nEntry: {price}")
+
+                tp = round(price - 20, 2)
+                sl = round(price + 20, 2)
+
+                send_telegram(
+f"""📉 SHORT NQ
+
+Entry: {price}
+TP: {tp}
+SL: {sl}
+"""
+)
 
         last_price = price
 
