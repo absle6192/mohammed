@@ -17,7 +17,6 @@ def send_telegram(message):
             "chat_id": CHAT_ID,
             "text": message
         }, timeout=10)
-
     except Exception as e:
         print("Telegram error:", e)
 
@@ -25,19 +24,14 @@ def send_telegram(message):
 def get_price():
 
     try:
-
         url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols=NQ=F"
-
         r = requests.get(url, timeout=10)
-
         data = r.json()
 
         return data["quoteResponse"]["result"][0]["regularMarketPrice"]
 
     except Exception as e:
-
         print("Price error:", e)
-
         return None
 
 
@@ -59,25 +53,27 @@ while True:
 
             if price > last_price:
 
-                send_telegram(
-f"""📈 LONG NQ
+                tp = price + 20
+                sl = price - 10
 
+                send_telegram(f"""
+📈 LONG NQ
 Entry: {price}
-TP: {price+20}
-SL: {price-10}
-"""
-)
+TP: {tp}
+SL: {sl}
+""")
 
             elif price < last_price:
 
-                send_telegram(
-f"""📉 SHORT NQ
+                tp = price - 20
+                sl = price + 10
 
+                send_telegram(f"""
+📉 SHORT NQ
 Entry: {price}
-TP: {price-20}
-SL: {price+10}
-"""
-)
+TP: {tp}
+SL: {sl}
+""")
 
         last_price = price
 
@@ -86,5 +82,4 @@ SL: {price+10}
     except Exception as e:
 
         print("Loop error:", e)
-
         time.sleep(20)
