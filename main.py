@@ -23,7 +23,8 @@ def send_telegram(message):
 
 def get_price():
     try:
-        url = f"https://api.twelvedata.com/price?symbol={SYMBOL}=F&apikey={API_KEY}"
+        # تم تعديل هذا السطر
+        url = f"https://api.twelvedata.com/price?symbol=NQ&apikey={API_KEY}"
         r = requests.get(url)
         data = r.json()
 
@@ -52,7 +53,7 @@ while True:
 
         print("Current price:", price)
 
-        # رسالة اختبار كل دقيقة
+        # رسالة اختبار
         send_telegram(f"""
 🧪 BOT TEST
 
@@ -62,7 +63,6 @@ Current Price: {price}
 Bot Status: RUNNING
 """)
 
-        # مقارنة السعر السابق
         if last_price is not None:
 
             if price > last_price:
