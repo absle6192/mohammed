@@ -10,11 +10,14 @@ def send_telegram(message):
     data = {"chat_id": CHAT_ID, "text": message}
     requests.post(url, json=data)
 
+# رسالة تشغيل
 send_telegram("🚀 Bot Running")
 
 while True:
     try:
-        send_telegram("✅ Bot loop working")
+        send_telegram("✅ Loop Working")
         time.sleep(10)
+
     except Exception as e:
         print(e)
+        time.sleep(10)
