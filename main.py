@@ -7,6 +7,7 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 last_price = None
 
+
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     data = {
@@ -15,19 +16,28 @@ def send_telegram(message):
     }
     requests.post(url, json=data)
 
+
 def get_price():
     url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols=NQ=F"
     data = requests.get(url).json()
     price = data["quoteResponse"]["result"][0]["regularMarketPrice"]
     return price
 
+
+# 🔔 رسالة عند تشغيل البوت
+send_telegram("🚀 Bot started and running")
+
+
 while True:
     try:
+
         price = get_price()
 
         if last_price is not None:
+
             if price > last_price:
                 send_telegram(f"📈 BUY NQ\nEntry: {price}")
+
             elif price < last_price:
                 send_telegram(f"📉 SELL NQ\nEntry: {price}")
 
