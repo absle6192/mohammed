@@ -5,8 +5,10 @@ import time
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 API_KEY = os.getenv("TWELVE_API_KEY")
+SYMBOL = os.getenv("SYMBOL")
 
 last_price = None
+last_signal = None
 
 
 def send_telegram(message):
@@ -22,7 +24,7 @@ def send_telegram(message):
 
 def get_price():
     try:
-        url = f"https://api.twelvedata.com/price?symbol=NQ=F&apikey={API_KEY}"
+        url = f"https://api.twelvedata.com/price?symbol={SYMBOL}=F&apikey={API_KEY}"
         r = requests.get(url)
         data = r.json()
 
@@ -37,7 +39,7 @@ def get_price():
         return None
 
 
-send_telegram("🚀 NQ Trading Bot Started")
+send_telegram(f"🚀 {SYMBOL} Trading Bot Started")
 
 while True:
 
@@ -51,25 +53,29 @@ while True:
 
         print("Current price:", price)
 
-        send_telegram(f"💰 NQ Price: {price}")
-
         if last_price is not None:
 
-            if price > last_price:
+            if price > last_price and last_signal != "LONG":
+
+                last_signal = "LONG"
 
                 send_telegram(f"""
 📈 LONG SIGNAL
 
+Symbol: {SYMBOL}
 Entry: {price}
 Take Profit: {price + 20}
 Stop Loss: {price - 10}
 """)
 
-            elif price < last_price:
+            elif price < last_price and last_signal != "SHORT":
+
+                last_signal = "SHORT"
 
                 send_telegram(f"""
 📉 SHORT SIGNAL
 
+Symbol: {SYMBOL}
 Entry: {price}
 Take Profit: {price - 20}
 Stop Loss: {price + 10}
