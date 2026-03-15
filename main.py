@@ -10,13 +10,10 @@ last_price = None
 
 def send_telegram(message):
 
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-
     try:
-        requests.post(url, json={
-            "chat_id": CHAT_ID,
-            "text": message
-        }, timeout=10)
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": CHAT_ID, "text": message}, timeout=10)
+
     except Exception as e:
         print("Telegram error:", e)
 
@@ -24,14 +21,24 @@ def send_telegram(message):
 def get_price():
 
     try:
+
         url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols=NQ=F"
+
         r = requests.get(url, timeout=10)
+
         data = r.json()
 
-        return data["quoteResponse"]["result"][0]["regularMarketPrice"]
+        result = data["quoteResponse"]["result"]
+
+        if len(result) == 0:
+            return None
+
+        return result[0]["regularMarketPrice"]
 
     except Exception as e:
+
         print("Price error:", e)
+
         return None
 
 
@@ -44,7 +51,8 @@ while True:
         price = get_price()
 
         if price is None:
-            time.sleep(20)
+            print("No price received")
+            time.sleep(30)
             continue
 
         send_telegram(f"💰 NQ Price: {price}")
@@ -53,27 +61,25 @@ while True:
 
             if price > last_price:
 
-                tp = price + 20
-                sl = price - 10
+                send_telegram(
+f"""📈 LONG NQ
 
-                send_telegram(f"""
-📈 LONG NQ
 Entry: {price}
-TP: {tp}
-SL: {sl}
-""")
+TP: {price+20}
+SL: {price-10}
+"""
+)
 
             elif price < last_price:
 
-                tp = price - 20
-                sl = price + 10
+                send_telegram(
+f"""📉 SHORT NQ
 
-                send_telegram(f"""
-📉 SHORT NQ
 Entry: {price}
-TP: {tp}
-SL: {sl}
-""")
+TP: {price-20}
+SL: {price+10}
+"""
+)
 
         last_price = price
 
@@ -81,5 +87,6 @@ SL: {sl}
 
     except Exception as e:
 
-        print("Loop error:", e)
-        time.sleep(20)
+        print("Main loop error:", e)
+
+        time.sleep(30)
