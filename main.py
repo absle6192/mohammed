@@ -24,7 +24,7 @@ def get_price():
     return price
 
 
-send_telegram("🚀 NQ Bot Started")
+send_telegram("🚀 NQ Trading Bot Started")
 
 
 while True:
@@ -32,6 +32,9 @@ while True:
     try:
 
         price = get_price()
+
+        # إرسال السعر الحالي
+        send_telegram(f"💰 NQ Price: {price}")
 
         if last_price is not None:
 
@@ -67,7 +70,7 @@ SL: {sl}
 
         last_price = price
 
-        time.sleep(15)
+        time.sleep(60)
 
     except Exception as e:
         print("Error:", e)
