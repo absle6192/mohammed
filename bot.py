@@ -2,6 +2,7 @@ import os
 import time
 import math
 import logging
+import threading
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -10,9 +11,8 @@ import requests
 from zoneinfo import ZoneInfo
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
-
+from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass
 from alpaca.data.live import StockDataStream
 from alpaca.data.enums import DataFeed
 
@@ -56,11 +56,11 @@ def send_tg(text: str) -> None:
 SYMBOLS = [s.strip().upper() for s in env("SYMBOLS", "TSLA,AAPL,NVDA,AMD,GOOGL,MSFT,META,AMZN,MU").split(",") if s.strip()]
 NOTIONAL_PER_TRADE = env_float("OPEN_NOTIONAL_USD", "30000")
 
-WINDOW_SECONDS = env_int("OPEN_WINDOW_SECONDS", "45")
-MIN_POINTS = env_int("MIN_POINTS", "20")
-MIN_MOVE_PCT = env_float("MIN_MOVE_PCT", "0.0006")
-MAX_SPREAD_PCT = env_float("MAX_SPREAD_PCT", "0.0025")
-COOLDOWN_AFTER = env_int("COOLDOWN_AFTER_OPEN_TRADES", "9999")
+WINDOW_SECONDS = env_int("OPEN_WINDOW_SECONDS", "45")          
+MIN_POINTS = env_int("MIN_POINTS", "20")                       
+MIN_MOVE_PCT = env_float("MIN_MOVE_PCT", "0.0006")             
+MAX_SPREAD_PCT = env_float("MAX_SPREAD_PCT", "0.0025")         
+COOLDOWN_AFTER = env_int("COOLDOWN_AFTER_OPEN_TRADES", "9999") 
 
 ALLOW_SHORT = env_bool("ALLOW_SHORT", "true")
 
@@ -69,17 +69,16 @@ FEED = DataFeed.IEX if FEED_NAME == "iex" else DataFeed.SIP
 
 API_KEY = env("APCA_API_KEY_ID")
 API_SECRET = env("APCA_API_SECRET_KEY")
-PAPER = env_bool("ALPACA_PAPER", "true")
-
+PAPER = env_bool("ALPACA_PAPER", "true")  
 
 @dataclass
 class SymState:
-    mids: deque
-    spreads: deque
-    trade_sizes: deque
+    mids: deque   
+    spreads: deque  
+    trade_sizes: deque  
     last_mid: float = 0.0
     last_spread: float = 0.0
-    last_price: float = 0.0
+    last_price: float = 0.0  
 
 
 state = {s: SymState(deque(maxlen=600), deque(maxlen=600), deque(maxlen=600)) for s in SYMBOLS}
@@ -101,7 +100,7 @@ def place_market_entry(trading_client: TradingClient, symbol: str, direction: st
 
     qty = math.floor(notional_usd / max(last_price, 0.01))
     if qty <= 0:
-        raise ValueError(f"qty computed 0 for {symbol}")
+        raise ValueError(f"qty computed 0 for {symbol} (notional={notional_usd}, last={last_price})")
 
     order = MarketOrderRequest(
         symbol=symbol,
@@ -112,33 +111,47 @@ def place_market_entry(trading_client: TradingClient, symbol: str, direction: st
     return trading_client.submit_order(order)
 
 
-# ✅ ----------- ADD: TAKE PROFIT FUNCTION -----------
-def check_take_profit(trading: TradingClient):
-    try:
-        positions = trading.get_all_positions()
-        for p in positions:
-            pnl = float(p.unrealized_pl or 0)
+# -------------------- TAKE PROFIT MONITOR (التعديل الجديد) --------------------
+def monitor_take_profit(trading_client: TradingClient):
+    """
+    هذه الوظيفة تراقب الأرباح وتبيع آلياً عند تحقيق ربح +7$ للسهم الواحد
+    """
+    logging.info("Starting Take Profit Monitor (+7$ Target)...")
+    while True:
+        try:
+            positions = trading_client.get_all_positions()
+            for pos in positions:
+                symbol = pos.symbol
+                entry_price = float(pos.avg_entry_price)
+                current_price = float(pos.current_price)
+                qty = abs(float(pos.qty))
+                side = pos.side # 'long' or 'short'
 
-            if pnl >= 7:
-                symbol = p.symbol
-                qty = abs(float(p.qty))
-                side = OrderSide.SELL if float(p.qty) > 0 else OrderSide.BUY
+                # حساب الربح للسهم الواحد
+                if side == 'long':
+                    profit_per_share = current_price - entry_price
+                else: # short
+                    profit_per_share = entry_price - current_price
 
-                order = MarketOrderRequest(
-                    symbol=symbol,
-                    side=side,
-                    qty=qty,
-                    time_in_force=TimeInForce.DAY,
-                )
-
-                trading.submit_order(order)
-
-                send_tg(f"💰 TAKE PROFIT\n{symbol} | PnL: ${pnl:.2f} → CLOSED")
-                logging.info(f"TP executed for {symbol} pnl={pnl}")
-
-    except Exception as e:
-        logging.warning(f"TP check error: {e}")
-# --------------------------------------------------
+                # إذا وصل الربح إلى 7$ أو أكثر
+                if profit_per_share >= 7.0:
+                    sell_side = OrderSide.SELL if side == 'long' else OrderSide.BUY
+                    order_data = MarketOrderRequest(
+                        symbol=symbol,
+                        qty=qty,
+                        side=sell_side,
+                        time_in_force=TimeInForce.DAY
+                    )
+                    trading_client.submit_order(order_data)
+                    
+                    msg = f"💰 TAKE PROFIT TRIGGERED!\nSymbol: {symbol}\nProfit: ${profit_per_share:.2f}/share\nSold Qty: {qty}"
+                    logging.info(msg)
+                    send_tg(msg)
+            
+            time.sleep(1) # فحص كل ثانية
+        except Exception as e:
+            logging.error(f"Error in Take Profit Monitor: {e}")
+            time.sleep(5)
 
 
 # -------------------- WebSocket handlers --------------------
@@ -175,19 +188,16 @@ async def on_trade(t):
 # -------------------- Scoring --------------------
 def compute_score(symbol: str):
     st = state[symbol]
-
     if len(st.mids) < MIN_POINTS:
         return None
-
     if st.last_spread <= 0 or st.last_spread > MAX_SPREAD_PCT:
         return None
-
     first = st.mids[0]
     last = st.mids[-1]
     if first <= 0:
         return None
 
-    move = (last - first) / first
+    move = (last - first) / first  
     if abs(move) < MIN_MOVE_PCT:
         return None
 
@@ -203,9 +213,8 @@ def compute_score(symbol: str):
         direction = "long" if move > 0 else "short"
 
     vol = sum(st.trade_sizes) if len(st.trade_sizes) else 0.0
-    vol_score = math.log1p(vol)
+    vol_score = math.log1p(vol)  
     spread_pen = st.last_spread * 100.0
-
     score = (abs(move) * 10000.0) + (vol_score * 10.0) - (spread_pen * 2.0)
 
     return {
@@ -232,20 +241,26 @@ def reset_window_buffers():
 def main():
     trading = TradingClient(API_KEY, API_SECRET, paper=PAPER)
 
-    stream = StockDataStream(API_KEY, API_SECRET, feed=FEED)
+    # تشغيل مراقب الربح في خلفية الكود
+    tp_thread = threading.Thread(target=monitor_take_profit, args=(trading,), daemon=True)
+    tp_thread.start()
 
+    stream = StockDataStream(API_KEY, API_SECRET, feed=FEED)
     for s in SYMBOLS:
         stream.subscribe_quotes(on_quote, s)
         stream.subscribe_trades(on_trade, s)
 
-    import threading
     def run_stream():
         stream.run()
 
     t = threading.Thread(target=run_stream, daemon=True)
     t.start()
 
-    send_tg("🚀 Bot started")
+    send_tg(
+        "🚀 Open-3 Bot started\n"
+        f"Symbols: {','.join(SYMBOLS)}\n"
+        "Auto-Exit: Profit +$7 per share\n"
+    )
 
     ny = ZoneInfo("America/New_York")
     while True:
@@ -254,11 +269,14 @@ def main():
             if clock.is_open:
                 break
             time.sleep(5)
-        except:
+        except Exception as e:
+            logging.warning(f"Clock error: {e}")
             time.sleep(5)
 
     reset_window_buffers()
     start = time.time()
+    logging.info("Market open detected. Collecting window...")
+    send_tg(f"⏱️ Market OPEN detected. Collecting {WINDOW_SECONDS}s data...")
 
     while time.time() - start < WINDOW_SECONDS:
         time.sleep(0.2)
@@ -273,22 +291,38 @@ def main():
 
     scored.sort(key=lambda x: x["score"], reverse=True)
 
-    filled = []
+    if not scored:
+        send_tg("⚠️ No candidates passed filters.")
+        return
 
+    filled = []
     for r in scored:
         if len(filled) >= 3:
             break
 
-        try:
-            order = place_market_entry(trading, r["symbol"], r["direction"], NOTIONAL_PER_TRADE, r["last_price"])
-            filled.append(r["symbol"])
-        except:
+        symbol = r["symbol"]
+        direction = r["direction"]
+        last_price = float(r["last_price"] or r["last"])
+        spread_pct = r["spread"]
+
+        if spread_pct > MAX_SPREAD_PCT:
             continue
 
-    # ✅ هنا الإضافة: مراقبة مستمرة للبيع
+        try:
+            order = place_market_entry(trading, symbol, direction, NOTIONAL_PER_TRADE, last_price)
+            filled.append((symbol, direction, order.id))
+            send_tg(
+                f"✅ ENTRY (Market)\n"
+                f"{symbol} | {direction.upper()}\n"
+                f"Target Exit: ${last_price + 7 if direction == 'long' else last_price - 7:.2f}"
+            )
+        except Exception as e:
+            logging.warning(f"Order rejected for {symbol}: {e}")
+            continue
+
+    # البوت سيستمر في العمل لمراقبة الـ Take Profit بفضل الـ tp_thread
     while True:
-        check_take_profit(trading)
-        time.sleep(1)
+        time.sleep(60)
 
 
 if __name__ == "__main__":
