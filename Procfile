@@ -1,1 +1,1 @@
-worker: python bot.py & python exit_manager.py
+worker: python bot.py && python exit_manager.py
