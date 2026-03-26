@@ -170,7 +170,7 @@ def manage_positions(trading):
                         continue
 
             # تقليل وقت النوم من 2 ثانية إلى 0.5 ثانية لفحص أسرع
-            time.sleep(0.5)
+            time.sleep(1)
 
         except Exception as e:
             logging.error(f"Manage error: {e}")
