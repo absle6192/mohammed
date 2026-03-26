@@ -412,4 +412,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    while True:
+        try:
+            main()
+        except Exception as e:
+            logging.error(f"🔥 CRASH: {e}")
+            send_tg(f"🔥 BOT CRASHED: {e}")
+            time.sleep(5)
