@@ -1,5 +1,4 @@
 alpaca-py==0.21.0
-alpaca-trade-api
 websockets==11.0.3
 pandas
 requests
