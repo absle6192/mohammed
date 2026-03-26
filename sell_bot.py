@@ -8,7 +8,8 @@ BASE_URL = "https://paper-api.alpaca.markets"
 
 api = REST(API_KEY, API_SECRET, BASE_URL)
 
-WEBHOOK_URL = "YOUR_WEBHOOK_URL"
+import os
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 state = {}
 
