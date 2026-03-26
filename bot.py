@@ -409,13 +409,3 @@ def main():
         stream.stop()
     except Exception:
         pass
-
-
-if __name__ == "__main__":
-    while True:
-        try:
-            main()
-        except Exception as e:
-            logging.error(f"🔥 CRASH: {e}")
-            send_tg(f"🔥 BOT CRASHED: {e}")
-            time.sleep(5)
