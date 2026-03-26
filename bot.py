@@ -84,7 +84,7 @@ class SymState:
 state = {s: SymState(deque(maxlen=600), deque(maxlen=600), deque(maxlen=600)) for s in SYMBOLS}
 
 
-# ===================== SELL LOGIC =====================
+# ===================== SELL LOGIC (MODIFIED) =====================
 sell_state = {}
 
 def manage_positions(trading):
@@ -94,11 +94,22 @@ def manage_positions(trading):
 
             for pos in positions:
                 symbol = pos.symbol
-                qty = abs(float(pos.qty)) # نستخدم القيمة المطلقة للكمية
-                profit = float(pos.unrealized_pl)
-                
-                # تحديد جهة الإغلاق بناءً على نوع الصفقة (Long or Short)
+                qty = abs(float(pos.qty))
                 side_to_close = OrderSide.SELL if pos.side == 'long' else OrderSide.BUY
+                
+                # --- التعديل الجوهري: حساب الربح بناءً على سعر اللايف ---
+                st = state.get(symbol)
+                if st and st.last_price > 0:
+                    entry_price = float(pos.avg_entry_price)
+                    current_price = st.last_price
+                    # حساب الربح يدوياً لضمان السرعة وتجاوز لاق المنصة
+                    if pos.side == 'long':
+                        profit = (current_price - entry_price) * qty
+                    else:
+                        profit = (entry_price - current_price) * qty
+                else:
+                    # في حال لم تتوفر بيانات لايف نستخدم بيانات المنصة كخيار بديل
+                    profit = float(pos.unrealized_pl)
 
                 if symbol not in sell_state:
                     sell_state[symbol] = {
@@ -111,7 +122,7 @@ def manage_positions(trading):
                 if profit > s["highest"]:
                     s["highest"] = profit
 
-                # Stop Loss
+                # Stop Loss (حماية صارمة عند 12 دولار)
                 if profit <= -12:
                     order_data = MarketOrderRequest(
                         symbol=symbol,
@@ -120,7 +131,7 @@ def manage_positions(trading):
                         time_in_force=TimeInForce.DAY
                     )
                     trading.submit_order(order_data)
-                    send_tg(f"🔴 SOLD {symbol} | Loss: {round(profit,2)}$")
+                    send_tg(f"🔴 FAST STOP LOSS {symbol} | Loss: {round(profit,2)}$")
                     sell_state.pop(symbol, None)
                     continue
 
@@ -138,13 +149,13 @@ def manage_positions(trading):
                         send_tg(f"💰 PARTIAL SELL {symbol} | Profit: {round(profit/2,2)}$")
                         s["partial_sold"] = True
 
-                # Trailing
+                # Trailing (تضييق الفجوات لحماية الربح)
                 if profit >= 7:
-                    gap = 2
+                    gap = 1.5  # فجوة صغيرة للبداية
                     if profit >= 15:
-                        gap = 3
+                        gap = 2.0
                     if profit >= 25:
-                        gap = 5
+                        gap = 2.5 # بدل 5، جعلناها 2.5 للخروج السريع عند الارتداد
 
                     if profit <= s["highest"] - gap:
                         order_data = MarketOrderRequest(
@@ -158,11 +169,12 @@ def manage_positions(trading):
                         sell_state.pop(symbol, None)
                         continue
 
-            time.sleep(2)
+            # تقليل وقت النوم من 2 ثانية إلى 0.5 ثانية لفحص أسرع
+            time.sleep(0.5)
 
         except Exception as e:
-            print("Manage error:", e)
-            time.sleep(5)
+            logging.error(f"Manage error: {e}")
+            time.sleep(1) # تقليل وقت الانتظار عند الخطأ للعودة بسرعة
 # =====================================================
 
 
