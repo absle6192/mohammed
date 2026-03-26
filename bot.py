@@ -56,11 +56,11 @@ def send_tg(text: str) -> None:
 SYMBOLS = [s.strip().upper() for s in env("SYMBOLS", "TSLA,AAPL,NVDA,AMD,GOOGL,MSFT,META,AMZN,MU").split(",") if s.strip()]
 NOTIONAL_PER_TRADE = env_float("OPEN_NOTIONAL_USD", "30000")
 
-WINDOW_SECONDS = env_int("OPEN_WINDOW_SECONDS", "45")          # تجمع بيانات كم ثانية بعد الافتتاح
-MIN_POINTS = env_int("MIN_POINTS", "20")                       # أقل عدد تيكات/نقاط سعر
-MIN_MOVE_PCT = env_float("MIN_MOVE_PCT", "0.0006")             # 0.06% (مناسب للافتتاح)
-MAX_SPREAD_PCT = env_float("MAX_SPREAD_PCT", "0.0025")         # 0.25%
-COOLDOWN_AFTER = env_int("COOLDOWN_AFTER_OPEN_TRADES", "9999") # نخليه كبير عشان ما يعيد يدخل
+WINDOW_SECONDS = env_int("OPEN_WINDOW_SECONDS", "45")
+MIN_POINTS = env_int("MIN_POINTS", "20")
+MIN_MOVE_PCT = env_float("MIN_MOVE_PCT", "0.0006")
+MAX_SPREAD_PCT = env_float("MAX_SPREAD_PCT", "0.0025")
+COOLDOWN_AFTER = env_int("COOLDOWN_AFTER_OPEN_TRADES", "9999")
 
 ALLOW_SHORT = env_bool("ALLOW_SHORT", "true")
 
@@ -69,28 +69,102 @@ FEED = DataFeed.IEX if FEED_NAME == "iex" else DataFeed.SIP
 
 API_KEY = env("APCA_API_KEY_ID")
 API_SECRET = env("APCA_API_SECRET_KEY")
-PAPER = env_bool("ALPACA_PAPER", "true")  # خله مثل ما هو (واضح عندك موجود)
+PAPER = env_bool("ALPACA_PAPER", "true")
 
 @dataclass
 class SymState:
-    mids: deque   # mid prices
-    spreads: deque  # spread pct
-    trade_sizes: deque  # trade sizes
+    mids: deque
+    spreads: deque
+    trade_sizes: deque
     last_mid: float = 0.0
     last_spread: float = 0.0
-    last_price: float = 0.0  # last traded price
+    last_price: float = 0.0
 
 
 state = {s: SymState(deque(maxlen=600), deque(maxlen=600), deque(maxlen=600)) for s in SYMBOLS}
 
 
+# ===================== SELL LOGIC =====================
+sell_state = {}
+
+def manage_positions(trading):
+    while True:
+        try:
+            positions = trading.get_all_positions()
+
+            for pos in positions:
+                symbol = pos.symbol
+                qty = int(float(pos.qty))
+                profit = float(pos.unrealized_pl)
+
+                if symbol not in sell_state:
+                    sell_state[symbol] = {
+                        "highest": profit,
+                        "partial_sold": False
+                    }
+
+                s = sell_state[symbol]
+
+                if profit > s["highest"]:
+                    s["highest"] = profit
+
+                # Stop Loss
+                if profit <= -12:
+                    trading.submit_order(
+                        symbol=symbol,
+                        qty=qty,
+                        side="sell",
+                        type="market",
+                        time_in_force="day"
+                    )
+                    send_tg(f"🔴 SOLD {symbol} | Loss: {round(profit,2)}$")
+                    sell_state.pop(symbol, None)
+                    continue
+
+                # Partial Sell
+                if profit >= 40 and not s["partial_sold"]:
+                    half = qty // 2
+                    if half > 0:
+                        trading.submit_order(
+                            symbol=symbol,
+                            qty=half,
+                            side="sell",
+                            type="market",
+                            time_in_force="day"
+                        )
+                        send_tg(f"💰 PARTIAL SELL {symbol} | Profit: {round(profit/2,2)}$")
+                        s["partial_sold"] = True
+
+                # Trailing
+                if profit >= 7:
+                    gap = 2
+                    if profit >= 15:
+                        gap = 3
+                    if profit >= 25:
+                        gap = 5
+
+                    if profit <= s["highest"] - gap:
+                        trading.submit_order(
+                            symbol=symbol,
+                            qty=qty,
+                            side="sell",
+                            type="market",
+                            time_in_force="day"
+                        )
+                        send_tg(f"🚀 TRAILING SELL {symbol} | Profit: {round(profit,2)}$")
+                        sell_state.pop(symbol, None)
+                        continue
+
+            time.sleep(2)
+
+        except Exception as e:
+            print("Manage error:", e)
+            time.sleep(5)
+# =====================================================
+
+
 # -------------------- Market Order helpers --------------------
 def place_market_entry(trading_client: TradingClient, symbol: str, direction: str, notional_usd: float, last_price: float):
-    """
-    direction: 'long' or 'short'
-    Long: market BUY using notional
-    Short: market SELL using qty
-    """
     if direction == "long":
         order = MarketOrderRequest(
             symbol=symbol,
@@ -100,13 +174,12 @@ def place_market_entry(trading_client: TradingClient, symbol: str, direction: st
         )
         return trading_client.submit_order(order)
 
-    # short
     if not ALLOW_SHORT:
         raise RuntimeError("Short is disabled by ALLOW_SHORT=false")
 
     qty = math.floor(notional_usd / max(last_price, 0.01))
     if qty <= 0:
-        raise ValueError(f"qty computed 0 for {symbol} (notional={notional_usd}, last={last_price})")
+        raise ValueError(f"qty computed 0 for {symbol}")
 
     order = MarketOrderRequest(
         symbol=symbol,
@@ -119,7 +192,6 @@ def place_market_entry(trading_client: TradingClient, symbol: str, direction: st
 
 # -------------------- WebSocket handlers --------------------
 async def on_quote(q):
-    # q: Quote
     s = q.symbol.upper()
     if s not in state:
         return
@@ -156,7 +228,6 @@ def compute_score(symbol: str):
     if len(st.mids) < MIN_POINTS:
         return None
 
-    # spread filter (آخر قيمة)
     if st.last_spread <= 0 or st.last_spread > MAX_SPREAD_PCT:
         return None
 
@@ -165,7 +236,7 @@ def compute_score(symbol: str):
     if first <= 0:
         return None
 
-    move = (last - first) / first  # signed
+    move = (last - first) / first
     if abs(move) < MIN_MOVE_PCT:
         return None
 
@@ -173,23 +244,18 @@ def compute_score(symbol: str):
     trend_ok_long = (last > ma)
     trend_ok_short = (last < ma)
 
-    # direction: combine move sign + MA position
     if move > 0 and trend_ok_long:
         direction = "long"
     elif move < 0 and trend_ok_short:
         direction = "short"
     else:
-        # إذا متردد، نخليه حسب الاتجاه الأقوى (move)
         direction = "long" if move > 0 else "short"
 
-    # volume proxy
     vol = sum(st.trade_sizes) if len(st.trade_sizes) else 0.0
-    vol_score = math.log1p(vol)  # stable
+    vol_score = math.log1p(vol)
 
-    # spread penalty
     spread_pen = st.last_spread * 100.0
 
-    # score: prioritize move, then volume, then low spread
     score = (abs(move) * 10000.0) + (vol_score * 10.0) - (spread_pen * 2.0)
 
     return {
@@ -216,6 +282,10 @@ def reset_window_buffers():
 def main():
     trading = TradingClient(API_KEY, API_SECRET, paper=PAPER)
 
+    # تشغيل البيع في الخلفية
+    import threading
+    threading.Thread(target=manage_positions, args=(trading,), daemon=True).start()
+
     # Start websocket
     stream = StockDataStream(API_KEY, API_SECRET, feed=FEED)
 
@@ -223,8 +293,6 @@ def main():
         stream.subscribe_quotes(on_quote, s)
         stream.subscribe_trades(on_trade, s)
 
-    # Run stream in background thread-like (alpaca stream is async)
-    import threading
     def run_stream():
         stream.run()
 
@@ -239,21 +307,17 @@ def main():
         f"Notional/Trade: ${NOTIONAL_PER_TRADE:,.0f} | Short: {ALLOW_SHORT}\n"
     )
 
-    # Wait market open using Alpaca clock
     ny = ZoneInfo("America/New_York")
     while True:
         try:
             clock = trading.get_clock()
             if clock.is_open:
                 break
-            # لو مو مفتوح، انتظر شوي
             time.sleep(5)
         except Exception as e:
             logging.warning(f"Clock error: {e}")
             time.sleep(5)
 
-    # Market just opened (or already open)
-    # We want the first window AFTER open. If script started late, still runs once.
     reset_window_buffers()
     start = time.time()
     logging.info("Market open detected. Collecting window...")
@@ -262,12 +326,10 @@ def main():
     while time.time() - start < WINDOW_SECONDS:
         time.sleep(0.2)
 
-    # Score all symbols
     scored = []
     for s in SYMBOLS:
         r = compute_score(s)
         if r:
-            # if direction is short but short disabled, skip
             if r["direction"] == "short" and not ALLOW_SHORT:
                 continue
             scored.append(r)
@@ -281,14 +343,12 @@ def main():
         logging.warning(msg)
         return
 
-    # pick top 3 with execution fallback (if order rejected, pick next)
     picks = []
     for r in scored:
         if len(picks) >= 3:
             break
         picks.append(r)
 
-    # Execute
     filled = []
     rejected = []
 
@@ -301,7 +361,6 @@ def main():
         last_price = float(r["last_price"] or r["last"])
         spread_pct = r["spread"]
 
-        # hard spread guard right before sending
         if spread_pct > MAX_SPREAD_PCT:
             continue
 
@@ -314,7 +373,7 @@ def main():
                 f"Last≈ {last_price:.2f}\n"
                 f"Move({WINDOW_SECONDS}s): {r['move']*100:.3f}% | Spread: {spread_pct*100:.3f}%\n"
                 f"Score: {r['score']:.1f}\n"
-                f"⚠️ بيعك يدويًا (البوت لن يخرج)"
+                f"⚠️ البيع الآن تلقائي"
             )
             logging.info(f"Submitted {symbol} {direction} order_id={order.id}")
         except Exception as e:
@@ -330,7 +389,7 @@ def main():
         )
     else:
         send_tg("❌ All entries were rejected. غالبًا بسبب الشورت/الهامش/عدم توفر أسهم للإقتراض أو قيود الحساب.")
-    # stop
+
     try:
         stream.stop()
     except Exception:
