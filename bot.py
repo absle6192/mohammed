@@ -94,8 +94,11 @@ def manage_positions(trading):
 
             for pos in positions:
                 symbol = pos.symbol
-                qty = int(float(pos.qty))
+                qty = abs(float(pos.qty)) # نستخدم القيمة المطلقة للكمية
                 profit = float(pos.unrealized_pl)
+                
+                # تحديد جهة الإغلاق بناءً على نوع الصفقة (Long or Short)
+                side_to_close = OrderSide.SELL if pos.side == 'long' else OrderSide.BUY
 
                 if symbol not in sell_state:
                     sell_state[symbol] = {
@@ -110,28 +113,28 @@ def manage_positions(trading):
 
                 # Stop Loss
                 if profit <= -12:
-                    trading.submit_order(
+                    order_data = MarketOrderRequest(
                         symbol=symbol,
                         qty=qty,
-                        side="sell",
-                        type="market",
-                        time_in_force="day"
+                        side=side_to_close,
+                        time_in_force=TimeInForce.DAY
                     )
+                    trading.submit_order(order_data)
                     send_tg(f"🔴 SOLD {symbol} | Loss: {round(profit,2)}$")
                     sell_state.pop(symbol, None)
                     continue
 
                 # Partial Sell
                 if profit >= 40 and not s["partial_sold"]:
-                    half = qty // 2
+                    half = qty / 2
                     if half > 0:
-                        trading.submit_order(
+                        order_data = MarketOrderRequest(
                             symbol=symbol,
                             qty=half,
-                            side="sell",
-                            type="market",
-                            time_in_force="day"
+                            side=side_to_close,
+                            time_in_force=TimeInForce.DAY
                         )
+                        trading.submit_order(order_data)
                         send_tg(f"💰 PARTIAL SELL {symbol} | Profit: {round(profit/2,2)}$")
                         s["partial_sold"] = True
 
@@ -144,13 +147,13 @@ def manage_positions(trading):
                         gap = 5
 
                     if profit <= s["highest"] - gap:
-                        trading.submit_order(
+                        order_data = MarketOrderRequest(
                             symbol=symbol,
                             qty=qty,
-                            side="sell",
-                            type="market",
-                            time_in_force="day"
+                            side=side_to_close,
+                            time_in_force=TimeInForce.DAY
                         )
+                        trading.submit_order(order_data)
                         send_tg(f"🚀 TRAILING SELL {symbol} | Profit: {round(profit,2)}$")
                         sell_state.pop(symbol, None)
                         continue
