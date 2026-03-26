@@ -2,8 +2,8 @@ import time
 import requests
 from alpaca_trade_api import REST
 
-API_KEY = "YOUR_KEY"
-API_SECRET = "YOUR_SECRET"
+API_KEY = "PKWVNKEMESVVLBBSVSO4MKYJO4"
+API_SECRET = "9aAiiEPFNj24Y6TC1bJbHXSSPefAwJVL8MF62nCK7vYU"
 BASE_URL = "https://paper-api.alpaca.markets"
 
 api = REST(API_KEY, API_SECRET, BASE_URL)
