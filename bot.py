@@ -1,13 +1,12 @@
-import os
+‏ import os
 import time
 import math
 import logging
-import threading
-import requests
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+import requests
 from zoneinfo import ZoneInfo
 
 from alpaca.trading.client import TradingClient
@@ -80,27 +79,18 @@ class SymState:
     last_mid: float = 0.0
     last_spread: float = 0.0
     last_price: float = 0.0  # last traded price
-    highest_profit: float = 0.0 # لتتبع أعلى ربح للملاحقة
-    partial_sold: bool = False  # هل تم بيع النصف؟
 
 
 state = {s: SymState(deque(maxlen=600), deque(maxlen=600), deque(maxlen=600)) for s in SYMBOLS}
 
 
-# -------------------- Helper for Saudi Market Closing --------------------
-def is_saudi_time_before_11pm():
-    # التأكد من التوقف عند الساعة 11 مساءً بتوقيت السعودية لإنهاء الجلسة
-    try:
-        now_sa = datetime.now(ZoneInfo("Asia/Riyadh"))
-        if now_sa.hour >= 23:
-            return False
-        return True
-    except:
-        return True # استمرار كاحتياط في حال فشل تحديد المنطقة الزمنية
-
-
 # -------------------- Market Order helpers --------------------
 def place_market_entry(trading_client: TradingClient, symbol: str, direction: str, notional_usd: float, last_price: float):
+    """
+    direction: 'long' or 'short'
+    Long: market BUY using notional
+    Short: market SELL using qty
+    """
     if direction == "long":
         order = MarketOrderRequest(
             symbol=symbol,
@@ -110,6 +100,7 @@ def place_market_entry(trading_client: TradingClient, symbol: str, direction: st
         )
         return trading_client.submit_order(order)
 
+    # short
     if not ALLOW_SHORT:
         raise RuntimeError("Short is disabled by ALLOW_SHORT=false")
 
@@ -125,51 +116,10 @@ def place_market_entry(trading_client: TradingClient, symbol: str, direction: st
     )
     return trading_client.submit_order(order)
 
-# -------------------- New Monitoring Logic (Added) --------------------
-def monitor_and_sell(trading_client, symbol):
-    """وظيفة المراقبة التي ستعمل في الخلفية لكل سهم يتم شراؤه"""
-    st = state[symbol]
-    st.highest_profit = 0.0  # ريست لأعلى ربح عند بدء صفقة جديدة
-    st.partial_sold = False  # ريست لحالة البيع الجزئي
-    
-    while True:
-        try:
-            pos = trading_client.get_open_position(symbol)
-            profit = float(pos.unrealized_pl)
-            qty = abs(float(pos.qty))
-            
-            # تحديث أعلى ربح وصل له السهم للملاحقة
-            if profit > st.highest_profit:
-                st.highest_profit = profit
-
-            # 1. وقف الخسارة الصارم (100 دولار)
-            if profit <= -100:
-                trading_client.close_position(symbol)
-                send_tg(f"🚨 {symbol}: ضرب وقف الخسارة (-100$). تم إغلاق المركز.")
-                break
-
-            # 2. بيع نصف الكمية لضمان الربح (عند وصول الربح 70 دولار)
-            if profit >= 70 and not st.partial_sold:
-                side = OrderSide.SELL if float(pos.qty) > 0 else OrderSide.BUY
-                trading_client.submit_order(MarketOrderRequest(
-                    symbol=symbol, qty=qty/2, side=side, time_in_force=TimeInForce.DAY
-                ))
-                st.partial_sold = True
-                send_tg(f"💰 {symbol}: وصل الربح 70$. تم بيع نصف الكمية.")
-
-            # 3. ملاحقة الربح (إذا نزل 10$ من أعلى قمة ربح وصل لها)
-            if st.highest_profit > 0 and (st.highest_profit - profit) >= 10:
-                trading_client.close_position(symbol)
-                send_tg(f"📉 {symbol}: تراجع الربح 10$ من القمة ({st.highest_profit}$). تم إغلاق المتبقي.")
-                break
-                
-            time.sleep(1) # فحص الأرباح كل ثانية
-        except Exception:
-            # إذا لم يجد المركز (يعني تم إغلاقه) يخرج من المراقبة
-            break
 
 # -------------------- WebSocket handlers --------------------
 async def on_quote(q):
+    # q: Quote
     s = q.symbol.upper()
     if s not in state:
         return
@@ -202,34 +152,58 @@ async def on_trade(t):
 # -------------------- Scoring --------------------
 def compute_score(symbol: str):
     st = state[symbol]
+
     if len(st.mids) < MIN_POINTS:
         return None
+
+    # spread filter (آخر قيمة)
     if st.last_spread <= 0 or st.last_spread > MAX_SPREAD_PCT:
         return None
+
     first = st.mids[0]
     last = st.mids[-1]
     if first <= 0:
         return None
-    move = (last - first) / first
+
+    move = (last - first) / first  # signed
     if abs(move) < MIN_MOVE_PCT:
         return None
+
     ma = sum(st.mids) / len(st.mids)
     trend_ok_long = (last > ma)
     trend_ok_short = (last < ma)
+
+    # direction: combine move sign + MA position
     if move > 0 and trend_ok_long:
         direction = "long"
     elif move < 0 and trend_ok_short:
         direction = "short"
     else:
+        # إذا متردد، نخليه حسب الاتجاه الأقوى (move)
         direction = "long" if move > 0 else "short"
+
+    # volume proxy
     vol = sum(st.trade_sizes) if len(st.trade_sizes) else 0.0
-    vol_score = math.log1p(vol)
+    vol_score = math.log1p(vol)  # stable
+
+    # spread penalty
     spread_pen = st.last_spread * 100.0
+
+    # score: prioritize move, then volume, then low spread
     score = (abs(move) * 10000.0) + (vol_score * 10.0) - (spread_pen * 2.0)
+
     return {
-        "symbol": symbol, "score": score, "move": move, "ma": ma, "last": last,
-        "spread": st.last_spread, "vol": vol, "direction": direction, "last_price": st.last_price or last,
+        "symbol": symbol,
+        "score": score,
+        "move": move,
+        "ma": ma,
+        "last": last,
+        "spread": st.last_spread,
+        "vol": vol,
+        "direction": direction,
+        "last_price": st.last_price or last,
     }
+
 
 def reset_window_buffers():
     for s in SYMBOLS:
@@ -241,97 +215,127 @@ def reset_window_buffers():
 # -------------------- Main --------------------
 def main():
     trading = TradingClient(API_KEY, API_SECRET, paper=PAPER)
+
+    # Start websocket
     stream = StockDataStream(API_KEY, API_SECRET, feed=FEED)
 
     for s in SYMBOLS:
         stream.subscribe_quotes(on_quote, s)
         stream.subscribe_trades(on_trade, s)
 
+    # Run stream in background thread-like (alpaca stream is async)
+    import threading
     def run_stream():
         stream.run()
 
     t = threading.Thread(target=run_stream, daemon=True)
     t.start()
 
-    send_tg(f"🚀 Open-3 Bot started | Monitor Enabled")
+    send_tg(
+        "🚀 Open-3 Bot started\n"
+        f"Symbols: {','.join(SYMBOLS)}\n"
+        f"Feed: {FEED_NAME}\n"
+        f"Window: {WINDOW_SECONDS}s | MinMove: {MIN_MOVE_PCT*100:.3f}% | MaxSpread: {MAX_SPREAD_PCT*100:.2f}%\n"
+        f"Notional/Trade: ${NOTIONAL_PER_TRADE:,.0f} | Short: {ALLOW_SHORT}\n"
+    )
 
-    # حلقة التكرار الكبيرة لضمان العمل طوال اليوم
-    while is_saudi_time_before_11pm():
+    # Wait market open using Alpaca clock
+    ny = ZoneInfo("America/New_York")
+    while True:
         try:
-            # التأكد من أن السوق مفتوح قبل البدء
             clock = trading.get_clock()
-            if not clock.is_open:
-                logging.info("Market is closed. Waiting...")
-                time.sleep(60)
-                continue
-
-            reset_window_buffers()
-            start = time.time()
-            send_tg(f"⏱️ Collecting {WINDOW_SECONDS}s data...")
-
-            while time.time() - start < WINDOW_SECONDS:
-                time.sleep(0.2)
-
-            scored = []
-            for s in SYMBOLS:
-                r = compute_score(s)
-                if r:
-                    if r["direction"] == "short" and not ALLOW_SHORT: continue
-                    scored.append(r)
-
-            scored.sort(key=lambda x: x["score"], reverse=True)
-
-            if not scored:
-                logging.info("No candidates passed filters. Retrying...")
-                time.sleep(5)
-                continue
-
-            filled = []
-            for r in scored:
-                # الالتزام بشرطك السابق (بحد أقصى مركزين مفتوحين)
-                if len(filled) >= 2: break
-                
-                symbol = r["symbol"]
-                direction = r["direction"]
-                last_price = float(r["last_price"] or r["last"])
-                
-                if r["spread"] > MAX_SPREAD_PCT: continue
-
-                try:
-                    order = place_market_entry(trading, symbol, direction, NOTIONAL_PER_TRADE, last_price)
-                    filled.append(symbol)
-                    send_tg(f"✅ ENTRY: {symbol} | {direction.upper()} | المراقبة الآلية بدأت")
-                    
-                    # تشغيل المراقبة لكل سهم يتم شراؤه
-                    threading.Thread(target=monitor_and_sell, args=(trading, symbol), daemon=True).start()
-                    
-                except Exception as e:
-                    logging.warning(f"Order rejected for {symbol}: {e}")
-                    continue
-
-            if filled:
-                send_tg(f"🎯 Positions: {', '.join(filled)}. البوت يراقب الصفقات...")
-                
-                # البوت يبقى في حالة انتظار حتى تغلق جميع المراكز قبل أن يبدأ دورة بحث جديدة
-                while True:
-                    try:
-                        positions = trading.get_all_positions()
-                        if not positions:
-                            send_tg("♻️ All positions closed. Scanning for new opportunities...")
-                            break
-                        time.sleep(10)
-                    except:
-                        break
-            else:
-                time.sleep(5)
-
+            if clock.is_open:
+                break
+            # لو مو مفتوح، انتظر شوي
+            time.sleep(5)
         except Exception as e:
-            logging.error(f"Error in main loop: {e}")
-            time.sleep(10)
+            logging.warning(f"Clock error: {e}")
+            time.sleep(5)
 
-    send_tg("🏁 Market closed (11 PM Saudi). Bot stopping.")
-    try: stream.stop()
-    except: pass
+    # Market just opened (or already open)
+    # We want the first window AFTER open. If script started late, still runs once.
+    reset_window_buffers()
+    start = time.time()
+    logging.info("Market open detected. Collecting window...")
+    send_tg(f"⏱️ Market OPEN detected. Collecting {WINDOW_SECONDS}s data to pick best 3...")
+
+    while time.time() - start < WINDOW_SECONDS:
+        time.sleep(0.2)
+
+    # Score all symbols
+    scored = []
+    for s in SYMBOLS:
+        r = compute_score(s)
+        if r:
+            # if direction is short but short disabled, skip
+            if r["direction"] == "short" and not ALLOW_SHORT:
+                continue
+            scored.append(r)
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+
+    if not scored:
+        msg = "⚠️ No candidates passed filters.\n" \
+              "Try lowering MIN_MOVE_PCT or MIN_POINTS, or increase MAX_SPREAD_PCT slightly."
+        send_tg(msg)
+        logging.warning(msg)
+        return
+
+    # pick top 3 with execution fallback (if order rejected, pick next)
+    picks = []
+    for r in scored:
+        if len(picks) >= 3:
+            break
+        picks.append(r)
+
+    # Execute
+    filled = []
+    rejected = []
+
+    for r in scored:
+        if len(filled) >= 3:
+            break
+
+        symbol = r["symbol"]
+        direction = r["direction"]
+        last_price = float(r["last_price"] or r["last"])
+        spread_pct = r["spread"]
+
+        # hard spread guard right before sending
+        if spread_pct > MAX_SPREAD_PCT:
+            continue
+
+        try:
+            order = place_market_entry(trading, symbol, direction, NOTIONAL_PER_TRADE, last_price)
+            filled.append((symbol, direction, order.id))
+            send_tg(
+                f"✅ ENTRY (Market)\n"
+                f"{symbol} | {direction.upper()}\n"
+                f"Last≈ {last_price:.2f}\n"
+                f"Move({WINDOW_SECONDS}s): {r['move']*100:.3f}% | Spread: {spread_pct*100:.3f}%\n"
+                f"Score: {r['score']:.1f}\n"
+                f"⚠️ بيعك يدويًا (البوت لن يخرج)"
+            )
+            logging.info(f"Submitted {symbol} {direction} order_id={order.id}")
+        except Exception as e:
+            rejected.append((symbol, str(e)))
+            logging.warning(f"Order rejected for {symbol}: {e}")
+            continue
+
+    if filled:
+        send_tg(
+            "🎯 Done. Open-3 entries placed:\n" +
+            "\n".join([f"- {s} {d.upper()}" for s, d, _ in filled]) +
+            ("\n\n⚠️ Some were rejected:\n" + "\n".join([f"- {s}: {err[:80]}..." for s, err in rejected]) if rejected else "")
+        )
+    else:
+        send_tg("❌ All entries were rejected. غالبًا بسبب الشورت/الهامش/عدم توفر أسهم للإقتراض أو قيود الحساب.")
+    # stop
+    try:
+        stream.stop()
+    except Exception:
+        pass
+
 
 if __name__ == "__main__":
     main()
