@@ -133,19 +133,19 @@ def monitor_and_sell(trading_client, symbol):
                 send_tg(f"🚨 {symbol}: ضرب وقف الخسارة (-100$). تم إغلاق المركز.")
                 break
 
-            # 2. بيع نصف الكمية لضمان الربح (عند وصول الربح 40 دولار)
-            if profit >= 40 and not st.partial_sold:
+            # 2. بيع نصف الكمية لضمان الربح (عند وصول الربح 70 دولار)
+            if profit >= 70 and not st.partial_sold:
                 side = OrderSide.SELL if float(pos.qty) > 0 else OrderSide.BUY
                 trading_client.submit_order(MarketOrderRequest(
                     symbol=symbol, qty=qty/2, side=side, time_in_force=TimeInForce.DAY
                 ))
                 st.partial_sold = True
-                send_tg(f"💰 {symbol}: وصل الربح 40$. تم بيع نصف الكمية.")
+                send_tg(f"💰 {symbol}: وصل الربح 70$. تم بيع نصف الكمية.")
 
-            # 3. ملاحقة الربح (إذا نزل 3$ من أعلى قمة ربح وصل لها)
+            # 3. ملاحقة الربح (إذا نزل 10$ من أعلى قمة ربح وصل لها)
             if st.highest_profit > 0 and (st.highest_profit - profit) >= 3:
                 trading_client.close_position(symbol)
-                send_tg(f"📉 {symbol}: تراجع الربح 3$ من القمة ({st.highest_profit}$). تم إغلاق المتبقي.")
+                send_tg(f"📉 {symbol}: تراجع الربح 10$ من القمة ({st.highest_profit}$). تم إغلاق المتبقي.")
                 break
                 
             time.sleep(1) # فحص الأرباح كل ثانية
