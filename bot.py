@@ -69,7 +69,7 @@ FEED = DataFeed.IEX if FEED_NAME == "iex" else DataFeed.SIP
 
 API_KEY = env("APCA_API_KEY_ID")
 API_SECRET = env("APCA_API_SECRET_KEY")
-PAPER = env_bool("ALPACA_PAPER", "true")  # خله مثل ما هو (واضح عندك موجود)
+PAPER = env_bool("ALPACA_PAPER", "true")
 
 @dataclass
 class SymState:
@@ -84,13 +84,37 @@ class SymState:
 state = {s: SymState(deque(maxlen=600), deque(maxlen=600), deque(maxlen=600)) for s in SYMBOLS}
 
 
+# -------------------- Portfolio Helpers (التعديل الجديد) --------------------
+
+def get_open_positions_symbols(trading_client: TradingClient) -> list:
+    """
+    تجلب قائمة بكل الأسهم التي تملك فيها صفقات مفتوحة حالياً
+    """
+    try:
+        positions = trading_client.get_all_positions()
+        return [p.symbol.upper() for p in positions]
+    except Exception as e:
+        logging.error(f"خطأ أثناء جلب الصفقات المفتوحة: {e}")
+        return []
+
+def is_already_open(symbol: str, open_symbols: list) -> bool:
+    """
+    تتحقق إذا كان السهم موجود في قائمة الصفقات المفتوحة
+    """
+    return symbol.upper() in open_symbols
+
+
 # -------------------- Market Order helpers --------------------
 def place_market_entry(trading_client: TradingClient, symbol: str, direction: str, notional_usd: float, last_price: float):
     """
-    direction: 'long' or 'short'
-    Long: market BUY using notional
-    Short: market SELL using qty
+    تم إضافة فحص إضافي هنا لضمان عدم التكرار برمجياً
     """
+    # فحص أخير قبل الإرسال للمنصة
+    current_positions = get_open_positions_symbols(trading_client)
+    if is_already_open(symbol, current_positions):
+        logging.warning(f"⚠️ إلغاء العملية: لديك صفقة مفتوحة بالفعل في {symbol}")
+        return None
+
     if direction == "long":
         order = MarketOrderRequest(
             symbol=symbol,
@@ -119,7 +143,6 @@ def place_market_entry(trading_client: TradingClient, symbol: str, direction: st
 
 # -------------------- WebSocket handlers --------------------
 async def on_quote(q):
-    # q: Quote
     s = q.symbol.upper()
     if s not in state:
         return
@@ -156,7 +179,6 @@ def compute_score(symbol: str):
     if len(st.mids) < MIN_POINTS:
         return None
 
-    # spread filter (آخر قيمة)
     if st.last_spread <= 0 or st.last_spread > MAX_SPREAD_PCT:
         return None
 
@@ -165,7 +187,7 @@ def compute_score(symbol: str):
     if first <= 0:
         return None
 
-    move = (last - first) / first  # signed
+    move = (last - first) / first
     if abs(move) < MIN_MOVE_PCT:
         return None
 
@@ -173,23 +195,17 @@ def compute_score(symbol: str):
     trend_ok_long = (last > ma)
     trend_ok_short = (last < ma)
 
-    # direction: combine move sign + MA position
     if move > 0 and trend_ok_long:
         direction = "long"
     elif move < 0 and trend_ok_short:
         direction = "short"
     else:
-        # إذا متردد، نخليه حسب الاتجاه الأقوى (move)
         direction = "long" if move > 0 else "short"
 
-    # volume proxy
     vol = sum(st.trade_sizes) if len(st.trade_sizes) else 0.0
-    vol_score = math.log1p(vol)  # stable
-
-    # spread penalty
+    vol_score = math.log1p(vol)
     spread_pen = st.last_spread * 100.0
 
-    # score: prioritize move, then volume, then low spread
     score = (abs(move) * 10000.0) + (vol_score * 10.0) - (spread_pen * 2.0)
 
     return {
@@ -216,14 +232,12 @@ def reset_window_buffers():
 def main():
     trading = TradingClient(API_KEY, API_SECRET, paper=PAPER)
 
-    # Start websocket
     stream = StockDataStream(API_KEY, API_SECRET, feed=FEED)
 
     for s in SYMBOLS:
         stream.subscribe_quotes(on_quote, s)
         stream.subscribe_trades(on_trade, s)
 
-    # Run stream in background thread-like (alpaca stream is async)
     import threading
     def run_stream():
         stream.run()
@@ -232,28 +246,24 @@ def main():
     t.start()
 
     send_tg(
-        "🚀 Open-3 Bot started\n"
+        "🚀 Open-3 Bot started with Duplicate-Protection\n"
         f"Symbols: {','.join(SYMBOLS)}\n"
         f"Feed: {FEED_NAME}\n"
         f"Window: {WINDOW_SECONDS}s | MinMove: {MIN_MOVE_PCT*100:.3f}% | MaxSpread: {MAX_SPREAD_PCT*100:.2f}%\n"
         f"Notional/Trade: ${NOTIONAL_PER_TRADE:,.0f} | Short: {ALLOW_SHORT}\n"
     )
 
-    # Wait market open using Alpaca clock
     ny = ZoneInfo("America/New_York")
     while True:
         try:
             clock = trading.get_clock()
             if clock.is_open:
                 break
-            # لو مو مفتوح، انتظر شوي
             time.sleep(5)
         except Exception as e:
             logging.warning(f"Clock error: {e}")
             time.sleep(5)
 
-    # Market just opened (or already open)
-    # We want the first window AFTER open. If script started late, still runs once.
     reset_window_buffers()
     start = time.time()
     logging.info("Market open detected. Collecting window...")
@@ -262,12 +272,10 @@ def main():
     while time.time() - start < WINDOW_SECONDS:
         time.sleep(0.2)
 
-    # Score all symbols
     scored = []
     for s in SYMBOLS:
         r = compute_score(s)
         if r:
-            # if direction is short but short disabled, skip
             if r["direction"] == "short" and not ALLOW_SHORT:
                 continue
             scored.append(r)
@@ -275,22 +283,17 @@ def main():
     scored.sort(key=lambda x: x["score"], reverse=True)
 
     if not scored:
-        msg = "⚠️ No candidates passed filters.\n" \
-              "Try lowering MIN_MOVE_PCT or MIN_POINTS, or increase MAX_SPREAD_PCT slightly."
+        msg = "⚠️ No candidates passed filters."
         send_tg(msg)
         logging.warning(msg)
         return
 
-    # pick top 3 with execution fallback (if order rejected, pick next)
-    picks = []
-    for r in scored:
-        if len(picks) >= 3:
-            break
-        picks.append(r)
-
     # Execute
     filled = []
     rejected = []
+
+    # جلب الصفقات المفتوحة قبل البدء بالتنفيذ (لتجنب التكرار)
+    open_positions = get_open_positions_symbols(trading)
 
     for r in scored:
         if len(filled) >= 3:
@@ -301,22 +304,30 @@ def main():
         last_price = float(r["last_price"] or r["last"])
         spread_pct = r["spread"]
 
-        # hard spread guard right before sending
+        # حماية 1: فحص إذا السهم مفتوح فعلاً
+        if is_already_open(symbol, open_positions):
+            logging.info(f"Skipping {symbol}: Position already open in portfolio.")
+            continue
+
+        # حماية 2: فحص السبريد
         if spread_pct > MAX_SPREAD_PCT:
             continue
 
         try:
             order = place_market_entry(trading, symbol, direction, NOTIONAL_PER_TRADE, last_price)
-            filled.append((symbol, direction, order.id))
-            send_tg(
-                f"✅ ENTRY (Market)\n"
-                f"{symbol} | {direction.upper()}\n"
-                f"Last≈ {last_price:.2f}\n"
-                f"Move({WINDOW_SECONDS}s): {r['move']*100:.3f}% | Spread: {spread_pct*100:.3f}%\n"
-                f"Score: {r['score']:.1f}\n"
-                f"⚠️ بيعك يدويًا (البوت لن يخرج)"
-            )
-            logging.info(f"Submitted {symbol} {direction} order_id={order.id}")
+            
+            # التأكد أن الطلب تم إرساله ولم يتم رفضه من دالة الحماية
+            if order:
+                filled.append((symbol, direction, order.id))
+                send_tg(
+                    f"✅ ENTRY (Market)\n"
+                    f"{symbol} | {direction.upper()}\n"
+                    f"Last≈ {last_price:.2f}\n"
+                    f"Move: {r['move']*100:.3f}% | Spread: {spread_pct*100:.3f}%\n"
+                    f"Score: {r['score']:.1f}\n"
+                    f"⚠️ بيعك يدويًا (لن يتم الدخول مرتين لنفس السهم)"
+                )
+                logging.info(f"Submitted {symbol} {direction} order_id={order.id}")
         except Exception as e:
             rejected.append((symbol, str(e)))
             logging.warning(f"Order rejected for {symbol}: {e}")
@@ -329,8 +340,8 @@ def main():
             ("\n\n⚠️ Some were rejected:\n" + "\n".join([f"- {s}: {err[:80]}..." for s, err in rejected]) if rejected else "")
         )
     else:
-        send_tg("❌ All entries were rejected. غالبًا بسبب الشورت/الهامش/عدم توفر أسهم للإقتراض أو قيود الحساب.")
-    # stop
+        send_tg("❌ No new entries placed (Either rejected or already open).")
+    
     try:
         stream.stop()
     except Exception:
